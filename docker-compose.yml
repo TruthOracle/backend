@@ -1,0 +1,53 @@
+# Local infrastructure for the TruthOracle backend (docs/ARCHITECTURE.md §3).
+#   docker compose up -d
+# Postgres  → postgresql://truthoracle:truthoracle@localhost:5432/truthoracle_backend
+# Redis     → redis://localhost:6379
+# NATS      → nats://localhost:4222 (JetStream on; monitoring at http://localhost:8222/jsz)
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: truthoracle
+      POSTGRES_PASSWORD: truthoracle
+      POSTGRES_DB: truthoracle_backend
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U truthoracle -d truthoracle_backend"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-m", "8222", "-sd", "/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  pgdata:
+  redisdata:
+  natsdata:

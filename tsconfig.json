@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "ES2023",
+    "types": ["node", "jest"],
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "incremental": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "removeComments": false,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "jest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

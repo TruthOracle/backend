@@ -1,0 +1,13 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "testEnvironment": "node",
+  "testRegex": "\\.e2e-spec\\.ts$",
+  "transform": {
+    "^.+\\.ts$": "ts-jest",
+    "/node_modules/(@nestjs|jose)/.+\\.js$": "<rootDir>/esm-to-cjs.transformer.cjs"
+  },
+  "transformIgnorePatterns": ["/node_modules/(?!(@nestjs|jose)/)", "\\.pnp\\.[^\\/]+$"],
+  "testTimeout": 30000,
+  "maxWorkers": 1
+}
