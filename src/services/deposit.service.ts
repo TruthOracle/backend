@@ -33,22 +33,26 @@ import { WalletLinkService, ledgerWalletToApi, walletToApi } from "./wallet-link
 export interface WalletLedgerInput {
   id: string;
   partyId: string;
-  legacyCreditedCC: bigint;
   creditedCC: bigint;
   /** Settled Amulet inbound from this party to the treasury, already in 1e-10 units. */
   receivedCC: bigint;
 }
 
-export type DriftKind = "over_credit" | "ledger_below_expected";
+/**
+ * `over_credit`: a wallet is attributed more than it ever sent. `ledger_below_expected` /
+ * `ledger_above_expected`: the primary's on-ledger depositedCC differs from Σ credited_cc in
+ * that direction. None of them self-resolves; an operator looks.
+ */
+export type DriftKind = "over_credit" | "ledger_below_expected" | "ledger_above_expected";
 
 export interface CreditPlan {
-  /** received − legacy − credited per wallet (after the self-heal was applied to the primary). */
+  /** received − credited per wallet. */
   owed: Map<string, bigint>;
-  /** Legacy-path credit found on the ledger but not attributed: attributed to the primary (§8.3 step 4). */
-  healDelta: bigint;
   drift: { kind: DriftKind; walletId: string | null; amountCC: bigint } | null;
+  /** Σ credited_cc — what the ledger must show as depositedCC. */
   expected: bigint;
   ledgerDepositedCC: bigint;
+  /** ledgerDepositedCC − expected. */
   delta: bigint;
   /** Σ max(owed, 0) — exact. */
   amount: bigint;
@@ -56,45 +60,38 @@ export interface CreditPlan {
 }
 
 /**
- * Derive what the treasury owes the in-app wallet, per linked wallet. Identical derivation
- * principle to api/wallet/deposit.mjs (amounts never come from the client) extended to N wallets:
+ * Derive what the treasury owes the in-app wallet, per linked wallet. Amounts never come from the
+ * client; the derivation covers N wallets and is exact fixed point:
  *
- *   owed_w = received_w − legacy_credited_cc_w − credited_cc_w
- *   expected = legacy_credited_cc[primary] + Σ credited_cc ; delta = ledger.depositedCC − expected
+ *   owed_w   = received_w − credited_cc_w
+ *   expected = Σ credited_cc ; delta = ledger.depositedCC − expected
  *
- * Negative owed or negative delta (beyond DUST) is drift the backend refuses to paper over;
- * positive delta is a credit that reached the ledger through the legacy path and is attributed to
- * the primary so the invariant `ledger.depositedCC == legacy[primary] + Σ credited_cc` holds exactly.
+ * Every credit the primary's UserWallet ever received went through this backend (greenfield —
+ * ARCHITECTURE §18), so `ledger.depositedCC == Σ credited_cc` holds exactly after confirmation
+ * and ANY deviation beyond DUST — negative owed, negative delta, positive delta — is drift the
+ * backend refuses to paper over: nothing is credited, an operator is notified.
  */
 export function planCredit(input: { wallets: WalletLedgerInput[]; primaryPartyId: string; ledgerDepositedCC: bigint }): CreditPlan {
   const primary = input.wallets.find((w) => w.partyId === input.primaryPartyId);
   if (!primary) throw new Error("planCredit: the primary party has no wallet row");
 
   const owed = new Map<string, bigint>();
-  let creditedTotal = 0n;
+  let expected = 0n;
   for (const w of input.wallets) {
-    owed.set(w.id, w.receivedCC - w.legacyCreditedCC - w.creditedCC);
-    creditedTotal += w.creditedCC;
+    owed.set(w.id, w.receivedCC - w.creditedCC);
+    expected += w.creditedCC;
   }
-  const expected = primary.legacyCreditedCC + creditedTotal;
   const delta = input.ledgerDepositedCC - expected;
-  const base = { expected, ledgerDepositedCC: input.ledgerDepositedCC, delta, healDelta: 0n, amount: 0n, attribution: [] as DepositAttribution[] };
+  const base = { owed, expected, ledgerDepositedCC: input.ledgerDepositedCC, delta, amount: 0n, attribution: [] as DepositAttribution[] };
 
   // Step 3: a wallet attributed more than it ever sent is an over-credit → hard error.
   for (const w of input.wallets) {
     const o = owed.get(w.id) ?? 0n;
-    if (o < -DUST) return { ...base, owed, drift: { kind: "over_credit", walletId: w.id, amountCC: o } };
+    if (o < -DUST) return { ...base, drift: { kind: "over_credit", walletId: w.id, amountCC: o } };
   }
-  // Step 4: the ledger holding less than we attributed is unrecoverable drift; holding more is a
-  // legacy credit that self-heals onto the primary.
-  if (delta < -DUST) return { ...base, owed, drift: { kind: "ledger_below_expected", walletId: primary.id, amountCC: delta } };
-  let healDelta = 0n;
-  if (delta > DUST) {
-    healDelta = delta;
-    const healed = (owed.get(primary.id) ?? 0n) - healDelta;
-    owed.set(primary.id, healed);
-    if (healed < -DUST) return { ...base, owed, healDelta, drift: { kind: "over_credit", walletId: primary.id, amountCC: healed } };
-  }
+  // Step 4: the ledger must hold exactly what was attributed — in either direction.
+  if (delta < -DUST) return { ...base, drift: { kind: "ledger_below_expected", walletId: primary.id, amountCC: delta } };
+  if (delta > DUST) return { ...base, drift: { kind: "ledger_above_expected", walletId: primary.id, amountCC: delta } };
   // Step 5: every owed_w is already an exact 10-dp value; the sum is exact too.
   let amount = 0n;
   const attribution: DepositAttribution[] = [];
@@ -104,7 +101,7 @@ export function planCredit(input: { wallets: WalletLedgerInput[]; primaryPartyId
     amount += o;
     attribution.push({ walletId: w.id, partyId: w.partyId, amountCC: formatCC(o) });
   }
-  return { ...base, owed, healDelta, drift: null, amount, attribution };
+  return { ...base, drift: null, amount, attribution };
 }
 
 /**
@@ -205,7 +202,6 @@ export class DepositService {
         wallets: rows.map((w) => ({
           id: w.id,
           partyId: w.partyId,
-          legacyCreditedCC: w.legacyCreditedCC,
           creditedCC: w.creditedCC,
           receivedCC: this.wallet.totalReceivedFrom(history, treasury, w.partyId),
         })),
@@ -221,7 +217,6 @@ export class DepositService {
           amountCC: formatCC(plan.drift.amountCC),
         });
       }
-      if (plan.healDelta > 0n) await this.healPrimary(userId, primaryRow, plan, actor);
 
       if (plan.amount <= DUST) {
         return { credited: formatCC(0n), status: "nothing_outstanding", perWallet: [], ledger: ledgerBefore ? ledgerWalletToApi(ledgerBefore) : null };
@@ -367,25 +362,22 @@ export class DepositService {
     return (await this.markFailed(row, reason)) ? "failed" : "pending";
   }
 
+  /**
+   * THE confirmation rule: the Daml `Deposit` choice appends `txRef` to `UserWallet.depositRefs`
+   * and refuses a repeat, so the wallet carrying the row's txRef is the on-ledger proof this exact
+   * credit landed — whatever `depositedCC` did meanwhile (another Deposit, a rotated contract id).
+   */
   private isConfirmedOnLedger(row: DepositCreditEntity, onLedger: LedgerWallet | null): boolean {
-    if (!onLedger) return false;
-    if (this.config.damlUserWalletHasDepositRefs) return onLedger.depositRefs.includes(row.txRef);
-    return onLedger.depositedCC >= row.depositedCCBefore + row.amountCC;
+    return onLedger !== null && onLedger.depositRefs.includes(row.txRef);
   }
 
   /**
-   * Pre-state: the wallet's depositedCC is exactly what it was before the submit — deposits are
-   * monotonic, so equality means no deposit landed even if a trade has since rotated the contract
-   * id. A legacy Create-path row (no wallet before the submit) is in its pre-state while there is
-   * no wallet, or while the wallet that appeared meanwhile (an in-app payout's empty Create) does
-   * not carry the credit — otherwise such a row could never resolve and would block every later
-   * reconcile with `deposit_in_progress`.
+   * Pre-state: the wallet exists (every row records the wallet the Exercise was addressed to) and
+   * does not carry the row's txRef — by the same Daml rule, this credit has not landed. No wallet
+   * at all for a row that recorded one is anomalous and is treated as "in flight" (fail closed).
    */
   private ledgerShowsPreState(row: DepositCreditEntity, onLedger: LedgerWallet | null): boolean {
-    if (!onLedger) return row.walletCidBefore === null;
-    if (this.config.damlUserWalletHasDepositRefs && onLedger.depositRefs.includes(row.txRef)) return false;
-    if (row.walletCidBefore === null) return onLedger.depositedCC < row.amountCC;
-    return onLedger.depositedCC === row.depositedCCBefore;
+    return onLedger !== null && !onLedger.depositRefs.includes(row.txRef);
   }
 
   /**
@@ -398,7 +390,7 @@ export class DepositService {
     try {
       await this.wallet.externalSubmit({
         commandId,
-        commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: this.treasury, owner, withDepositRefs: this.config.damlUserWalletHasDepositRefs })],
+        commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: this.treasury, owner })],
       });
     } catch (err) {
       this.logger.warn(`UserWallet create ${commandId} did not succeed (${(err as Error).message}); re-reading the ledger`);
@@ -463,7 +455,7 @@ export class DepositService {
     });
   }
 
-  // ── write-ahead, self-heal, drift ─────────────────────────────────────────────────────────
+  // ── write-ahead, drift ────────────────────────────────────────────────────────────────────
 
   /**
    * INSERT … ON CONFLICT (command_id) DO NOTHING. No row inserted means the same state is
@@ -577,51 +569,7 @@ export class DepositService {
     };
   }
 
-  /**
-   * Step 4 self-heal: attribute the unexplained ledger surplus to the primary (legacy-path
-   * credit). A compare-and-set against the `credited_cc` the plan was derived from: should a
-   * second reconcile have slipped past the lock (TTL expiry) and healed first, this one refuses
-   * instead of adding the delta twice and manufacturing `ledger_below_expected` drift.
-   */
-  private async healPrimary(userId: string, primaryRow: WalletEntity, plan: CreditPlan, actor: Actor): Promise<void> {
-    await this.dataSource.transaction(async (manager) => {
-      const repo = manager.getRepository(WalletEntity);
-      const before = primaryRow.creditedCC;
-      const res = await repo
-        .createQueryBuilder()
-        .update(WalletEntity)
-        .set({ creditedCC: before + plan.healDelta })
-        .where("id = :id AND credited_cc = :before", { id: primaryRow.id, before: formatCC(before) })
-        .execute();
-      if (!res.affected) {
-        throw new ApiError(409, "deposit_in_progress", "the wallet attribution changed while reconciling; try again shortly");
-      }
-      primaryRow.creditedCC = before + plan.healDelta;
-      await this.audit.record(
-        {
-          actorType: actor.type,
-          actorUserId: actor.userId ?? null,
-          actorSessionId: actor.sessionId ?? null,
-          action: "deposit.attribution_healed",
-          subjectType: "wallet",
-          subjectId: primaryRow.id,
-          metadata: {
-            userId,
-            amountCC: formatCC(plan.healDelta),
-            creditedBefore: formatCC(before),
-            ledgerDepositedCC: formatCC(plan.ledgerDepositedCC),
-            expected: formatCC(plan.expected),
-            path: "legacy",
-          },
-          ip: actor.ip ?? null,
-        },
-        manager,
-      );
-    });
-    this.logger.warn(`deposit attribution healed for user ${userId}: +${formatCC(plan.healDelta)} CC to the primary wallet (legacy path)`);
-    void this.nats.publishSafe(NatsSubjects.depositHealed, { userId, walletId: primaryRow.id, amountCC: formatCC(plan.healDelta) });
-  }
-
+  /** Audit + Sentry + NATS for a refused reconciliation; the audit row is written outside the (absent) transaction so it survives the 409. */
   private async reportDrift(userId: string, primaryRow: WalletEntity, plan: CreditPlan, actor: Actor): Promise<void> {
     const drift = plan.drift;
     if (!drift) return;
@@ -674,8 +622,6 @@ export class DepositService {
       }),
     );
 
-    const primaryRow = rows.find((w) => w.partyId === primary) ?? null;
-    const legacyPrimaryCC = primaryRow?.legacyCreditedCC ?? 0n;
     const creditedTotalCC = rows.reduce((sum, w) => sum + w.creditedCC, 0n);
     const ledgerDepositedCC = onLedger?.depositedCC ?? 0n;
     const submitted = await this.credits.count({ where: { userId, status: "submitted" } });
@@ -695,10 +641,9 @@ export class DepositService {
       ledger: onLedger ? ledgerWalletToApi(onLedger) : null,
       wallets,
       attribution: {
-        legacyPrimaryCC: formatCC(legacyPrimaryCC),
         creditedTotalCC: formatCC(creditedTotalCC),
         ledgerDepositedCC: formatCC(ledgerDepositedCC),
-        delta: formatCC(ledgerDepositedCC - legacyPrimaryCC - creditedTotalCC),
+        delta: formatCC(ledgerDepositedCC - creditedTotalCC),
       },
       pending: { submitted },
       payouts: payoutRows.map((p) => this.payouts.toApi(p, active.has(p.pendingPayoutCid))),

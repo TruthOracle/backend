@@ -36,7 +36,8 @@ interface LedgerWallet { contractId: string; owner: string; balanceCC: Money; de
 interface Wallet {
   id: string; chain: "canton"; kind: "cantor8"; partyId: string; label: string | null;
   isPrimary: boolean; status: "active" | "revoked"; verifiedAt: string;
-  creditedCC: Money; legacyCreditedCC: Money; receivedCC?: Money;   // receivedCC only in GET /in-app-wallet
+  creditedCC: Money;                        // in-app credits attributed to this wallet (the only attribution — nothing predates the backend)
+  receivedCC?: Money;                       // only in GET /in-app-wallet
   ownLedgerWallet: LedgerWallet | null;     // a non-primary party's own on-ledger UserWallet, if any
 }
 interface KycVerification {
@@ -65,8 +66,8 @@ interface Payout {
 ```
 
 ## Health
-- `GET /health` → `200 { status: "ok", env, network, ts }`
-- `GET /health/ready` → `200 { status: "ok", checks: { postgres: "ok", redis: "ok", nats: "ok" } }` or `503` with the failing check.
+- `GET /health` → `200 { status: "ok", service, version, env, network, uptimeSec, ts }`
+- `GET /health/ready` → `200 { status: "ok", checks: { postgres: "ok", redis: "ok", nats: "ok" } }` or `503 { status: "degraded", checks, draining?: true }` with the failing check (`draining` only while the process shuts down).
 
 ## Auth
 - `GET /auth/session` → `200 { authenticated: false }` | `200 { authenticated: true, kind, user: User, expiresAt }`
@@ -108,14 +109,18 @@ returns `409 identity_already_linked`; a wallet owned by another account `409 wa
 ## Wallets
 - `GET /wallets` → `200 { wallets: Wallet[] }`
 - `POST /wallets/link-challenge` `{ partyId }` → `200 { challengeId, message, expiresAt }`
-- `POST /wallets/link` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", label? }` → `200 { wallet: Wallet, identity: Identity, seededLegacyCreditedCC: Money }`
+- `POST /wallets/link` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", label? }` → `200 { wallet: Wallet, identity: Identity }` (never reads the ledger; works while it is down)
 - `DELETE /wallets/:id` → `200 { ok: true }` | `409 primary_wallet_in_use` | `409 last_identity` | `409 identity_locked_by_kyc`
 - `POST /wallets/:id/primary` → `200 { wallet }` | `409 primary_wallet_in_use`
 
 ## In-app wallet
-- `GET /in-app-wallet` → `200 { partyId: string | null, ledger: LedgerWallet | null, wallets: Wallet[] (with receivedCC), attribution: { legacyPrimaryCC: Money, creditedTotalCC: Money, ledgerDepositedCC: Money, delta: Money }, pending: { submitted: number }, payouts: Payout[] }`
+Deposits and withdrawals **require a signed-in account** (ARCHITECTURE §18): there is no
+account-less money path. Trading and reads stay wallet-signed, but a choice that debits or
+credits a `UserWallet` presupposes one exists — i.e. an account that deposited through this API.
+- `GET /in-app-wallet` → `200 { partyId: string | null, ledger: LedgerWallet | null, wallets: Wallet[] (with receivedCC), attribution: { creditedTotalCC: Money, ledgerDepositedCC: Money, delta: Money }, pending: { submitted: number }, payouts: Payout[] }`
+  (`delta = ledgerDepositedCC − creditedTotalCC`; anything beyond 1e-9 CC makes the next reconcile answer `409 deposit_attribution_drift`)
 - `POST /in-app-wallet/deposits/reconcile` → `200 { credited: Money, status: "confirmed" | "submitted" | "nothing_outstanding", commandId?: string, perWallet: { walletId, partyId, amountCC: Money }[], ledger: LedgerWallet | null }`
-  | `409 no_primary_wallet` | `409 deposit_in_progress` | `409 deposit_attribution_drift` | `409 kyc_duplicate_identity`
+  | `409 no_primary_wallet` | `409 deposit_in_progress` | `409 deposit_attribution_drift` (`details: { kind: "over_credit" | "ledger_below_expected" | "ledger_above_expected" | "duplicate_user_wallet", walletId?, amountCC? }`) | `409 kyc_duplicate_identity` | `502 upstream_failed`
 - `GET /in-app-wallet/payouts` → `200 { payouts: Payout[] }`
 - `POST /in-app-wallet/payouts/:cid/settle` → `200 { payout: Payout, mode: "external" | "in_app" | "already_settled" }` | `404 payout_not_found` | `409 kyc_required` | `409 payout_blocked` (`details.status`)
 

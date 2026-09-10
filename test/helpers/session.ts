@@ -82,7 +82,6 @@ export async function issueSessionDirect(
           label: null,
           isPrimary,
           status: "active",
-          legacyCreditedCC: 0n,
           creditedCC: 0n,
           verifiedAt: new Date(),
           revokedAt: null,
@@ -114,7 +113,7 @@ export async function linkWallet(
   cookie: string,
   wallet: TestWallet,
   opts: { label?: string } = {},
-): Promise<{ wallet: ApiWallet; identity: ApiIdentity; seededLegacyCreditedCC: string }> {
+): Promise<{ wallet: ApiWallet; identity: ApiIdentity }> {
   const headers: Record<string, string> = { Origin: TEST_ORIGIN, "Content-Type": "application/json", Cookie: cookie };
   const challenge = await agent.post("/api/v1/wallets/link-challenge").set(headers).send({ partyId: wallet.partyId }).expect(200);
   const { challengeId, message } = challenge.body as ApiChallenge;
@@ -132,5 +131,5 @@ export async function linkWallet(
   if (res.status !== 200) {
     throw new Error(`POST /wallets/link → ${res.status} ${JSON.stringify(res.body)}`);
   }
-  return res.body as { wallet: ApiWallet; identity: ApiIdentity; seededLegacyCreditedCC: string };
+  return res.body as { wallet: ApiWallet; identity: ApiIdentity };
 }

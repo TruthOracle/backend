@@ -39,7 +39,6 @@ export interface VerifiedWallet {
 export interface LinkResult {
   wallet: WalletEntity;
   identity: AuthIdentityEntity;
-  seededLegacyCreditedCC: bigint;
 }
 
 /** Wire shape of an on-ledger UserWallet (docs/API.md `LedgerWallet`). */
@@ -68,7 +67,6 @@ export function walletToApi(
     status: wallet.status,
     verifiedAt: wallet.verifiedAt.toISOString(),
     creditedCC: formatCC(wallet.creditedCC),
-    legacyCreditedCC: formatCC(wallet.legacyCreditedCC),
     ownLedgerWallet: extras.ownLedgerWallet ? ledgerWalletToApi(extras.ownLedgerWallet) : null,
   };
   if (extras.receivedCC !== undefined) api.receivedCC = formatCC(extras.receivedCC);
@@ -80,10 +78,13 @@ export function walletToApi(
  *
  * A party is bound to its first account forever: any `to_wallets` row (active or revoked) under
  * another user refuses the link (`409 wallet_already_linked`); a row under this user is
- * reactivated, never re-inserted, with `credited_cc` / `legacy_credited_cc` untouched. The
- * `canton_wallet` identity is created / reactivated through IdentityService so the §6 rules
- * (one identity ↔ one account, unlinked = revoked, KYC lock, last identity) apply on both the
- * identity and the wallet route.
+ * reactivated, never re-inserted, with `credited_cc` untouched. The `canton_wallet` identity is
+ * created / reactivated through IdentityService so the §6 rules (one identity ↔ one account,
+ * unlinked = revoked, KYC lock, last identity) apply on both the identity and the wallet route.
+ *
+ * Linking never touches the ledger (greenfield, ARCHITECTURE §18): nothing on-ledger predates the
+ * backend, so a new row starts at `credited_cc = 0` and sign-in works while the ledger is down.
+ * The ledger client is used only by `setPrimary` and `ownLedgerWallets`.
  */
 @Injectable()
 export class WalletLinkService {
@@ -114,10 +115,7 @@ export class WalletLinkService {
     return this.wallets.find({ where: { userId }, order: { createdAt: "ASC" } });
   }
 
-  /**
-   * §8.1. `verified` comes from WalletChallengeService.verify (never from the client). The seed
-   * is read from the ledger BEFORE any write so an upstream failure changes nothing.
-   */
+  /** §8.1. `verified` comes from WalletChallengeService.verify (never from the client). No ledger I/O. */
   async link(userId: string, verified: VerifiedWallet, opts: { label?: string | null; actor: Actor }): Promise<LinkResult> {
     const partyId = verified.partyId.trim();
     if (!WALLET_KIND_ALLOWLIST.includes(verified.kind)) {
@@ -136,16 +134,6 @@ export class WalletLinkService {
     const user = await this.users.findById(userId);
     if (!user) throw new ApiError(404, "not_found", "user not found");
     if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
-
-    // Seed on first link only: the immutable legacy_credited_cc = the party's own on-ledger
-    // depositedCC (deposits credited before the account existed). Relinks keep the stored seed.
-    let seed = existing ? existing.legacyCreditedCC : 0n;
-    let seededFromLedger = false;
-    if (!existing) {
-      const own = await this.ledger.fetchUserWallet(partyId, { uncached: true });
-      seed = own?.depositedCC ?? 0n;
-      seededFromLedger = own !== null;
-    }
 
     // Identity rules (§6) — link mode for the current user. A canton_wallet identity that
     // belongs to another account (active or unlinked) surfaces as wallet_already_linked here.
@@ -213,7 +201,6 @@ export class WalletLinkService {
           label: label ?? null,
           isPrimary: makePrimary,
           status: "active",
-          legacyCreditedCC: seed,
           creditedCC: 0n,
           verifiedAt: now,
           revokedAt: null,
@@ -228,19 +215,6 @@ export class WalletLinkService {
             subjectType: "wallet",
             subjectId: row.id,
             metadata: { userId, partyId, kind: verified.kind, isPrimary: makePrimary, identityId: identity.id },
-            ip: actor.ip ?? null,
-          },
-          manager,
-        );
-        await this.audit.record(
-          {
-            actorType: actor.type,
-            actorUserId: actor.userId ?? null,
-            actorSessionId: actor.sessionId ?? null,
-            action: "wallet.legacy_seeded",
-            subjectType: "wallet",
-            subjectId: row.id,
-            metadata: { userId, partyId, legacyCreditedCC: formatCC(seed), hadLedgerWallet: seededFromLedger },
             ip: actor.ip ?? null,
           },
           manager,
@@ -280,7 +254,7 @@ export class WalletLinkService {
     });
 
     void this.nats.publishSafe(NatsSubjects.walletLinked, { userId, walletId: wallet.id, identityId: identity.id, relinked: Boolean(existing) });
-    return { wallet, identity, seededLegacyCreditedCC: wallet.legacyCreditedCC };
+    return { wallet, identity };
   }
 
   /**

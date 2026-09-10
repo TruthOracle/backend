@@ -246,8 +246,8 @@ describe("KYC (e2e)", () => {
   });
 
   // ───────────────────────────────── mock provider flows (enforce on) ────────────────────────────
-  describe("mock provider — KYC_ENFORCE_WITHDRAWALS=true (+ LEGACY_WALLET_ENDPOINTS_RETIRED=true)", () => {
-    const ctx = useTestApp({ env: { KYC_ENFORCE_WITHDRAWALS: "true", LEGACY_WALLET_ENDPOINTS_RETIRED: "true" } });
+  describe("mock provider — KYC_ENFORCE_WITHDRAWALS=true", () => {
+    const ctx = useTestApp({ env: { KYC_ENFORCE_WITHDRAWALS: "true" } });
 
     it("requiredForWithdrawal is true; an unverified account cannot withdraw (gate: kyc_required) but can deposit", async () => {
       const u = await newUser(ctx, "enf");
@@ -817,9 +817,9 @@ describe("KYC (e2e)", () => {
       expect(cfg.isMainnet).toBe(true);
     });
 
-    it("refuses KYC_ENFORCE_WITHDRAWALS=true without LEGACY_WALLET_ENDPOINTS_RETIRED=true, a sandbox Sumsub token on mainnet, and Sumsub without a webhook secret", () => {
-      expect(() => getConfiguration(testEnv({ KYC_ENFORCE_WITHDRAWALS: "true" }))).toThrow(/LEGACY_WALLET_ENDPOINTS_RETIRED/);
-      expect(getConfiguration(testEnv({ KYC_ENFORCE_WITHDRAWALS: "true", LEGACY_WALLET_ENDPOINTS_RETIRED: "true" })).kycEnforceWithdrawals).toBe(true);
+    it("KYC_ENFORCE_WITHDRAWALS is a plain flag; refuses a sandbox Sumsub token on mainnet, and Sumsub without a webhook secret", () => {
+      expect(getConfiguration(testEnv({ KYC_ENFORCE_WITHDRAWALS: "true" })).kycEnforceWithdrawals).toBe(true);
+      expect(getConfiguration(testEnv()).kycEnforceWithdrawals).toBe(false);
       expect(() => getConfiguration(testEnv({ APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "sbx:token", SUMSUB_WEBHOOK_SECRET: "wh", ...zkpc }))).toThrow(/sbx:/);
       // Sessions would start while every webhook is 401 — refused at boot instead.
       expect(() => getConfiguration(testEnv({ KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "sbx:token", SUMSUB_SECRET_KEY: "k" }))).toThrow(/SUMSUB_WEBHOOK_SECRET/);

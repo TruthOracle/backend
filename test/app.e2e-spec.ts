@@ -107,7 +107,7 @@ describe("App (e2e)", () => {
       const linked = await linkWallet(ctx.agent, cookie, secondary, { label: "cold" });
       expect(linked.wallet).toMatchObject({ partyId: secondary.partyId, isPrimary: false, label: "cold", status: "active" });
       expect(linked.identity).toMatchObject({ provider: "canton_wallet", subject: secondary.partyId, status: "active", kycLocked: false });
-      expect(linked.seededLegacyCreditedCC).toBe("0.0000000000");
+      expect(Object.keys(linked).sort()).toEqual(["identity", "wallet"]);
       const wallets = bodyOf<{ wallets: ApiWallet[] }>(await ctx.agent.get("/api/v1/wallets").set("Cookie", cookie).expect(200));
       expect(wallets.wallets.map((w) => [w.partyId, w.isPrimary])).toEqual([
         [primary.partyId, true],

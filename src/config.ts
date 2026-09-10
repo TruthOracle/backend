@@ -185,9 +185,6 @@ export class Config {
   @IsString()
   readonly truthoraclePackageName!: string;
 
-  @IsBoolean()
-  readonly damlUserWalletHasDepositRefs!: boolean;
-
   readonly keycloak!: KeycloakConfig;
   /** Per-target overrides; empty fields fall back to `keycloak`. */
   readonly ledgerKeycloak!: Partial<KeycloakConfig>;
@@ -199,6 +196,7 @@ export class Config {
   @IsIn(KYC_PROVIDERS as readonly string[])
   readonly kycProvider!: KycProviderSetting;
 
+  /** Gate external withdrawal settlement on an approved KYC (§9.4). A plain flag: money leaves only through this backend. */
   @IsBoolean()
   readonly kycEnforceWithdrawals!: boolean;
 
@@ -214,9 +212,6 @@ export class Config {
 
   @IsString()
   readonly kycPepperRotationAck!: string;
-
-  @IsBoolean()
-  readonly legacyWalletEndpointsRetired!: boolean;
 
   @IsArray()
   readonly payoutExternalReasons!: string[];
@@ -415,7 +410,6 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     enterpriseWalletAppName: str(env.ENTERPRISE_WALLET_APP_NAME, "truthoracle") || "truthoracle",
     truthoraclePackageId: str(env.TRUTHORACLE_PACKAGE_ID),
     truthoraclePackageName: str(env.TRUTHORACLE_PACKAGE_NAME),
-    damlUserWalletHasDepositRefs: parseBool(env.DAML_USER_WALLET_HAS_DEPOSIT_REFS, false),
     keycloak: {
       url: absoluteUrl(env.KEYCLOAK_URL),
       realm: str(env.KEYCLOAK_REALM, "master") || "master",
@@ -437,7 +431,6 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     kycRequiredLevel: str(env.KYC_REQUIRED_LEVEL, "basic-kyc-level") || "basic-kyc-level",
     kycFingerprintPepper: str(env.KYC_FINGERPRINT_PEPPER),
     kycPepperRotationAck: str(env.KYC_PEPPER_ROTATION_ACK).toLowerCase(),
-    legacyWalletEndpointsRetired: parseBool(env.LEGACY_WALLET_ENDPOINTS_RETIRED, false),
     payoutExternalReasons: parseList(env.PAYOUT_EXTERNAL_REASONS ?? "withdraw"),
     payoutInappReasons: parseList(env.PAYOUT_INAPP_REASONS ?? "bond,model-prize"),
     payoutMaxAttempts: parseIntOr(env.PAYOUT_MAX_ATTEMPTS, 5),
@@ -487,11 +480,6 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     if (config.dbSsl === "true" || (config.dbSsl === "auto" && !local)) {
       issues.push("DB_SSL=true/auto does not verify the Postgres server certificate; set DB_SSL=verify (with DB_SSL_CA when needed) or DB_SSL_INSECURE_ACK=true to accept unverified TLS in prod / on mainnet");
     }
-  }
-  if (config.kycEnforceWithdrawals && !config.legacyWalletEndpointsRetired) {
-    issues.push(
-      "KYC_ENFORCE_WITHDRAWALS=true requires LEGACY_WALLET_ENDPOINTS_RETIRED=true (ARCHITECTURE §18: the gate is meaningless while the legacy money endpoints exist)",
-    );
   }
   if (config.isMainnet) {
     const z = config.zkpc;

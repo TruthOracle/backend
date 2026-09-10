@@ -7,14 +7,13 @@ import { IdentityService } from "../services/identity.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { WalletChallengeService } from "../services/wallet-challenge.service";
 import { WalletLinkService } from "../services/wallet-link.service";
-import type { ApiChallenge, ApiIdentity, ApiMoney, ApiWallet } from "../types";
-import { formatCC } from "../util/money";
+import type { ApiChallenge, ApiIdentity, ApiWallet } from "../types";
 
 /**
  * Wallet routes (docs/API.md "Wallets"; ARCHITECTURE §8.1–8.2). Linking runs the same
  * challenge/signature crypto as sign-in with purpose `link-wallet` bound to this session, and the
- * link itself is WalletLinkService.link — the one place the wallet row + seed rule live, shared
- * with `POST /auth/wallet` in link mode.
+ * link itself is WalletLinkService.link — the one place the wallet-row rules live, shared with
+ * `POST /auth/wallet` in link mode. Linking never reads the ledger.
  */
 @ApiTags("wallets")
 @ApiCookieAuth("to_session")
@@ -47,16 +46,13 @@ export class WalletsController {
   }
 
   /**
-   * `200 { wallet, identity, seededLegacyCreditedCC }` | `409 wallet_already_linked`. The claim is
-   * consumed before verification; rejections keep the challenge service's codes (INTERNALS).
+   * `200 { wallet, identity }` | `409 wallet_already_linked`. The claim is consumed before
+   * verification; rejections keep the challenge service's codes (INTERNALS).
    * Rate limit: link 10/min/user.
    */
   @Post("link")
   @HttpCode(200)
-  async link(
-    @Body() body: LinkWalletDto,
-    @Req() req: AuthedRequest,
-  ): Promise<{ wallet: ApiWallet; identity: ApiIdentity; seededLegacyCreditedCC: ApiMoney }> {
+  async link(@Body() body: LinkWalletDto, @Req() req: AuthedRequest): Promise<{ wallet: ApiWallet; identity: ApiIdentity }> {
     const { user, session } = principalOf(req);
     await this.rateLimit.enforce("link", { userId: user.id });
     const verified = await this.challenges.verify({
@@ -76,7 +72,6 @@ export class WalletsController {
     return {
       wallet: this.walletLinks.toApi(linked.wallet),
       identity: this.identities.toApi(linked.identity, locked),
-      seededLegacyCreditedCC: formatCC(linked.seededLegacyCreditedCC),
     };
   }
 

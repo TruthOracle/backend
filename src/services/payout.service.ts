@@ -448,7 +448,7 @@ export class PayoutService {
       try {
         await this.wallet.externalSubmit({
           commandId: walletCreateCommandId,
-          commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: treasury, owner: payee, withDepositRefs: this.config.damlUserWalletHasDepositRefs })],
+          commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: treasury, owner: payee })],
         });
       } catch (err) {
         throw await this.attemptFailed(ctx, err, "wallet-create");

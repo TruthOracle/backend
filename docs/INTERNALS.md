@@ -67,7 +67,7 @@ src/entities/*.entity.ts  UserEntity (to_users), AuthIdentityEntity (to_auth_ide
   SessionEntity (to_sessions), KycVerificationEntity (to_kyc_verifications), KycPersonEntity (to_kyc_persons),
   KycWebhookEventEntity (to_kyc_webhook_events), PayoutEntity (to_payouts), DepositCreditEntity (to_deposit_credits),
   AuditEventEntity (to_audit_events), SettingEntity (to_settings)   — columns exactly as ARCHITECTURE.md §5
-src/migrations/<ts>-Init.ts   creates everything (CREATE EXTENSION IF NOT EXISTS citext), seeds to_settings.app_network
+src/migrations/<ts>-Init.ts   the ONE migration: creates everything (CREATE EXTENSION IF NOT EXISTS citext / pgcrypto), seeds to_settings.app_network — greenfield, no upgrade path (ARCHITECTURE §18)
 
 src/auth/session.guard.ts   SessionGuard (global): resolves the session from the to_session cookie or Authorization: Bearer;
                             sets req.session (SessionEntity), req.user (UserEntity), req.authIdentityId; routes marked @Public() pass
@@ -105,13 +105,13 @@ src/dto/common.dto.ts       PageQueryDto { page?: number }
 `telegramOidcClientId`, `telegramOidcClientSecret`, `telegramOidcIssuer`,
 `adminOperators (Map<partyId, pinnedPublicKey | "">)`,
 `ledgerApiUrl`, `enterpriseWalletUrl`, `treasuryPartyId`, `enterpriseWalletAppName`,
-`truthoraclePackageId`, `truthoraclePackageName`, `damlUserWalletHasDepositRefs`,
+`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v14 — `UserWallet.depositRefs` is mandatory, no feature flag),
 `keycloak: { url, realm, clientId, clientSecret }`, `ledgerKeycloak`, `walletKeycloak` (same shape, optional overrides),
 `zkpc: { ledgerApiUrl, keycloakUrl, keycloakRealm, clientId, clientSecret }`,
-`kycProvider ('mock'|'sumsub')`, `kycEnforceWithdrawals`, `kycRequiredLevel`, `kycFingerprintPepper`, `kycPepperRotationAck`,
-`legacyWalletEndpointsRetired`, `payoutExternalReasons (string[])`, `payoutInappReasons (string[])`, `payoutMaxAttempts`, `payoutScanMs`,
+`kycProvider ('mock'|'sumsub')`, `kycEnforceWithdrawals` (plain flag), `kycRequiredLevel`, `kycFingerprintPepper`, `kycPepperRotationAck`,
+`payoutExternalReasons (string[])`, `payoutInappReasons (string[])`, `payoutMaxAttempts`, `payoutScanMs`, `payoutResendGraceMs`,
 `sumsub: { baseUrl, appToken, secretKey, webhookSecret, duplicateLabels: string[], allowSha1 }`,
-`sessionCleanupMs`, `ledgerCacheMs`, `depositLockTtlMs`, `sentryDsn`, `swaggerEnabled (resolved)`.
+`sessionCleanupMs`, `ledgerCacheMs`, `depositLockTtlMs`, `depositConfirmGraceMs`, `sentryDsn`, `swaggerEnabled (resolved)`.
 
 ## Service signatures other packages rely on
 
@@ -133,13 +133,14 @@ bearerFor(target: "ledger" | "wallet"): Promise<string>       // throws ApiError
 
 // LedgerClientService (reads as the treasury party; package-name filters)
 fetchUserWallet(ownerParty: string): Promise<LedgerWallet | null>     // { contractId, owner, balanceCC: bigint, depositedCC: bigint, withdrawnCC: bigint, depositRefs: string[] }
+                                                                      // a payload without depositRefs (wrong package) → ApiError(502, "upstream_failed"), never []
 fetchAllUserWallets(): Promise<LedgerWallet[]>
 fetchPendingPayouts(): Promise<PendingPayoutRecord[]>                 // { contractId, user, marketId, amountCC: bigint, reason, createdAt }
 fetchPendingPayout(cid: string): Promise<PendingPayoutRecord | null>
 templateId(entity: string): string
 
 // EnterpriseWalletService
-transferHistory(partyId: string, opts?: { uncached?: boolean }): Promise<TransferRow[]>   // paged exactly as walletClient.mjs; Redis cache config.ledgerCacheMs unless uncached
+transferHistory(partyId: string, opts?: { uncached?: boolean }): Promise<TransferRow[]>   // paged GET /api/v1/history/{party} (wallet v0.1.35+; a 404 is upstream_failed); Redis cache config.ledgerCacheMs unless uncached
 totalReceivedFrom(rows: TransferRow[], partyId: string, counterparty: string): bigint      // fixed point; settled Amulet inbound only
 transferStatus(partyId, commandId): Promise<{ known: boolean; submitted: boolean; status: string | null }>   // known=false means the read failed → callers fail closed
 externalSubmit(args: { commandId; commands: unknown[]; disclosedContracts?: unknown[] }): Promise<{ commandId; status }>   // partyId = treasury, appName from config
@@ -187,13 +188,15 @@ verify(input: { challengeId; partyId; publicKey; signature; expectedPurpose: Cha
 completeLogin(res, claim, ctx: { req; kind: 'user'|'admin'; client: 'web'|'native' }): Promise<LoginResult>   // resolveForLogin → SessionService.issue → cookie/bearer → audit + NATS
 
 // WalletLinkService (P2)
-link(userId, verified: { partyId; publicKeyBase64; kind }, opts: { label?; actor }): Promise<{ wallet: WalletEntity; identity: AuthIdentityEntity; seededLegacyCreditedCC: bigint }>
+link(userId, verified: { partyId; publicKeyBase64; kind }, opts: { label?; actor }): Promise<{ wallet: WalletEntity; identity: AuthIdentityEntity }>   // no ledger I/O (§8.1)
 findByParty(partyId): Promise<WalletEntity | null>            // active OR revoked
 listForUser(userId): Promise<WalletEntity[]>; unlink(userId, walletId, actor): Promise<void>; setPrimary(userId, walletId, actor): Promise<WalletEntity>
 toApi(wallet, extras?: { ownLedgerWallet?: LedgerWallet|null; receivedCC?: bigint }): ApiWallet
 
 // DepositService (P2)
 reconcile(userId, actor): Promise<ReconcileResult>; confirmPending(userId?): Promise<{ confirmed: number; failed: number }>; overview(userId): Promise<InAppWalletOverview>
+planCredit({ wallets: { id; partyId; creditedCC; receivedCC }[]; primaryPartyId; ledgerDepositedCC }): CreditPlan   // pure: owed = received − credited; expected = Σ credited; |delta| > DUST → drift (over_credit | ledger_below_expected | ledger_above_expected)
+// confirm rule: UserWallet.depositRefs contains row.txRef (the only rule; depositedCC is never consulted)
 
 // PayoutService (P3)
 settle(cid: string, actor: { type: 'user'|'admin'|'system'; userId?: string; sessionId?: string; force?: boolean; reason?: string }): Promise<{ payout: PayoutEntity; mode: 'external'|'in_app'|'already_settled' }>
@@ -215,8 +218,10 @@ test/helpers/app.ts       createTestApp(overrides?): Promise<{ app: INestApplica
                           // real Postgres (TEST_DATABASE_URL, default postgresql://localhost:5432/truthoracle_backend_test — created on demand
                           // with `createdb` if missing) with migrations run once per Jest worker and tables truncated in beforeEach;
                           // real Redis (TEST_REDIS_URL, default redis://localhost:6379/1, FLUSHDB in beforeEach); FakeNatsService (records
-                          // publishes; `dispatch(subject, payload)` invokes registered consumers); FakeLedgerClient + FakeEnterpriseWallet
-                          // (in-memory UserWallets / PendingPayouts / transfer rows with helpers to seed); KYC provider = mock unless overridden
+                          // publishes; `dispatch(subject, payload)` invokes registered consumers); FakeLedgerClient (in-memory UserWallets /
+                          // PendingPayouts; records every read in `reads` / `fetchUserWalletCalls()`; `failReads` makes every read throw) +
+                          // FakeEnterpriseWallet (transfer rows, applies treasury commands to the fake ledger, requires depositRefs on Create);
+                          // KYC provider = mock unless overridden
 test/helpers/wallet.ts    makeTestWallet(hint = "test"): { partyId; publicKeyBase64; publicKeyHex; sign(message: string): string /*base64*/ }  // Ed25519 keypair whose party id is hint::<fingerprint>
 test/helpers/fakes.ts     FakeNatsService, FakeLedgerClient, FakeEnterpriseWallet, FakeKycProvider (optional)
 test/helpers/session.ts   signInWithWallet(agent, wallet, purpose?): Promise<{ user; cookie: string }>   // runs the real challenge/verify flow

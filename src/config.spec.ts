@@ -26,7 +26,7 @@ describe("config", () => {
       COOKIE_SECURE: "auto",
       SWAGGER_ENABLED: "auto",
       GOOGLE_NONCE_REQUIRED: "auto",
-      DAML_USER_WALLET_HAS_DEPOSIT_REFS: "yes",
+      KYC_ENFORCE_WITHDRAWALS: "yes",
       PAYOUT_INAPP_REASONS: "bond, model-prize",
       SUMSUB_DUPLICATE_LABELS: "duplicate,fraud",
     });
@@ -38,7 +38,7 @@ describe("config", () => {
     expect(c.cookieSecure).toBe(false);
     expect(c.swaggerEnabled).toBe(true);
     expect(c.googleNonceRequired).toBe(false);
-    expect(c.damlUserWalletHasDepositRefs).toBe(true);
+    expect(c.kycEnforceWithdrawals).toBe(true);
     expect(c.payoutInappReasons).toEqual(["bond", "model-prize"]);
     expect(c.payoutExternalReasons).toEqual(["withdraw"]);
     expect(c.sumsub.duplicateLabels).toEqual(["DUPLICATE", "FRAUD"]);
@@ -82,7 +82,6 @@ describe("config", () => {
         { APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "sbx:abc", ZKPC_LEDGER_API_URL: "https://l", ZKPC_KEYCLOAK_URL: "https://k", ZKPC_KEYCLOAK_CLIENT_ID: "c", ZKPC_KEYCLOAK_CLIENT_SECRET: "s" },
         /sandbox token/,
       ],
-      ["enforce without retirement attestation", { KYC_ENFORCE_WITHDRAWALS: "true" }, /LEGACY_WALLET_ENDPOINTS_RETIRED/],
       ["mainnet without ZKPC", { APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub" }, /ZKPC_/],
       ["cookie domain with proxy secret", { COOKIE_DOMAIN: "example.com", BACKEND_PROXY_SECRET: "x".repeat(32) }, /COOKIE_DOMAIN/],
       ["bad operator party", { ADMIN_OPERATORS: "not-a-party=abc" }, /ADMIN_OPERATORS/],
@@ -97,7 +96,9 @@ describe("config", () => {
     });
 
     it("accepts the safe combinations", () => {
-      expect(() => cfg({ KYC_ENFORCE_WITHDRAWALS: "true", LEGACY_WALLET_ENDPOINTS_RETIRED: "true" })).not.toThrow();
+      // KYC enforcement is a plain flag: nothing else has to be attested first (ARCHITECTURE §18).
+      expect(cfg({ KYC_ENFORCE_WITHDRAWALS: "true" }).kycEnforceWithdrawals).toBe(true);
+      expect(cfg().kycEnforceWithdrawals).toBe(false);
       expect(cfg({ APP_ENV: "prod", KYC_PROVIDER: "sumsub", DATABASE_URL: "postgresql://u:p@db.remote:5432/x", DB_SSL: "verify" }).dbSsl).toBe("verify");
       expect(cfg({ APP_ENV: "prod", KYC_PROVIDER: "sumsub", DATABASE_URL: "postgresql://u:p@db.remote:5432/x", DB_SSL_INSECURE_ACK: "true" }).dbSslInsecureAck).toBe(true);
       expect(cfg({ KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "prd:x", SUMSUB_SECRET_KEY: "k", SUMSUB_WEBHOOK_SECRET: "w" }).sumsub.webhookSecret).toBe("w");

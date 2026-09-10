@@ -338,7 +338,7 @@ export class IdentityService {
     if (email) identity.email = email;
     await repo.save(identity);
     if (identity.provider === "canton_wallet") {
-      // The wallet row follows the identity back (credited/legacy amounts untouched — §8.1).
+      // The wallet row follows the identity back (credited_cc untouched — §8.1).
       await manager
         .getRepository(WalletEntity)
         .update({ userId: identity.userId, partyId: identity.subject, status: "revoked" }, { status: "active", revokedAt: null });

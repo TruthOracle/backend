@@ -76,8 +76,9 @@ widget; `KycPanel` switches on the `provider` field returned by `GET /kyc`.
    branch in `KycPanel` keyed on `provider`; the mock and Sumsub branches show the pattern.
 6. Vendor dashboard: webhook URL `https://<app-host>/__backend/api/v1/webhooks/kyc/<name>`,
    webhook secret, and (if offered) the vendor's own duplicate-applicant restriction.
-7. Rollout: run with `KYC_ENFORCE_WITHDRAWALS=false` first so approvals accumulate; flip it
-   only after `LEGACY_WALLET_ENDPOINTS_RETIRED=true` (ARCHITECTURE §18).
+7. Rollout: run with `KYC_ENFORCE_WITHDRAWALS=false` first so approvals accumulate, then flip
+   it — a plain flag; money leaves only through this backend (ARCHITECTURE §18), so nothing
+   has to be attested first.
 
 ## 6. Runbooks
 

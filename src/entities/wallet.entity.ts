@@ -57,11 +57,7 @@ export class WalletEntity {
   @Column({ type: "text", default: "active" })
   status!: WalletStatus;
 
-  /** Immutable seed at link time = the party's own on-ledger `UserWallet.depositedCC` (0 if none). */
-  @Column({ name: "legacy_credited_cc", type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
-  legacyCreditedCC!: bigint;
-
-  /** In-app credits attributed to this wallet by the backend since link. */
+  /** In-app credits attributed to this wallet by the backend (the only attribution there is — §8.3). */
   @Column({ name: "credited_cc", type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
   creditedCC!: bigint;
 

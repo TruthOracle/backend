@@ -190,7 +190,7 @@ export interface LedgerWallet {
   balanceCC: bigint;
   depositedCC: bigint;
   withdrawnCC: bigint;
-  /** Empty when the Daml version has no `depositRefs` field (DAML_USER_WALLET_HAS_DEPOSIT_REFS=false). */
+  /** `UserWallet.depositRefs : [Text]` — every txRef already credited; the confirm pass keys on it (§8.3). */
   depositRefs: string[];
 }
 
@@ -232,7 +232,6 @@ export const NatsSubjects = {
   walletUnlinked: "truthoracle.wallet.unlinked",
   walletPrimaryChanged: "truthoracle.wallet.primary_changed",
   depositCredited: "truthoracle.deposit.credited",
-  depositHealed: "truthoracle.deposit.healed",
   depositDrift: "truthoracle.deposit.drift",
   payoutSettled: "truthoracle.payout.settled",
   payoutBlocked: "truthoracle.payout.blocked",
@@ -269,11 +268,9 @@ export type AuditAction =
   | "wallet.relinked"
   | "wallet.unlinked"
   | "wallet.primary_changed"
-  | "wallet.legacy_seeded"
   | "deposit.submitted"
   | "deposit.credited"
   | "deposit.failed"
-  | "deposit.attribution_healed"
   | "deposit.attribution_drift"
   | "payout.seen"
   | "payout.settled"
@@ -338,7 +335,6 @@ export interface ApiWallet {
   status: WalletStatus;
   verifiedAt: string;
   creditedCC: ApiMoney;
-  legacyCreditedCC: ApiMoney;
   receivedCC?: ApiMoney;
   ownLedgerWallet: ApiLedgerWallet | null;
 }
@@ -478,8 +474,8 @@ export interface InAppWalletOverview {
   partyId: string | null;
   ledger: ApiLedgerWallet | null;
   wallets: ApiWallet[];
+  /** `delta = ledgerDepositedCC − creditedTotalCC`; anything beyond DUST refuses the next reconcile (§8.3). */
   attribution: {
-    legacyPrimaryCC: ApiMoney;
     creditedTotalCC: ApiMoney;
     ledgerDepositedCC: ApiMoney;
     delta: ApiMoney;

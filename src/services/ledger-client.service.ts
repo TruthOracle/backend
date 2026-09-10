@@ -151,15 +151,28 @@ export class LedgerClientService {
     return out;
   }
 
+  /**
+   * `depositRefs` is mandatory on the deployed Daml (truthoracle-v14 `UserWallet.depositRefs :
+   * [Text]`) and is THE confirmation rule of the deposit confirm pass, so a payload without it is
+   * not "an older wallet" — it is the wrong package (or a changed JSON shape) and every read fails
+   * closed as an upstream error rather than pretending the wallet carries no credits.
+   */
   private walletFrom(row: ActiveContract): LedgerWallet {
     const p = row.payload;
+    let depositRefs: string[];
+    try {
+      depositRefs = parseDepositRefs(p.depositRefs);
+    } catch (err) {
+      this.logger.error(`UserWallet ${row.contractId} (owner ${asString(p.owner)}): ${(err as Error).message}; is TRUTHORACLE_PACKAGE_ID the deployed truthoracle-v14?`);
+      throw new ApiError(502, "upstream_failed", "ledger returned a UserWallet without depositRefs", { contractId: row.contractId });
+    }
     return {
       contractId: row.contractId,
       owner: asString(p.owner),
       balanceCC: tryParseCC(p.balanceCC) ?? 0n,
       depositedCC: tryParseCC(p.depositedCC) ?? 0n,
       withdrawnCC: tryParseCC(p.withdrawnCC) ?? 0n,
-      depositRefs: parseDepositRefs(p.depositRefs),
+      depositRefs,
     };
   }
 
@@ -169,7 +182,7 @@ export class LedgerClientService {
    *
    * UserWallet has no contract key, so two racing Creates could mint two wallets for one owner.
    * The backend keys every Create on one deterministic command id per owner precisely so that
-   * cannot happen; should it happen anyway (a legacy tool, a hand-run command) the balance is
+   * cannot happen; should it happen anyway (a hand-run command, another tool) the balance is
    * split across contracts and every attribution invariant is void. That is never silently
    * resolved to "the first one": it is reported and refused as attribution drift.
    */
@@ -225,24 +238,28 @@ export class LedgerClientService {
 }
 
 /**
- * The one shape of a treasury-created UserWallet: empty (0 / 0 / 0). Both the deposit path and
- * the in-app payout path create wallets through this with the SAME deterministic command id
- * (`walletCreateCommandIdFor(owner)`), so two racing Creates collide on ledger command-dedup
- * instead of minting two wallets — UserWallet has no contract key to stop that on-ledger.
- * `depositRefs` is only sent when the deployed Daml carries the field (1.0.0 has none; on 2.0.0
- * an omitted Optional defaults to None — port of api/wallet/deposit.mjs).
+ * The one shape of a treasury-created UserWallet: empty (0 / 0 / 0, no refs). Both the deposit
+ * path and the in-app payout path create wallets through this with the SAME deterministic command
+ * id (`walletCreateCommandIdFor(owner)`), so two racing Creates collide on ledger command-dedup
+ * instead of minting two wallets — UserWallet has no contract key to stop that on-ledger. The
+ * credit itself is always an `Exercise Deposit { amountCC, txRef }` on the wallet that exists,
+ * which is what appends `txRef` to `depositRefs` (mandatory `[Text]` on truthoracle-v14).
  */
-export function userWalletCreateCommand(input: { templateId: string; admin: string; owner: string; withDepositRefs: boolean }): unknown {
+export function userWalletCreateCommand(input: { templateId: string; admin: string; owner: string }): unknown {
   const zero = formatCC(0n);
-  const createArguments: Record<string, unknown> = {
-    admin: input.admin,
-    owner: input.owner,
-    balanceCC: zero,
-    depositedCC: zero,
-    withdrawnCC: zero,
+  return {
+    CreateCommand: {
+      templateId: input.templateId,
+      createArguments: {
+        admin: input.admin,
+        owner: input.owner,
+        balanceCC: zero,
+        depositedCC: zero,
+        withdrawnCC: zero,
+        depositRefs: [],
+      },
+    },
   };
-  if (input.withDepositRefs) createArguments.depositRefs = [];
-  return { CreateCommand: { templateId: input.templateId, createArguments } };
 }
 
 /** `wallet-create-<sha256(owner)[:40]>` — one Create per owner, whoever submits it first. */
@@ -251,15 +268,14 @@ export function walletCreateCommandIdFor(ownerParty: string): string {
 }
 
 /**
- * Daml `Optional [Text]` arrives as `null` / `["…"]` on the JSON Ledger API v2; older tooling
- * (and nested optionals) use `{ "Some": [...] }` / `"None"`. Missing = pre-2.0.0 Daml.
+ * Daml `[Text]` arrives as a JSON array on the JSON Ledger API v2. The field is mandatory on
+ * truthoracle-v14, so anything else — missing, null, an Optional wrapper from another package
+ * version — is a hard parse error: the caller must fail the read, never default to "no refs"
+ * (which would let the confirm pass mistake a landed credit for one that never happened).
  */
 export function parseDepositRefs(value: unknown): string[] {
-  if (value === null || value === undefined || value === "None") return [];
-  if (Array.isArray(value)) return value.map((v) => String(v));
-  if (typeof value === "object") {
-    const some = (value as { Some?: unknown; value?: unknown }).Some ?? (value as { value?: unknown }).value;
-    if (Array.isArray(some)) return some.map((v) => String(v));
+  if (!Array.isArray(value)) {
+    throw new Error(`UserWallet.depositRefs is ${value === undefined ? "missing" : `not a list (${JSON.stringify(value)})`}`);
   }
-  return [];
+  return value.map((v) => String(v));
 }

@@ -19,11 +19,13 @@ import { RedisService } from "./redis.service";
 const INBOUND = new Set(["in", "incoming", "inbound", "receive", "received", "credit"]);
 const OUTBOUND = new Set(["out", "outgoing", "outbound", "send", "sent", "debit"]);
 
-// Wallet v0.1.35 history rows carry a status ("completed" observed on DevNet). Only
+// Wallet v0.1.35+ history rows carry a status ("completed" observed on DevNet). Only
 // clearly-final states count toward what a user has sent in: crediting a pending or
-// failed transfer would mint balance for money that never arrived. Missing status
-// (pre-0.1.35 rows) keeps the old behavior of counting the row.
+// failed transfer would mint balance for money that never arrived. A row without a
+// status is an unknown shape and is skipped (and reported) like an unknown status.
 const SETTLED = new Set(["completed", "complete", "settled", "success", "succeeded", "confirmed", "final"]);
+/** Non-final statuses the wallet is known to emit — skipped silently (the next reconcile picks them up once final). */
+const NOT_SETTLED = new Set(["failed", "rejected", "cancelled", "canceled", "expired", "pending"]);
 
 /**
  * Page size for history reads. The wallet's documented default (100000) is above what it can
@@ -98,10 +100,10 @@ export function totalReceivedFrom(
     if (row?.instrumentId !== instrumentId) continue;
 
     const status = String(row?.status ?? "").trim().toLowerCase();
-    if (status && !SETTLED.has(status)) {
-      // Unknown statuses are skipped too, and loudly: under-crediting is recoverable (the next
-      // reconcile picks it up once the status is added), over-crediting is a mint.
-      if (!["failed", "rejected", "cancelled", "canceled", "expired", "pending"].includes(status)) skipped += 1;
+    if (!SETTLED.has(status)) {
+      // Unknown (or missing) statuses are skipped too, and loudly: under-crediting is recoverable
+      // (the next reconcile picks it up once the status is added), over-crediting is a mint.
+      if (!NOT_SETTLED.has(status)) skipped += 1;
       continue;
     }
 
@@ -170,12 +172,12 @@ export class EnterpriseWalletService {
    * reconciliation must see ALL of it — a truncated result would understate what a user has
    * sent in and silently under-credit them.
    *
-   * Wallet v0.1.35 replaced `GET /api/v1/transfer/{partyId}` with a unified
-   * `GET /api/v1/history/{partyId}` returning `{ events: [{ eventType, timestamp, event }] }`,
-   * where each `event` payload is either a transfer or a swap. We flatten to the payloads —
-   * swap events carry no `instrumentId`, so `totalReceivedFrom` skips them naturally. The old
-   * flat-array endpoint remains as a fallback for pre-0.1.35 deployments (e.g. the local docker
-   * wallet). Cached in Redis for `ledgerCacheMs` unless `uncached` (the reconcile route).
+   * Wallet v0.1.35+ serves `GET /api/v1/history/{partyId}` returning
+   * `{ events: [{ eventType, timestamp, event }] }`, where each `event` payload is either a
+   * transfer or a swap. We flatten to the payloads — swap events carry no `instrumentId`, so
+   * `totalReceivedFrom` skips them naturally. There is no other history endpoint: a 404 here is
+   * an upstream failure (wrong wallet version or URL), never a reason to try an older shape.
+   * Cached in Redis for `ledgerCacheMs` unless `uncached` (the reconcile route).
    */
   async transferHistory(partyId: string, opts: { uncached?: boolean; pageSize?: number } = {}): Promise<TransferRow[]> {
     const cacheKey = `wallet:history:${partyId}`;
@@ -204,15 +206,7 @@ export class EnterpriseWalletService {
       );
       return events.map((item) => (item?.event ?? item) as TransferRow);
     } catch (e) {
-      if (!(e instanceof UpstreamError) || e.status !== 404) {
-        throw this.asApiError(e, "wallet history read failed");
-      }
-    }
-    try {
-      const rows = await this.wallet<unknown>(`/api/v1/transfer/${party}?limit=${pageSize}`);
-      return Array.isArray(rows) ? (rows as TransferRow[]) : [];
-    } catch (e) {
-      throw this.asApiError(e, "wallet transfer list read failed");
+      throw this.asApiError(e, "wallet history read failed");
     }
   }
 

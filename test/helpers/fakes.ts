@@ -106,12 +106,22 @@ export class FakeNatsService {
 // Ledger
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * In-memory ledger (UserWallets keyed by owner, PendingPayouts by cid). Every read is recorded in
+ * `reads` (`"fetchUserWallet:<party>"`, `"fetchAllUserWallets"`, `"fetchPendingPayouts"`,
+ * `"fetchPendingPayout:<cid>"`) so specs can assert a route never touched the ledger; `failReads`
+ * makes every read throw (the ledger / its Keycloak being down).
+ */
 export class FakeLedgerClient {
   /** owner party → active UserWallet */
   readonly wallets = new Map<string, LedgerWallet>();
   /** contractId → active PendingPayout */
   readonly payouts = new Map<string, PendingPayoutRecord>();
   readonly archived = new Set<string>();
+  /** Every read made through this fake, in order. */
+  readonly reads: string[] = [];
+  /** When set, every read throws it (nothing is recorded as read); use an `ApiError(502, "upstream_failed")` to mirror the real client. */
+  failReads: Error | null = null;
   private seq = 0;
 
   isConfigured(): boolean {
@@ -170,25 +180,40 @@ export class FakeLedgerClient {
     return null;
   }
 
+  /** Reads made to `fetchUserWallet`, as owner parties. */
+  fetchUserWalletCalls(): string[] {
+    return this.reads.filter((r) => r.startsWith("fetchUserWallet:")).map((r) => r.slice("fetchUserWallet:".length));
+  }
+
+  private read(what: string): void {
+    if (this.failReads) throw this.failReads;
+    this.reads.push(what);
+  }
+
   async fetchUserWallet(ownerParty: string): Promise<LedgerWallet | null> {
+    this.read(`fetchUserWallet:${ownerParty}`);
     const w = this.wallets.get(ownerParty);
     return w ? { ...w, depositRefs: [...w.depositRefs] } : null;
   }
 
   async fetchAllUserWallets(): Promise<LedgerWallet[]> {
+    this.read("fetchAllUserWallets");
     return [...this.wallets.values()].map((w) => ({ ...w, depositRefs: [...w.depositRefs] }));
   }
 
   async fetchPendingPayouts(): Promise<PendingPayoutRecord[]> {
+    this.read("fetchPendingPayouts");
     return [...this.payouts.values()].map((p) => ({ ...p }));
   }
 
   async fetchPendingPayout(cid: string): Promise<PendingPayoutRecord | null> {
+    this.read(`fetchPendingPayout:${cid}`);
     const p = this.payouts.get(cid);
     return p ? { ...p } : null;
   }
 
   async activeContracts(_party: string, entity: string): Promise<{ contractId: string; payload: Record<string, unknown> }[]> {
+    this.read(`activeContracts:${entity}`);
     if (entity === "UserWallet") {
       return [...this.wallets.values()].map((w) => ({
         contractId: w.contractId,
@@ -208,6 +233,8 @@ export class FakeLedgerClient {
     this.wallets.clear();
     this.payouts.clear();
     this.archived.clear();
+    this.reads.length = 0;
+    this.failReads = null;
     this.seq = 0;
   }
 }
@@ -393,11 +420,13 @@ export class FakeEnterpriseWallet {
       if (!templateId.endsWith(":UserWallet")) throw new Error(`fake ledger: cannot create ${templateId}`);
       const owner = asString(a.owner);
       if (this.ledger.wallets.has(owner)) throw new Error(`fake ledger: UserWallet already exists for ${owner}`);
+      // `depositRefs : [Text]` is mandatory on truthoracle-v14: the real ledger rejects a Create without it.
+      if (!Array.isArray(a.depositRefs)) throw new Error("fake ledger: UserWallet.depositRefs is mandatory (missing or not a list)");
       this.ledger.seedUserWallet(owner, {
         balanceCC: asString(a.balanceCC, "0"),
         depositedCC: asString(a.depositedCC, "0"),
         withdrawnCC: asString(a.withdrawnCC, "0"),
-        depositRefs: Array.isArray(a.depositRefs) ? a.depositRefs.map(String) : [],
+        depositRefs: a.depositRefs.map(String),
       });
       return;
     }

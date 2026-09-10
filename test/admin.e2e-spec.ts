@@ -40,7 +40,7 @@ const FP64 = "a".repeat(64);
 
 describe("Admin API (e2e)", () => {
   const ctx = useTestApp({
-    env: { ADMIN_OPERATORS: operator.partyId, KYC_ENFORCE_WITHDRAWALS: "true", LEGACY_WALLET_ENDPOINTS_RETIRED: "true", PAYOUT_SCAN_MS: "600000" },
+    env: { ADMIN_OPERATORS: operator.partyId, KYC_ENFORCE_WITHDRAWALS: "true", PAYOUT_SCAN_MS: "600000" },
   });
 
   let admin: { cookie: string; userId: string };
@@ -205,7 +205,7 @@ describe("Admin API (e2e)", () => {
       await identities.resolveForLogin({ provider: "canton_wallet", subject: secondary.partyId }, { currentUser: target.user });
       const wallets = ctx.dataSource.getRepository(WalletEntity);
       await wallets.save(
-        wallets.create({ userId: target.user.id, chain: "canton", kind: "cantor8", partyId: secondary.partyId, publicKey: secondary.publicKeyBase64, label: "cold", isPrimary: false, status: "active", legacyCreditedCC: parseCC("1.5"), creditedCC: 0n, verifiedAt: new Date(), revokedAt: null }),
+        wallets.create({ userId: target.user.id, chain: "canton", kind: "cantor8", partyId: secondary.partyId, publicKey: secondary.publicKeyBase64, label: "cold", isPrimary: false, status: "active", creditedCC: parseCC("1.5"), verifiedAt: new Date(), revokedAt: null }),
       );
       ctx.ledger.seedUserWallet(secondary.partyId, { balanceCC: "3", depositedCC: "3" });
 
@@ -233,7 +233,8 @@ describe("Admin API (e2e)", () => {
       expect(detail.wallets).toHaveLength(2);
       const [w1, w2] = detail.wallets;
       expect(w1).toMatchObject({ partyId: primary.partyId, isPrimary: true, ownLedgerWallet: null });
-      expect(w2).toMatchObject({ partyId: secondary.partyId, isPrimary: false, label: "cold", legacyCreditedCC: "1.5000000000" });
+      expect(w2).toMatchObject({ partyId: secondary.partyId, isPrimary: false, label: "cold", creditedCC: "1.5000000000" });
+      expect(Object.keys(w2).filter((k) => k.endsWith("CC"))).toEqual(["creditedCC"]);
       expect(w2.ownLedgerWallet).toMatchObject({ owner: secondary.partyId, balanceCC: "3.0000000000" });
       expect(detail.kyc).toMatchObject({ provider: "mock", status: "approved", attachedIdentityId: google.identity.id, requiredForWithdrawal: true });
       expect(detail.kyc.history).toHaveLength(1);

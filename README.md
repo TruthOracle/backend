@@ -73,8 +73,12 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm test` | unit specs (`src/**/*.spec.ts`) |
 | `npm run test:e2e [-- test/session.e2e-spec.ts]` | e2e specs against `TEST_DATABASE_URL` (default `postgresql://localhost:5432/truthoracle_backend_test`, created on demand with `createdb`) and `TEST_REDIS_URL` (default `redis://localhost:6379/1`, flushed before every test) |
 | `npm run typeorm -- <cmd>` | TypeORM CLI against `dist/data-source.js` |
-| `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration |
+| `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (against a migrated database it must print "No changes in database schema") |
 | `npm run migration:run` · `migration:revert` | apply / roll back |
+
+There is exactly one migration (`src/migrations/<ts>-Init.ts`, the final schema): this version is
+greenfield (ARCHITECTURE §18) — a database created by an earlier layout is dropped and recreated,
+never upgraded.
 
 Jest runs in CommonJS with `test/esm-to-cjs.transformer.cjs` converting the ESM-only packages
 (`@nestjs/*`, `jose`) — it passes on Node 22 and 24+.
@@ -86,26 +90,31 @@ its default and the boot refusal it participates in. Highlights: `APP_NETWORK` s
 key prefix, the NATS stream (`TRUTHORACLE_<NETWORK>`) and, on mainnet, the `ZKPC_*` ledger
 credentials; `BACKEND_PROXY_SECRET` is what lets the Vercel proxy's `x-real-ip` /
 `x-forwarded-host` be trusted; `KYC_PROVIDER=mock` is refused in prod and on mainnet;
-`KYC_ENFORCE_WITHDRAWALS=true` requires `LEGACY_WALLET_ENDPOINTS_RETIRED=true`.
+`KYC_ENFORCE_WITHDRAWALS` is a plain flag. The Daml package is **truthoracle-v14 1.0.0**
+(`TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a`,
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v14`); `UserWallet.depositRefs` is mandatory there and is
+what the deposit confirm pass keys on.
 
 ## Status
 
 Every package has landed and been reconciled: F (foundation) plus P1–P5 (auth + me, wallets +
 deposits, payouts, KYC with the mock provider and the Sumsub reference adapter, admin). No route
-answers `501 not_implemented` any more; every route in `docs/API.md` is implemented and covered
-by an e2e spec (`test/{session,app,auth,wallets,payouts,kyc,admin}.e2e-spec.ts`).
+answers `501 not_implemented`; every route in `docs/API.md` is implemented and covered by an
+e2e spec (`test/{session,app,auth,wallets,payouts,kyc,admin}.e2e-spec.ts`).
+
+**Greenfield (ARCHITECTURE §18, decided 2026-09-10):** no backward compatibility with the earlier
+account-less app. The primary wallet's on-ledger `UserWallet` is created only by this backend;
+deposits and withdrawals require a signed-in account; linking never reads the ledger (a first-time
+wallet sign-in succeeds while the ledger is down); deposit confirmation keys on
+`UserWallet.depositRefs`; attribution drift in either direction is a hard
+`409 deposit_attribution_drift`; one `Init` migration creates the final schema; package
+truthoracle-v14.
 
 Verified on 2026-09-10: `npm run typecheck`, `npm run lint`, `npm run build` exit 0;
-`npm test` 12 suites / 104 tests; `npm run test:e2e` 7 suites / 136 tests against real
-Postgres + Redis (no `test.failing` markers remain). A live boot against Postgres + Redis + a
-JetStream `nats-server`, driven **through the `truthoracle-canton` vite relay**
-(`/__backend/api/v1`), passes the sequence in `docs/RUNBOOK.md` §8 — health, wallet sign-in
-with the relayed `to_session` cookie, mock KYC approval, linking a second wallet, deposit
-reconcile answering `502 upstream_failed` against an unreachable treasury, sessions, logout,
-CSRF/404 envelopes — and the boot refusals in §1 exit 1 within a second.
-
-Known behaviour worth knowing before deploying (details in `docs/RUNBOOK.md` §9): the first
-sign-in or link of a **never-seen** wallet reads that party's on-ledger `UserWallet` to seed
-`legacy_credited_cc`, so it answers `502 upstream_failed` while the ledger or its Keycloak is
-unreachable (deliberately fail-closed — a wrong seed would double-credit later). Sign-ins with an
-already-linked wallet, Google and Telegram do not touch the ledger.
+`npm test` 21 suites / 150 tests; `npm run test:e2e` 7 suites / 161 tests against real
+Postgres + Redis. A live boot against Postgres + Redis + a JetStream `nats-server`, driven
+**through the `truthoracle-canton` vite relay** (`/__backend/api/v1`), passes the sequence in
+`docs/RUNBOOK.md` §8 — health, wallet sign-in with the relayed `to_session` cookie, mock KYC
+approval, linking a second wallet, deposit reconcile answering `502 upstream_failed` against an
+unreachable treasury, sessions, logout, CSRF/404 envelopes — and the boot refusals in §1 exit 1
+within a second.

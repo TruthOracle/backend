@@ -211,7 +211,7 @@ describe("auth (e2e)", () => {
       // §7.3 "On success": identity + wallet row seeded, first wallet primary, users.party_id set.
       const wallets = await repo(WalletEntity).find({ where: { userId: result.user.id } });
       expect(wallets).toHaveLength(1);
-      expect(wallets[0]).toMatchObject({ partyId: w.partyId, isPrimary: true, status: "active", kind: "cantor8", publicKey: w.publicKeyBase64, legacyCreditedCC: 0n, creditedCC: 0n });
+      expect(wallets[0]).toMatchObject({ partyId: w.partyId, isPrimary: true, status: "active", kind: "cantor8", publicKey: w.publicKeyBase64, creditedCC: 0n });
       const user = await repo(UserEntity).findOneByOrFail({ id: result.user.id });
       expect(user.partyId).toBe(w.partyId);
       const identities = await repo(AuthIdentityEntity).find({ where: { userId: result.user.id } });
@@ -370,7 +370,7 @@ describe("auth (e2e)", () => {
       expect(me.user).toMatchObject({ id: result.user.id, partyId: w.partyId, status: "active" });
       expect(me.identities).toEqual([expect.objectContaining({ id: result.identity.id, provider: "canton_wallet", subject: w.partyId, status: "active", kycLocked: false })]);
       expect(me.wallets).toEqual([
-        expect.objectContaining({ chain: "canton", kind: "cantor8", partyId: w.partyId, isPrimary: true, status: "active", creditedCC: "0.0000000000", legacyCreditedCC: "0.0000000000", ownLedgerWallet: null }),
+        expect.objectContaining({ chain: "canton", kind: "cantor8", partyId: w.partyId, isPrimary: true, status: "active", creditedCC: "0.0000000000", ownLedgerWallet: null }),
       ]);
       expect(me.capabilities).toMatchObject({ primaryPartyId: w.partyId, isAdmin: false });
       expect(me.kyc).toMatchObject({ status: "none" });

@@ -1047,7 +1047,6 @@ describe("payouts (e2e)", () => {
           label: "cold",
           isPrimary: false,
           status: "revoked",
-          legacyCreditedCC: 0n,
           creditedCC: 0n,
           verifiedAt: new Date(),
           revokedAt: new Date(),
@@ -1111,7 +1110,6 @@ describe("payouts (e2e)", () => {
     const ctx = useTestApp({
       env: {
         KYC_ENFORCE_WITHDRAWALS: "true",
-        LEGACY_WALLET_ENDPOINTS_RETIRED: "true",
         PAYOUT_SCAN_MS: "600000",
       },
     });

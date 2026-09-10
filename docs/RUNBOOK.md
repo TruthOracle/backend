@@ -17,7 +17,6 @@ configured.
 | `BACKEND_PROXY_SECRET must be at least 32 characters when set` | short proxy secret | same value on both sides (`truthoracle-canton` `BACKEND_PROXY_SECRET`) |
 | `KYC_PROVIDER=mock is refused when APP_ENV=prod or APP_NETWORK=mainnet` | mock KYC in a real environment | set `KYC_PROVIDER` to the chosen vendor adapter (not selected yet — see docs/KYC.md §5; `sumsub` is the reference adapter) |
 | `SUMSUB_APP_TOKEN is a sandbox token (sbx:) but APP_NETWORK=mainnet` | sandbox credentials on mainnet | use the production app token |
-| `KYC_ENFORCE_WITHDRAWALS=true requires LEGACY_WALLET_ENDPOINTS_RETIRED=true` | gate switched on before the legacy endpoints were retired | see §3 |
 | `APP_NETWORK=mainnet requires ZKPC_*` | mainnet ledger credentials missing | set `ZKPC_LEDGER_API_URL`, `ZKPC_KEYCLOAK_URL`, `ZKPC_KEYCLOAK_CLIENT_ID`, `ZKPC_KEYCLOAK_CLIENT_SECRET` — `LEDGER_API_URL` / `KEYCLOAK_*` are ignored for the ledger on mainnet |
 | `COOKIE_DOMAIN must stay empty while BACKEND_PROXY_SECRET is configured` | domain cookie behind the proxy | unset `COOKIE_DOMAIN` (the proxy strips `Domain=` anyway; cookies are host-only) |
 | `to_settings.app_network is "X" but APP_NETWORK=Y` | the database was created for another network | point `DATABASE_URL` at the right database. Never edit `to_settings.app_network` to "fix" this: the Redis prefix, NATS stream, fingerprints and ledger credentials all differ per network |
@@ -43,17 +42,30 @@ To rotate:
 
 The pepper itself is never stored; only its hash is.
 
-## 3. Legacy wallet endpoint retirement attestation
+## 3. Daml package (truthoracle-v14) and deposit drift
 
-`KYC_ENFORCE_WITHDRAWALS=true` makes external withdrawal settlement require an approved KYC. The
-gate is meaningless while `truthoracle-canton/api/wallet/{deposit,settle-payout}.mjs` still
-settle anonymously, so the backend refuses to enforce until an operator attests that the
-frontend deployment answers `410 moved_to_backend` on those routes (ARCHITECTURE §18):
+The backend is built against **truthoracle-v14 1.0.0**
+(`TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a`,
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v14`), whose `UserWallet.depositRefs : [Text]` is
+mandatory and is the deposit confirm pass's only confirmation rule. There is no Daml feature
+flag and no upgrade path from an older package (ARCHITECTURE §18).
 
-1. Deploy `truthoracle-canton` with `BACKEND_URL` set (the functions then answer 410 for deposits
-   and for `reason = withdraw` settlements).
-2. Verify: `curl -X POST https://<app>/api/wallet/deposit -d '{}'` → `410`.
-3. Set `LEGACY_WALLET_ENDPOINTS_RETIRED=true` on the backend, then `KYC_ENFORCE_WITHDRAWALS=true`.
+- `502 upstream_failed "ledger returned a UserWallet without depositRefs"` on any money route,
+  with `UserWallet <cid> (owner …): UserWallet.depositRefs is missing; is TRUTHORACLE_PACKAGE_ID
+  the deployed truthoracle-v14?` in the log: the configured package id / name does not match
+  what is deployed. Fix the env; nothing was written.
+- `409 deposit_attribution_drift` (audit `deposit.attribution_drift`, Sentry, NATS
+  `truthoracle.deposit.drift`): the primary's on-ledger `depositedCC` differs from
+  `Σ to_wallets.credited_cc` by more than 1e-9 CC in **either** direction
+  (`details.kind = ledger_below_expected | ledger_above_expected`), a wallet is attributed more
+  than it ever sent (`over_credit`), or the owner has two active `UserWallet`s
+  (`duplicate_user_wallet`). Nothing is credited and the backend never repairs this on its
+  own — every credit the wallet ever received went through this backend, so a surplus is as
+  suspicious as a shortfall. Compare `GET /in-app-wallet.attribution` with the ledger
+  contract, find the command that moved `depositedCC` (its `txRef` is in `depositRefs`), and
+  correct `credited_cc` deliberately (audited SQL) once the cause is understood.
+- `KYC_ENFORCE_WITHDRAWALS=true` is a plain flag: money leaves only through this backend, so
+  it can be switched on whenever the KYC vendor is live (docs/KYC.md §5).
 
 ## 4. NATS JetStream requirement
 
@@ -92,8 +104,12 @@ consumers are created per processor.
   `npm run migration:generate -- src/migrations/<Name>` (diffs the entities against
   `DATABASE_URL`; regenerating against a migrated database must print "No changes in database
   schema"). `.env` is read by the CLI the same way the app reads it.
-- The first migration creates the `citext` extension and seeds `to_settings.app_network` from
-  the `APP_NETWORK` the migration ran under; `kyc_pepper_hash` is written on first boot (§1, §2).
+- There is exactly one migration (`src/migrations/<ts>-Init.ts`): it creates the `citext` /
+  `pgcrypto` extensions and every `to_*` table of the final layout and seeds
+  `to_settings.app_network` from the `APP_NETWORK` the migration ran under; `kyc_pepper_hash`
+  is written on first boot (§1, §2). Greenfield (ARCHITECTURE §18): a database created by an
+  earlier layout is not upgraded — drop and recreate it (`dropdb truthoracle_backend && createdb
+  truthoracle_backend`) and let `DB_MIGRATE_ON_BOOT` apply the migration.
 
 ## 6. Sessions and suspension
 
@@ -157,8 +173,8 @@ answers, in order (`R` = `http://127.0.0.1:5199/__backend`):
 | `GET http://127.0.0.1:8091/api/v1/nope` (direct) | `404 not_found` envelope with `x-request-id` |
 
 Boot-refusal spot checks (each exits 1 in under a second, nothing listens): `KYC_PROVIDER=mock
-APP_NETWORK=mainnet` (also lists the missing `ZKPC_*`), `KYC_ENFORCE_WITHDRAWALS=true` without
-`LEGACY_WALLET_ENDPOINTS_RETIRED=true`, `SESSION_SECRET=short`.
+APP_NETWORK=mainnet` (also lists the missing `ZKPC_*`), `SESSION_SECRET=short`,
+`COOKIE_DOMAIN=example.com` with a `BACKEND_PROXY_SECRET`.
 
 ## 9. Upstream outages (ledger, Enterprise Wallet, Keycloak)
 
@@ -168,7 +184,7 @@ process. What each route does when `fetch` fails or Keycloak refuses the client 
 
 | Route | Behaviour |
 |---|---|
-| `POST /auth/wallet`, `POST /wallets/link` for a party with **no** `to_wallets` row yet | `502 upstream_failed` before any write (the `legacy_credited_cc` seed is read from the ledger first — §8.1 of ARCHITECTURE; a wrong seed would double-credit the party's own `UserWallet` later). The challenge is consumed; the user signs a fresh one once the ledger is back. Re-linking a known party, and Google/Telegram sign-ins, need no ledger. |
+| `POST /auth/wallet`, `POST /wallets/link` (first-time or relink), Google/Telegram sign-ins | unaffected — linking never reads the ledger (ARCHITECTURE §8.1); a first-time wallet sign-in succeeds while the ledger is down |
 | `GET /me`, `GET /wallets`, `GET /in-app-wallet` | 200 with `ownLedgerWallet: null` / `ledger: null` (degraded reads are logged, not surfaced) |
 | `POST /in-app-wallet/deposits/reconcile` | `502 upstream_failed`; nothing is written (the history walk precedes the write-ahead row) |
 | `POST /in-app-wallet/payouts/:cid/settle`, admin settle, processor scan | `502 upstream_failed` (user/admin) or a logged warning (scan); a row that already recorded a submission stays `settling` — fail closed, never re-transferred (ARCHITECTURE §9.4) |
