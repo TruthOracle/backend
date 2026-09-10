@@ -35,6 +35,10 @@ export class KycWebhookEventEntity {
   @Column({ type: "integer", default: 0 })
   attempts!: number;
 
+  /** Last time the durable consumer tried to apply the row (the sweep's re-arm cooldown counts from here). */
+  @Column({ name: "last_attempt_at", type: "timestamptz", nullable: true })
+  lastAttemptAt!: Date | null;
+
   @Column({ type: "text", nullable: true })
   error!: string | null;
 

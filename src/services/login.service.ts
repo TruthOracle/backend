@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import type { Response } from "express";
 
 import type { AuthedRequest } from "../auth/request";
@@ -34,8 +34,6 @@ export interface LoginContext {
  */
 @Injectable()
 export class LoginService {
-  private readonly logger = new Logger(LoginService.name);
-
   constructor(
     private readonly config: Config,
     private readonly identities: IdentityService,
@@ -78,7 +76,7 @@ export class LoginService {
         { partyId: claim.subject, publicKeyBase64: ctx.wallet.publicKeyBase64, kind: ctx.wallet.kind },
         { actor: { type: actorType, userId: user.id, sessionId: currentSession?.id ?? null, ip } },
       );
-      identity = linked.identity ?? identity;
+      identity = linked.identity;
       // The first link sets users.party_id.
       user = (await this.users.findById(user.id)) ?? user;
     }
@@ -104,8 +102,8 @@ export class LoginService {
       ip,
       userAgent,
     });
-    if (ctx.client !== "native") res.append("Set-Cookie", this.sessions.cookieFor(token, ctx.kind));
-
+    // Audit BEFORE the cookie is appended: a failed audit write must answer 500 without a live
+    // session cookie riding along on the error response.
     await this.audit.record({
       actorType,
       actorUserId: user.id,
@@ -116,13 +114,14 @@ export class LoginService {
       metadata: { provider: claim.provider, identityId: identity.id, created: resolution.created, client: ctx.client },
       ip,
     });
-    void this.publish(ctx.kind === "admin" ? NatsSubjects.authAdminLogin : NatsSubjects.authLogin, {
+    void this.nats.publishSafe(ctx.kind === "admin" ? NatsSubjects.authAdminLogin : NatsSubjects.authLogin, {
       userId: user.id,
       identityId: identity.id,
       sessionId: session.id,
       provider: claim.provider,
       created: resolution.created,
     });
+    if (ctx.client !== "native") res.append("Set-Cookie", this.sessions.cookieFor(token, ctx.kind));
 
     const result: ApiLoginResult = {
       mode: "login",
@@ -134,13 +133,5 @@ export class LoginService {
     };
     if (ctx.client === "native") result.token = token;
     return result;
-  }
-
-  private async publish(subject: `truthoracle.${string}`, payload: object): Promise<void> {
-    try {
-      await this.nats.publish(subject, payload);
-    } catch (err) {
-      this.logger.warn(`publish ${subject} failed: ${(err as Error).message}`);
-    }
   }
 }

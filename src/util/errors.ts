@@ -64,8 +64,6 @@ function codeForStatus(status: number): ErrorCode {
       return "unsupported_media_type";
     case 429:
       return "rate_limited";
-    case 501:
-      return "not_implemented";
     case 502:
     case 503:
     case 504:
@@ -188,7 +186,6 @@ export const errors = {
   notFound: (message = "not found"): ApiError => new ApiError(404, "not_found", message),
   validation: (message: string, details?: Record<string, unknown>): ApiError =>
     new ApiError(400, "validation_failed", message, details),
-  notImplemented: (what: string): ApiError => new ApiError(501, "not_implemented", `${what} pending`),
   upstream: (message: string, details?: Record<string, unknown>): ApiError =>
     new ApiError(502, "upstream_failed", message, details),
 };

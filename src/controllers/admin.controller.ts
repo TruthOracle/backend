@@ -1,20 +1,8 @@
-import {
-  Body,
-  Controller,
-  type ExecutionContext,
-  Get,
-  HttpCode,
-  Param,
-  ParseUUIDPipe,
-  Post,
-  Query,
-  UseGuards,
-  createParamDecorator,
-} from "@nestjs/common";
-import { ApiTags } from "@nestjs/swagger";
+import { Body, Controller, Get, HttpCode, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from "@nestjs/common";
+import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { AdminGuard } from "../auth/admin.guard";
-import type { AuthedRequest } from "../auth/request";
+import { type AuthedRequest, actorOf } from "../auth/request";
 import {
   AdminAuditQueryDto,
   AdminKycOverrideDto,
@@ -23,8 +11,11 @@ import {
   AdminPersonTransferDto,
   AdminReasonDto,
   AdminUsersQueryDto,
+  FingerprintParamDto,
+  WebhookEventParamDto,
 } from "../dto/admin.dto";
 import { DEFAULT_PAGE_LIMIT } from "../dto/common.dto";
+import { PayoutCidParamDto } from "../dto/payouts.dto";
 import {
   type AdminActor,
   type AdminAuditFilter,
@@ -42,17 +33,14 @@ import type {
 } from "../types";
 import { ApiError } from "../util/errors";
 
-/** The operator behind an admin request; AdminGuard guarantees the session and user exist. */
+/** The operator behind an admin request: `actorOf` narrowed to the admin session AdminGuard guarantees. */
 export function adminActorOf(req: AuthedRequest): AdminActor {
-  if (!req.user || !req.session) {
-    throw new ApiError(401, "unauthenticated", "authentication required");
+  const actor = actorOf(req);
+  if (actor.type !== "admin" || !actor.userId || !actor.sessionId) {
+    throw new ApiError(403, "forbidden", "an admin session is required");
   }
-  return { type: "admin", userId: req.user.id, sessionId: req.session.id, ip: req.clientIp ?? null };
+  return { type: "admin", userId: actor.userId, sessionId: actor.sessionId, ip: actor.ip ?? null };
 }
-
-const Actor = createParamDecorator((_data: unknown, ctx: ExecutionContext): AdminActor =>
-  adminActorOf(ctx.switchToHttp().getRequest<AuthedRequest>()),
-);
 
 /**
  * Operator API (docs/API.md "Admin"; ARCHITECTURE §11). Every route sits behind AdminGuard —
@@ -60,6 +48,8 @@ const Actor = createParamDecorator((_data: unknown, ctx: ExecutionContext): Admi
  * Every mutation requires a `reason` and is audited with actorType `admin`.
  */
 @ApiTags("admin")
+@ApiCookieAuth("to_session")
+@ApiBearerAuth()
 @Controller("admin")
 @UseGuards(AdminGuard)
 export class AdminController {
@@ -82,9 +72,9 @@ export class AdminController {
   suspend(
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: AdminReasonDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ ok: true }> {
-    return this.admin.suspend(id, body.reason, actor);
+    return this.admin.suspend(id, body.reason, adminActorOf(req));
   }
 
   @Post("users/:id/reinstate")
@@ -92,9 +82,9 @@ export class AdminController {
   reinstate(
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: AdminReasonDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ ok: true }> {
-    return this.admin.reinstate(id, body.reason, actor);
+    return this.admin.reinstate(id, body.reason, adminActorOf(req));
   }
 
   @Post("users/:id/sessions/revoke")
@@ -102,9 +92,9 @@ export class AdminController {
   revokeSessions(
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: AdminReasonDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ ok: true }> {
-    return this.admin.revokeSessions(id, body.reason, actor);
+    return this.admin.revokeSessions(id, body.reason, adminActorOf(req));
   }
 
   // ───────────────────────────────────────── identities ────────────────────────────────────────
@@ -115,9 +105,9 @@ export class AdminController {
     @Param("id", ParseUUIDPipe) id: string,
     @Param("identityId", ParseUUIDPipe) identityId: string,
     @Body() body: AdminReasonDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ identity: ApiIdentity }> {
-    return this.admin.reattachIdentity(id, identityId, body.reason, actor);
+    return this.admin.reattachIdentity(id, identityId, body.reason, adminActorOf(req));
   }
 
   @Post("users/:id/identities/:identityId/unlink")
@@ -126,9 +116,9 @@ export class AdminController {
     @Param("id", ParseUUIDPipe) id: string,
     @Param("identityId", ParseUUIDPipe) identityId: string,
     @Body() body: AdminReasonDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ identity: ApiIdentity }> {
-    return this.admin.unlinkIdentity(id, identityId, body.reason, actor);
+    return this.admin.unlinkIdentity(id, identityId, body.reason, adminActorOf(req));
   }
 
   // ───────────────────────────────────────────── KYC ───────────────────────────────────────────
@@ -138,9 +128,9 @@ export class AdminController {
   kycOverride(
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: AdminKycOverrideDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ verification: ApiKycVerification }> {
-    return this.admin.kycOverride(id, body.status, body.reason, actor);
+    return this.admin.kycOverride(id, body.status, body.reason, adminActorOf(req));
   }
 
   @Get("kyc/duplicates")
@@ -156,11 +146,22 @@ export class AdminController {
   @Post("kyc/persons/:fingerprint/transfer")
   @HttpCode(200)
   transferPerson(
-    @Param("fingerprint") fingerprint: string,
+    @Param() params: FingerprintParamDto,
     @Body() body: AdminPersonTransferDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ ok: true }> {
-    return this.admin.transferPerson(fingerprint, body.toUserId, body.reason, actor);
+    return this.admin.transferPerson(params.fingerprint, body.toUserId, body.reason, adminActorOf(req));
+  }
+
+  /** Operator escape hatch for a stored webhook the durable consumer gave up on (RUNBOOK §4). */
+  @Post("kyc/webhooks/:id/replay")
+  @HttpCode(200)
+  replayWebhook(
+    @Param() params: WebhookEventParamDto,
+    @Body() body: AdminReasonDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ ok: true; eventId: string }> {
+    return this.admin.replayWebhook(params.id, body.reason, adminActorOf(req));
   }
 
   // ─────────────────────────────────────────── payouts ─────────────────────────────────────────
@@ -173,11 +174,11 @@ export class AdminController {
   @Post("payouts/:cid/settle")
   @HttpCode(200)
   settlePayout(
-    @Param("cid") cid: string,
+    @Param() params: PayoutCidParamDto,
     @Body() body: AdminPayoutSettleDto,
-    @Actor() actor: AdminActor,
+    @Req() req: AuthedRequest,
   ): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
-    return this.admin.settlePayout(cid, { force: body.force === true, reason: body.reason }, actor);
+    return this.admin.settlePayout(params.cid, { force: body.force === true, reason: body.reason }, adminActorOf(req));
   }
 
   // ──────────────────────────────────────────── audit ──────────────────────────────────────────

@@ -59,7 +59,10 @@ export function signSumsubRequest(
 }
 
 function firstHeader(headers: Record<string, string | string[] | undefined>, name: string): string {
-  const raw = headers[name] ?? headers[name.toLowerCase()];
+  // Node lowercases incoming header names; fakes and tests may not, so match case-insensitively.
+  const wanted = name.toLowerCase();
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === wanted);
+  const raw = key === undefined ? undefined : headers[key];
   const v = Array.isArray(raw) ? raw[0] : raw;
   return typeof v === "string" ? v.trim() : "";
 }

@@ -18,7 +18,7 @@ export type AppEnv = (typeof APP_ENVS)[number];
 const APP_NETWORKS = ["devnet", "mainnet"] as const;
 export type AppNetwork = (typeof APP_NETWORKS)[number];
 
-const DB_SSL_MODES = ["auto", "true", "false"] as const;
+const DB_SSL_MODES = ["auto", "true", "false", "verify"] as const;
 export type DbSslMode = (typeof DB_SSL_MODES)[number];
 
 const KYC_PROVIDERS = ["mock", "sumsub"] as const;
@@ -82,6 +82,14 @@ export class Config {
 
   @IsIn(DB_SSL_MODES as readonly string[])
   readonly dbSsl!: DbSslMode;
+
+  /** PEM (inline or file path) the server certificate must chain to under `DB_SSL=verify`; resolved by data-source.ts. */
+  @IsString()
+  readonly dbSslCa!: string;
+
+  /** Prod / mainnet refuse unverified TLS to Postgres unless this is set (RUNBOOK §1). */
+  @IsBoolean()
+  readonly dbSslInsecureAck!: boolean;
 
   @IsString()
   @IsNotEmpty({ message: "REDIS_URL is required" })
@@ -224,6 +232,15 @@ export class Config {
   @Min(1000)
   readonly payoutScanMs!: number;
 
+  /**
+   * How old a `to_payouts` row must be before an operator's `force` may re-send a transfer the
+   * wallet reports as never submitted (`PAYOUT_RESEND_GRACE_MS`): a lagging transfer index must
+   * have had time to catch up, otherwise the resend is the double-pay case.
+   */
+  @IsInt()
+  @Min(0)
+  readonly payoutResendGraceMs!: number;
+
   readonly sumsub!: SumsubConfig;
 
   // ── loops / caches / observability ─────────────────────────────────────────
@@ -235,9 +252,19 @@ export class Config {
   @Min(0)
   readonly ledgerCacheMs!: number;
 
+  /** Must cover the worst-case history walk; correctness never depends on it (§8.3). */
   @IsInt()
-  @Min(1000)
+  @Min(60_000)
   readonly depositLockTtlMs!: number;
+
+  /**
+   * A `submitted` credit younger than this is never failed by the confirm pass, whatever the
+   * wallet says (`DEPOSIT_CONFIRM_GRACE_MS`): the ACS lags the accepted command, and a wrong
+   * `failed` would let the same command id be re-armed and re-submitted.
+   */
+  @IsInt()
+  @Min(0)
+  readonly depositConfirmGraceMs!: number;
 
   @IsString()
   @IsOptional()
@@ -357,6 +384,8 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     databaseUrl: str(env.DATABASE_URL),
     dbMigrateOnBoot: parseBool(env.DB_MIGRATE_ON_BOOT, true),
     dbSsl: str(env.DB_SSL, "auto") as DbSslMode,
+    dbSslCa: str(env.DB_SSL_CA),
+    dbSslInsecureAck: parseBool(env.DB_SSL_INSECURE_ACK, false),
     redisUrl: str(env.REDIS_URL),
     natsUrl: str(env.NATS_URL),
 
@@ -413,6 +442,7 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     payoutInappReasons: parseList(env.PAYOUT_INAPP_REASONS ?? "bond,model-prize"),
     payoutMaxAttempts: parseIntOr(env.PAYOUT_MAX_ATTEMPTS, 5),
     payoutScanMs: parseIntOr(env.PAYOUT_SCAN_MS, 30_000),
+    payoutResendGraceMs: parseIntOr(env.PAYOUT_RESEND_GRACE_MS, 10 * 60_000),
     sumsub: {
       baseUrl: absoluteUrl(env.SUMSUB_BASE_URL) || "https://api.sumsub.com",
       appToken: str(env.SUMSUB_APP_TOKEN),
@@ -427,6 +457,7 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     sessionCleanupMs: parseIntOr(env.SESSION_CLEANUP_MS, 3_600_000),
     ledgerCacheMs: parseIntOr(env.LEDGER_CACHE_MS, 15_000),
     depositLockTtlMs: parseIntOr(env.DEPOSIT_LOCK_TTL_MS, 300_000),
+    depositConfirmGraceMs: parseIntOr(env.DEPOSIT_CONFIRM_GRACE_MS, 10 * 60_000),
     sentryDsn: str(env.SENTRY_DSN),
     swaggerEnabled: parseAutoBool(env.SWAGGER_ENABLED, !isProd),
   };
@@ -447,6 +478,15 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (config.isMainnet && config.sumsub.appToken.startsWith("sbx:")) {
     issues.push("SUMSUB_APP_TOKEN is a sandbox token (sbx:) but APP_NETWORK=mainnet");
+  }
+  if (config.kycProvider === "sumsub" && config.sumsub.appToken && !config.sumsub.webhookSecret) {
+    issues.push("KYC_PROVIDER=sumsub requires SUMSUB_WEBHOOK_SECRET (sessions would start while every webhook is rejected with 401)");
+  }
+  if ((isProd || config.isMainnet) && !config.dbSslInsecureAck) {
+    const local = /(localhost|127\.0\.0\.1|@postgres[:/])/.test(config.databaseUrl);
+    if (config.dbSsl === "true" || (config.dbSsl === "auto" && !local)) {
+      issues.push("DB_SSL=true/auto does not verify the Postgres server certificate; set DB_SSL=verify (with DB_SSL_CA when needed) or DB_SSL_INSECURE_ACK=true to accept unverified TLS in prod / on mainnet");
+    }
   }
   if (config.kycEnforceWithdrawals && !config.legacyWalletEndpointsRetired) {
     issues.push(

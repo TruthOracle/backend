@@ -1,5 +1,9 @@
+import type { Config } from "../config";
 import { parseCC } from "../util/money";
-import { collectHistory, totalReceivedFrom } from "./enterprise-wallet.service";
+import { UpstreamError } from "../util/upstream-http";
+import { collectHistory, EnterpriseWalletService, totalReceivedFrom } from "./enterprise-wallet.service";
+import type { KeycloakTokenService } from "./keycloak-token.service";
+import type { RedisService } from "./redis.service";
 
 const TREASURY = "treasury::1220" + "a".repeat(64);
 const USER = "user::1220" + "b".repeat(64);
@@ -81,6 +85,32 @@ describe("EnterpriseWalletService pure helpers", () => {
       );
       expect(total).toBe(parseCC("1"));
       expect(skipped).toEqual([2]);
+    });
+  });
+
+  describe("status reads: two indexes, two failure semantics", () => {
+    function service(answer: () => Promise<unknown>): EnterpriseWalletService {
+      const config = { enterpriseWalletUrl: "http://wallet", treasuryPartyId: TREASURY, enterpriseWalletAppName: "truthoracle" } as unknown as Config;
+      const keycloak = { bearerFor: jest.fn().mockResolvedValue("token") } as unknown as KeycloakTokenService;
+      const svc = new EnterpriseWalletService(config, keycloak, {} as RedisService);
+      jest.spyOn(svc as unknown as { wallet: () => Promise<unknown> }, "wallet").mockImplementation(answer);
+      return svc;
+    }
+
+    it("transferStatus: a 404 on the transfer index means the transfer never happened (known, not submitted)", async () => {
+      await expect(service(() => Promise.reject(new UpstreamError("404", 404, ""))).transferStatus(TREASURY, "payout-1")).resolves.toEqual({ known: true, submitted: false, status: "not_found" });
+      await expect(service(() => Promise.resolve({ status: "Completed" })).transferStatus(TREASURY, "payout-1")).resolves.toEqual({ known: true, submitted: true, status: "completed" });
+      await expect(service(() => Promise.resolve({ status: "failed" })).transferStatus(TREASURY, "payout-1")).resolves.toEqual({ known: true, submitted: false, status: "failed" });
+      await expect(service(() => Promise.reject(new UpstreamError("503", 503, ""))).transferStatus(TREASURY, "payout-1")).resolves.toEqual({ known: false, submitted: false, status: null });
+    });
+
+    it("commandStatus: a 404 on the command index is UNKNOWN (the index is not always wired through), only an explicit failure is a failure", async () => {
+      await expect(service(() => Promise.reject(new UpstreamError("404", 404, ""))).commandStatus(TREASURY, "deposit-1")).resolves.toEqual({ known: false, submitted: false, status: "not_found" });
+      await expect(service(() => Promise.resolve({ status: "completed", updateId: "u" })).commandStatus(TREASURY, "deposit-1")).resolves.toEqual({ known: true, submitted: true, status: "completed" });
+      await expect(service(() => Promise.resolve({ status: "pending" })).commandStatus(TREASURY, "deposit-1")).resolves.toEqual({ known: true, submitted: true, status: "pending" });
+      await expect(service(() => Promise.resolve({ status: "REJECTED" })).commandStatus(TREASURY, "deposit-1")).resolves.toEqual({ known: true, submitted: false, status: "rejected" });
+      await expect(service(() => Promise.resolve({})).commandStatus(TREASURY, "deposit-1")).resolves.toEqual({ known: false, submitted: false, status: null });
+      await expect(service(() => Promise.reject(new UpstreamError("boom", 0, ""))).commandStatus(TREASURY, "deposit-1")).resolves.toEqual({ known: false, submitted: false, status: null });
     });
   });
 });

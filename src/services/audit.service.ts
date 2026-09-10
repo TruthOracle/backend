@@ -4,6 +4,7 @@ import { type EntityManager, Repository } from "typeorm";
 
 import { AuditEventEntity } from "../entities/audit-event.entity";
 import type { ActorType, ApiAuditEvent, AuditAction } from "../types";
+import { formatCC } from "../util/money";
 
 export interface AuditInput {
   actorType: ActorType;
@@ -110,12 +111,18 @@ export class AuditService {
   }
 }
 
+/**
+ * Drop forbidden keys and `undefined`; a `bigint` is always a CC amount in 1e-10 units
+ * (util/money), so it is rendered as the 10-decimal wire string — never as raw units, which
+ * would put two money encodings into one audit trail (API.md: "Money is a string with exactly
+ * 10 decimals").
+ */
 export function sanitizeMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(metadata)) {
     if (FORBIDDEN_METADATA_KEYS.has(k)) continue;
     if (v === undefined) continue;
-    out[k] = typeof v === "bigint" ? v.toString() : v;
+    out[k] = typeof v === "bigint" ? formatCC(v) : v;
   }
   return out;
 }

@@ -5,18 +5,45 @@
  * controller (Telegram may append parameters we do not control on the callback).
  */
 import { Transform } from "class-transformer";
-import { IsIn, IsOptional, IsString, Matches, MaxLength, MinLength } from "class-validator";
+import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from "class-validator";
 
-import { type ChallengePurpose, WALLET_KIND_ALLOWLIST, type WalletKind } from "../types";
+import { CHALLENGE_PURPOSES, type ChallengePurpose, WALLET_KIND_ALLOWLIST, type WalletKind } from "../types";
 import { PARTY_ID_RE } from "../util/canton-crypto";
+import { numberToString } from "./common.dto";
 
 export type LoginClient = "web" | "native";
 export const LOGIN_CLIENTS: readonly LoginClient[] = ["web", "native"];
-export const CHALLENGE_PURPOSES: readonly ChallengePurpose[] = ["sign-in", "link-wallet", "admin-sign-in"];
 
-/** Telegram's widget posts `id` / `auth_date` as JSON numbers; the verifier wants strings. */
-const numberToString = ({ value }: { value: unknown }): unknown =>
-  typeof value === "number" && Number.isFinite(value) ? String(value) : value;
+/**
+ * The one wallet proof `WalletChallengeService.verify` consumes — `POST /auth/wallet`,
+ * `POST /wallets/link` and the wallet half of `POST /me/identities/:id/reattach` all validate it
+ * the same way. Key and signature encodings are decoded by util/canton-crypto (hex / base64 /
+ * base64url), so only presence and sane bounds are checked here.
+ */
+export class WalletProofDto {
+  @IsUUID(undefined, { message: "challengeId must be the id returned by the challenge route" })
+  challengeId!: string;
+
+  @IsString()
+  @Matches(PARTY_ID_RE, { message: "partyId must be a Canton party id (<hint>::1220<64 hex>)" })
+  partyId!: string;
+
+  /** 32-byte Ed25519 key, hex / base64 / base64url (short prefixes tolerated by util/canton-crypto). */
+  @IsString()
+  @MinLength(40)
+  @MaxLength(128)
+  publicKey!: string;
+
+  /** 64-byte Ed25519 signature over the raw UTF-8 challenge message. */
+  @IsString()
+  @MinLength(64)
+  @MaxLength(256)
+  signature!: string;
+
+  /** Informational allowlist (`cantor8` in v1). */
+  @IsIn(WALLET_KIND_ALLOWLIST as readonly string[], { message: `kind must be one of: ${WALLET_KIND_ALLOWLIST.join(", ")}` })
+  kind!: WalletKind;
+}
 
 class ClientDto {
   /** `native` returns the session token in the body instead of a cookie (API.md "Auth"). */
@@ -90,28 +117,9 @@ export class WalletChallengeDto {
   purpose!: ChallengePurpose;
 }
 
-export class WalletLoginDto extends ClientDto {
-  @IsString()
-  @Matches(/^[0-9a-fA-F-]{36}$/, { message: "challengeId must be the id returned by /auth/wallet/challenge" })
-  challengeId!: string;
-
-  @IsString()
-  @Matches(PARTY_ID_RE, { message: "partyId must be a Canton party id (<hint>::1220<64 hex>)" })
-  partyId!: string;
-
-  /** 32-byte Ed25519 key, hex / base64 / base64url (short prefixes tolerated by util/canton-crypto). */
-  @IsString()
-  @MinLength(40)
-  @MaxLength(128)
-  publicKey!: string;
-
-  /** 64-byte Ed25519 signature over the raw UTF-8 challenge message. */
-  @IsString()
-  @MinLength(64)
-  @MaxLength(256)
-  signature!: string;
-
-  /** Informational allowlist (`cantor8` in v1). */
-  @IsIn(WALLET_KIND_ALLOWLIST)
-  kind!: WalletKind;
+export class WalletLoginDto extends WalletProofDto {
+  /** `native` returns the session token in the body instead of a cookie (API.md "Auth"). */
+  @IsOptional()
+  @IsIn(LOGIN_CLIENTS)
+  client?: LoginClient;
 }

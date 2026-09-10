@@ -59,7 +59,7 @@ interface Mocks {
   users: { findById: jest.Mock; suspend: jest.Mock; reinstate: jest.Mock; toApi: jest.Mock };
   identities: { listForUser: jest.Mock; findById: jest.Mock; unlink: jest.Mock; reattach: jest.Mock; toApi: jest.Mock };
   sessions: { listForUser: jest.Mock; revokeAllForUser: jest.Mock; toApi: jest.Mock };
-  walletLinks: { listForUser: jest.Mock; toApi: jest.Mock };
+  walletLinks: { listForUser: jest.Mock; toApi: jest.Mock; ownLedgerWallets: jest.Mock };
   kyc: { summaryForUser: jest.Mock; lockedIdentityId: jest.Mock; adminOverride: jest.Mock; transferPerson: jest.Mock };
   payouts: { listForUser: jest.Mock; listAll: jest.Mock; settle: jest.Mock; toApi: jest.Mock };
   audit: { record: jest.Mock; list: jest.Mock; toApi: jest.Mock };
@@ -92,6 +92,7 @@ function build(): { service: AdminService; m: Mocks } {
     walletLinks: {
       listForUser: jest.fn().mockResolvedValue([]),
       toApi: jest.fn((w: WalletEntity, extras?: { ownLedgerWallet?: unknown }) => ({ id: w.id, ownLedgerWallet: extras?.ownLedgerWallet ?? null })),
+      ownLedgerWallets: jest.fn().mockResolvedValue(new Map()),
     },
     kyc: {
       summaryForUser: jest.fn().mockResolvedValue({ status: "none", history: [] }),
@@ -192,11 +193,12 @@ describe("AdminService", () => {
       const wallet = { id: "i-wallet", provider: "canton_wallet" } as AuthIdentityEntity;
       m.identities.listForUser.mockResolvedValue([google, wallet]);
       m.kyc.lockedIdentityId.mockResolvedValue("i-google");
-      m.walletLinks.listForUser.mockResolvedValue([
+      const walletRows = [
         { id: "w-primary", partyId: "p::1", isPrimary: true } as WalletEntity,
         { id: "w-second", partyId: "p::2", isPrimary: false } as WalletEntity,
-      ]);
-      m.ledger.fetchUserWallet.mockResolvedValue({ contractId: "uw-2", owner: "p::2" });
+      ];
+      m.walletLinks.listForUser.mockResolvedValue(walletRows);
+      m.walletLinks.ownLedgerWallets.mockResolvedValue(new Map([["w-primary", null], ["w-second", { contractId: "uw-2", owner: "p::2" }]]));
       m.kyc.summaryForUser.mockResolvedValue({ status: "approved", history: [{ id: "v-1" }] });
       m.sessions.listForUser.mockResolvedValue([{ id: "s-1", authIdentityId: "i-wallet" } as SessionEntity]);
       m.payouts.listForUser.mockResolvedValue([
@@ -213,8 +215,9 @@ describe("AdminService", () => {
         { id: "i-google", kycLocked: true },
         { id: "i-wallet", kycLocked: false },
       ]);
-      expect(m.ledger.fetchUserWallet).toHaveBeenCalledTimes(1);
-      expect(m.ledger.fetchUserWallet).toHaveBeenCalledWith("p::2");
+      // One ledger read for every row (WalletLinkService.ownLedgerWallets), never one per wallet.
+      expect(m.walletLinks.ownLedgerWallets).toHaveBeenCalledWith(walletRows, undefined);
+      expect(m.ledger.fetchUserWallet).not.toHaveBeenCalled();
       expect(detail.wallets).toEqual([
         { id: "w-primary", ownLedgerWallet: null },
         { id: "w-second", ownLedgerWallet: { contractId: "uw-2", owner: "p::2" } },

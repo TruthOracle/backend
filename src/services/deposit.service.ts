@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { DataSource, type EntityManager, Repository } from "typeorm";
+import { DataSource, Repository } from "typeorm";
 
 import { Config } from "../config";
 import { type DepositAttribution, DepositCreditEntity } from "../entities/deposit-credit.entity";
@@ -18,13 +18,13 @@ import { ApiError } from "../util/errors";
 import { DUST, formatCC, parseCC } from "../util/money";
 import { AuditService } from "./audit.service";
 import { EnterpriseWalletService } from "./enterprise-wallet.service";
-import { LedgerClientService } from "./ledger-client.service";
+import { LedgerClientService, userWalletCreateCommand, walletCreateCommandIdFor } from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { PayoutService } from "./payout.service";
 import { RedisService } from "./redis.service";
 import { SentryService } from "./sentry.service";
 import { UserService } from "./user.service";
-import { ledgerWalletToApi, walletToApi } from "./wallet-link.service";
+import { WalletLinkService, ledgerWalletToApi, walletToApi } from "./wallet-link.service";
 
 // ---------------------------------------------------------------------------------------------
 // Pure derivation (ARCHITECTURE §8.3 steps 3–5, §8.4) — exact fixed point, no I/O
@@ -154,6 +154,7 @@ export class DepositService {
     private readonly nats: NatsService,
     private readonly sentry: SentryService,
     private readonly payouts: PayoutService,
+    private readonly walletLinks: WalletLinkService,
   ) {}
 
   private get treasury(): string {
@@ -226,8 +227,15 @@ export class DepositService {
         return { credited: formatCC(0n), status: "nothing_outstanding", perWallet: [], ledger: ledgerBefore ? ledgerWalletToApi(ledgerBefore) : null };
       }
 
-      // 6. write-ahead row keyed by the deterministic command id.
-      const commandId = depositCommandId(primary, ledgerBefore?.contractId ?? null, plan.amount, ledgerBefore?.depositedCC ?? 0n);
+      // 6. the primary's UserWallet must exist BEFORE the write-ahead: it is created empty
+      //    (0/0/0) under the one deterministic id every path uses (`wallet-create-<hash(owner)>`),
+      //    so a Create racing PayoutService's in-app path collides on ledger command-dedup instead
+      //    of minting a second wallet. The credit itself is then always an Exercise Deposit, whose
+      //    txRef the Daml refuses to credit twice.
+      const ledgerWallet = ledgerBefore ?? (await this.ensureUserWallet(primary));
+
+      // 7. write-ahead row keyed by the deterministic command id.
+      const commandId = depositCommandId(primary, ledgerWallet.contractId, plan.amount, ledgerWallet.depositedCC);
       const txRef = depositTxRef(commandId);
       const credit = await this.writeAhead(userId, {
         ownerParty: primary,
@@ -235,16 +243,15 @@ export class DepositService {
         txRef,
         amountCC: plan.amount,
         attribution: plan.attribution,
-        depositedCCBefore: ledgerBefore?.depositedCC ?? 0n,
-        walletCidBefore: ledgerBefore?.contractId ?? null,
+        depositedCCBefore: ledgerWallet.depositedCC,
+        walletCidBefore: ledgerWallet.contractId,
         actor,
       });
 
-      // 7. submit as treasury.
-      const commands = this.buildCommands(primary, ledgerBefore, plan.amount, txRef);
+      // 8. submit as treasury.
       let submitError: unknown = null;
       try {
-        await this.wallet.externalSubmit({ commandId, commands });
+        await this.wallet.externalSubmit({ commandId, commands: [this.depositCommand(ledgerWallet, plan.amount, txRef)] });
       } catch (err) {
         // The command may or may not have reached the ledger: the row stays `submitted` and the
         // confirm pass below (or the next one) decides — never resubmit blindly.
@@ -252,24 +259,36 @@ export class DepositService {
         this.logger.warn(`deposit submit ${commandId} failed: ${(err as Error).message}`);
       }
 
-      // 8. confirm immediately (best effort) and answer with the attribution.
+      // 9. confirm immediately (best effort) and answer with the attribution and the row's REAL
+      //    status — a row the pass could not confirm is `submitted` (the processor finishes it),
+      //    never a guess.
       await this.confirmForUser(userId).catch((err: unknown) => {
         this.logger.warn(`post-submit confirm pass failed for ${commandId}: ${(err as Error).message}`);
       });
       const row = (await this.credits.findOne({ where: { id: credit.id } })) ?? credit;
-      const ledgerAfter = await this.ledger.fetchUserWallet(primary, { uncached: true }).catch(() => ledgerBefore);
+      const ledgerAfter = await this.ledger.fetchUserWallet(primary, { uncached: true }).catch(() => ledgerWallet);
       const perWallet = plan.attribution.map((a) => ({ walletId: a.walletId, partyId: a.partyId, amountCC: a.amountCC }));
+      const ledger = ledgerAfter ? ledgerWalletToApi(ledgerAfter) : null;
 
       if (row.status === "confirmed") {
-        return { credited: formatCC(plan.amount), status: "confirmed", commandId, perWallet, ledger: ledgerAfter ? ledgerWalletToApi(ledgerAfter) : null };
+        return { credited: formatCC(plan.amount), status: "confirmed", commandId, perWallet, ledger };
+      }
+      if (row.status === "failed") {
+        throw new ApiError(502, "upstream_failed", "the deposit credit was not accepted by the ledger; retry the reconciliation", {
+          commandId,
+          creditStatus: row.status,
+          creditId: row.id,
+        });
       }
       if (submitError) {
-        if (ApiError.is(submitError)) {
-          throw new ApiError(submitError.status, submitError.code, submitError.message, { ...(submitError.details ?? {}), commandId, creditStatus: row.status });
-        }
-        throw submitError instanceof Error ? submitError : new Error("deposit submit failed", { cause: submitError });
+        // Whatever the transport threw, the answer is an upstream failure that names the row: the
+        // credit is written ahead and the confirm pass owns it from here.
+        const base = ApiError.is(submitError)
+          ? submitError
+          : new ApiError(502, "upstream_failed", `deposit submit failed: ${submitError instanceof Error ? submitError.message : "unknown error"}`);
+        throw new ApiError(base.status, base.code, base.message, { ...(base.details ?? {}), commandId, creditStatus: row.status, creditId: row.id });
       }
-      return { credited: formatCC(plan.amount), status: "submitted", commandId, perWallet, ledger: ledgerAfter ? ledgerWalletToApi(ledgerAfter) : null };
+      return { credited: formatCC(plan.amount), status: "submitted", commandId, perWallet, ledger };
     } finally {
       await lock.release();
     }
@@ -328,12 +347,24 @@ export class DepositService {
     if (this.isConfirmedOnLedger(row, onLedger)) {
       return (await this.markConfirmed(row)) ? "confirmed" : "pending";
     }
-    // Only a ledger that still shows the PRE-state AND a wallet that says the command never
-    // happened may fail the row; anything else is "in flight" and stays submitted (fail closed).
+    // Only a ledger that still shows the PRE-state, after the grace period, AND a wallet that
+    // reports the command as failed or unknown may fail the row; anything else is "in flight" and
+    // stays submitted (fail closed). The grace period exists because the ACS lags an accepted
+    // command and a wrong `failed` would re-arm the same command id for a second submission.
     if (!this.ledgerShowsPreState(row, onLedger)) return "pending";
-    const status = await this.wallet.transferStatus(this.treasury, row.commandId);
-    if (!status.known || status.submitted) return "pending";
-    return (await this.markFailed(row, `wallet reports the command as ${status.status ?? "never submitted"}`)) ? "failed" : "pending";
+    const ageMs = Date.now() - row.submittedAt.getTime();
+    if (ageMs < this.config.depositConfirmGraceMs) return "pending";
+    const status = await this.wallet.commandStatus(this.treasury, row.commandId);
+    if (status.known && status.submitted) {
+      // The wallet says it went through but the ledger disagrees past the grace period: an
+      // operator must look — nothing is credited and nothing is re-armed.
+      this.logger.warn(`deposit ${row.commandId}: wallet reports "${status.status ?? "submitted"}" but the ledger still shows the pre-state after ${Math.round(ageMs / 1000)} s`);
+      this.sentry.captureMessage("deposit credit accepted by the wallet but absent from the ledger", "warning", { commandId: row.commandId });
+      return "pending";
+    }
+    if (!status.known && status.status !== "not_found") return "pending";
+    const reason = status.known ? `wallet reports the command as ${status.status ?? "failed"}` : "wallet does not know the command after the grace period";
+    return (await this.markFailed(row, reason)) ? "failed" : "pending";
   }
 
   private isConfirmedOnLedger(row: DepositCreditEntity, onLedger: LedgerWallet | null): boolean {
@@ -343,15 +374,40 @@ export class DepositService {
   }
 
   /**
-   * Pre-state: the Create never happened (no wallet), or the wallet's depositedCC is exactly what
-   * it was before the submit — deposits are monotonic, so equality means no deposit landed even
-   * if a withdrawal has since rotated the contract id.
+   * Pre-state: the wallet's depositedCC is exactly what it was before the submit — deposits are
+   * monotonic, so equality means no deposit landed even if a trade has since rotated the contract
+   * id. A legacy Create-path row (no wallet before the submit) is in its pre-state while there is
+   * no wallet, or while the wallet that appeared meanwhile (an in-app payout's empty Create) does
+   * not carry the credit — otherwise such a row could never resolve and would block every later
+   * reconcile with `deposit_in_progress`.
    */
   private ledgerShowsPreState(row: DepositCreditEntity, onLedger: LedgerWallet | null): boolean {
-    if (row.walletCidBefore === null) return onLedger === null;
-    if (!onLedger) return false;
+    if (!onLedger) return row.walletCidBefore === null;
     if (this.config.damlUserWalletHasDepositRefs && onLedger.depositRefs.includes(row.txRef)) return false;
+    if (row.walletCidBefore === null) return onLedger.depositedCC < row.amountCC;
     return onLedger.depositedCC === row.depositedCCBefore;
+  }
+
+  /**
+   * The primary's empty UserWallet, created under the shared deterministic id. A dedup collision
+   * (PayoutService or another instance created it a moment ago) is not an error: the fresh read
+   * decides. A wallet that is accepted but not yet visible is a 502 the user retries.
+   */
+  private async ensureUserWallet(owner: string): Promise<LedgerWallet> {
+    const commandId = walletCreateCommandIdFor(owner);
+    try {
+      await this.wallet.externalSubmit({
+        commandId,
+        commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: this.treasury, owner, withDepositRefs: this.config.damlUserWalletHasDepositRefs })],
+      });
+    } catch (err) {
+      this.logger.warn(`UserWallet create ${commandId} did not succeed (${(err as Error).message}); re-reading the ledger`);
+    }
+    const created = await this.ledger.fetchUserWallet(owner, { uncached: true });
+    if (!created) {
+      throw new ApiError(502, "upstream_failed", "the in-app wallet is not yet visible on the ledger; try again shortly", { commandId });
+    }
+    return created;
   }
 
   /** Atomic `submitted → confirmed` + attribution bumps + audit, in one transaction. */
@@ -382,7 +438,7 @@ export class DepositService {
     });
     if (done) {
       this.logger.log(`deposit ${row.commandId} confirmed: ${formatCC(row.amountCC)} CC across ${walletIds.length} wallet(s)`);
-      void this.publish(NatsSubjects.depositCredited, { userId: row.userId, depositCreditId: row.id, commandId: row.commandId, amountCC: formatCC(row.amountCC), walletIds });
+      void this.nats.publishSafe(NatsSubjects.depositCredited, { userId: row.userId, depositCreditId: row.id, commandId: row.commandId, amountCC: formatCC(row.amountCC), walletIds });
     }
     return done;
   }
@@ -402,6 +458,7 @@ export class DepositService {
         manager,
       );
       this.logger.warn(`deposit ${row.commandId} marked failed: ${error}`);
+      this.sentry.captureMessage("deposit credit marked failed", "warning", { commandId: row.commandId });
       return true;
     });
   }
@@ -411,8 +468,10 @@ export class DepositService {
   /**
    * INSERT … ON CONFLICT (command_id) DO NOTHING. No row inserted means the same state is
    * already being credited (`409 deposit_in_progress`) — except a row the confirm pass marked
-   * `failed` (the wallet said the command never happened): that one is re-armed under the same
-   * id, which the wallet reported safe to retry.
+   * `failed` (past the grace period, ledger in the pre-state, wallet reporting the command as
+   * failed or unknown): that one is re-armed under the same id with a fresh `submitted_at`.
+   * Ledger command-dedup and the Daml txRef assertion are the backstops should the original
+   * command land after all.
    */
   private async writeAhead(
     userId: string,
@@ -444,6 +503,7 @@ export class DepositService {
           walletCidBefore: input.walletCidBefore,
           status: "submitted",
           error: null,
+          submittedAt: new Date(),
           confirmedAt: null,
         })
         .orIgnore()
@@ -464,6 +524,7 @@ export class DepositService {
           {
             status: "submitted",
             error: null,
+            submittedAt: new Date(),
             confirmedAt: null,
             attribution: input.attribution,
             amountCC: input.amountCC,
@@ -505,34 +566,36 @@ export class DepositService {
     });
   }
 
-  private buildCommands(primary: string, onLedger: LedgerWallet | null, amountCC: bigint, txRef: string): unknown[] {
-    const amount = formatCC(amountCC);
-    const templateId = this.ledger.templateId("UserWallet");
-    if (onLedger) {
-      return [{ ExerciseCommand: { templateId, contractId: onLedger.contractId, choice: "Deposit", choiceArgument: { amountCC: amount, txRef } } }];
-    }
-    // depositRefs only when the deployed Daml has the field: v13 1.0.0 has no such field, and on
-    // 2.0.0 an omitted Optional defaults to None (the wallet then records refs from its first
-    // Deposit exercise onward) — port of api/wallet/deposit.mjs.
-    const createArguments: Record<string, unknown> = {
-      admin: this.treasury,
-      owner: primary,
-      balanceCC: amount,
-      depositedCC: amount,
-      withdrawnCC: formatCC(0n),
+  private depositCommand(onLedger: LedgerWallet, amountCC: bigint, txRef: string): unknown {
+    return {
+      ExerciseCommand: {
+        templateId: this.ledger.templateId("UserWallet"),
+        contractId: onLedger.contractId,
+        choice: "Deposit",
+        choiceArgument: { amountCC: formatCC(amountCC), txRef },
+      },
     };
-    if (this.config.damlUserWalletHasDepositRefs) createArguments.depositRefs = [txRef];
-    return [{ CreateCommand: { templateId, createArguments } }];
   }
 
-  /** Step 4 self-heal: attribute the unexplained ledger surplus to the primary (legacy-path credit). */
+  /**
+   * Step 4 self-heal: attribute the unexplained ledger surplus to the primary (legacy-path
+   * credit). A compare-and-set against the `credited_cc` the plan was derived from: should a
+   * second reconcile have slipped past the lock (TTL expiry) and healed first, this one refuses
+   * instead of adding the delta twice and manufacturing `ledger_below_expected` drift.
+   */
   private async healPrimary(userId: string, primaryRow: WalletEntity, plan: CreditPlan, actor: Actor): Promise<void> {
     await this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(WalletEntity);
-      const locked = await repo.findOne({ where: { id: primaryRow.id }, lock: { mode: "pessimistic_write" } });
-      if (!locked) throw new ApiError(409, "no_primary_wallet", "the primary wallet row vanished");
-      const before = locked.creditedCC;
-      await repo.update({ id: locked.id }, { creditedCC: before + plan.healDelta });
+      const before = primaryRow.creditedCC;
+      const res = await repo
+        .createQueryBuilder()
+        .update(WalletEntity)
+        .set({ creditedCC: before + plan.healDelta })
+        .where("id = :id AND credited_cc = :before", { id: primaryRow.id, before: formatCC(before) })
+        .execute();
+      if (!res.affected) {
+        throw new ApiError(409, "deposit_in_progress", "the wallet attribution changed while reconciling; try again shortly");
+      }
       primaryRow.creditedCC = before + plan.healDelta;
       await this.audit.record(
         {
@@ -541,7 +604,7 @@ export class DepositService {
           actorSessionId: actor.sessionId ?? null,
           action: "deposit.attribution_healed",
           subjectType: "wallet",
-          subjectId: locked.id,
+          subjectId: primaryRow.id,
           metadata: {
             userId,
             amountCC: formatCC(plan.healDelta),
@@ -556,7 +619,7 @@ export class DepositService {
       );
     });
     this.logger.warn(`deposit attribution healed for user ${userId}: +${formatCC(plan.healDelta)} CC to the primary wallet (legacy path)`);
-    void this.publish(NatsSubjects.depositHealed, { userId, walletId: primaryRow.id, amountCC: formatCC(plan.healDelta) });
+    void this.nats.publishSafe(NatsSubjects.depositHealed, { userId, walletId: primaryRow.id, amountCC: formatCC(plan.healDelta) });
   }
 
   private async reportDrift(userId: string, primaryRow: WalletEntity, plan: CreditPlan, actor: Actor): Promise<void> {
@@ -582,7 +645,7 @@ export class DepositService {
     });
     this.logger.error(`deposit attribution drift for user ${userId}: ${drift.kind} ${formatCC(drift.amountCC)} CC (ledger ${formatCC(plan.ledgerDepositedCC)}, expected ${formatCC(plan.expected)})`);
     this.sentry.captureMessage(`deposit attribution drift: ${drift.kind}`, "error", { userId, walletId: subjectId, kind: drift.kind });
-    void this.publish(NatsSubjects.depositDrift, { userId, walletId: subjectId, kind: drift.kind, amountCC: formatCC(drift.amountCC) });
+    void this.nats.publishSafe(NatsSubjects.depositDrift, { userId, walletId: subjectId, kind: drift.kind, amountCC: formatCC(drift.amountCC) });
   }
 
   // ── GET /in-app-wallet ────────────────────────────────────────────────────────────────────
@@ -595,12 +658,7 @@ export class DepositService {
 
     // The 15 s cached views are fine here; only the reconcile route insists on fresh reads.
     const onLedger = primary ? await this.ledger.fetchUserWallet(primary) : null;
-    let byOwner = new Map<string, LedgerWallet>();
-    try {
-      byOwner = new Map((await this.ledger.fetchAllUserWallets()).map((w) => [w.owner, w]));
-    } catch (err) {
-      this.logger.warn(`ownLedgerWallet read failed: ${(err as Error).message}`);
-    }
+    const own = await this.walletLinks.ownLedgerWallets(rows, primary);
     let history: TransferRow[] | null = null;
     try {
       history = await this.wallet.transferHistory(this.treasury);
@@ -611,7 +669,7 @@ export class DepositService {
 
     const wallets = rows.map((w) =>
       walletToApi(w, {
-        ownLedgerWallet: w.partyId === primary ? null : (byOwner.get(w.partyId) ?? null),
+        ownLedgerWallet: own.get(w.id) ?? null,
         ...(history ? { receivedCC: this.wallet.totalReceivedFrom(history, this.treasury, w.partyId) } : {}),
       }),
     );
@@ -647,16 +705,4 @@ export class DepositService {
     };
   }
 
-  private async publish(subject: `truthoracle.${string}`, payload: object): Promise<void> {
-    try {
-      await this.nats.publish(subject, payload);
-    } catch (err) {
-      this.logger.warn(`publish ${subject} failed: ${(err as Error).message}`);
-    }
-  }
-}
-
-/** Exposed for composing packages that hold a transaction and need the same pessimistic read. */
-export async function lockWalletRow(manager: EntityManager, walletId: string): Promise<WalletEntity | null> {
-  return manager.getRepository(WalletEntity).findOne({ where: { id: walletId }, lock: { mode: "pessimistic_write" } });
 }

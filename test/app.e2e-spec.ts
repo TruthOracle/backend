@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
+import request from "supertest";
 
 import { DepositConfirmProcessor } from "../src/processors/deposit-confirm.processor";
 import { KycWebhookProcessor } from "../src/processors/kyc-webhook.processor";
 import { SessionCleanupProcessor } from "../src/processors/session-cleanup.processor";
+import { AppService } from "../src/services/app.service";
 import type {
   ApiAuditEvent,
   ApiKycSummary,
@@ -18,7 +21,7 @@ import type {
   ReconcileResult,
 } from "../src/types";
 import type { ErrorBody } from "../src/util/errors";
-import { TEST_ORIGIN, useTestApp } from "./helpers/app";
+import { TEST_ORIGIN, createTestApp, useTestApp } from "./helpers/app";
 import { bodyOf, linkWallet, signInWithWallet } from "./helpers/session";
 import { makeTestWallet } from "./helpers/wallet";
 
@@ -171,6 +174,35 @@ describe("App (e2e)", () => {
       // A malformed trigger is terminated; a well-formed one for an unknown row is acked (skipped).
       expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.mock", { nope: true })).toEqual(["term"]);
       expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.mock", { eventId: randomUUID() })).toEqual(["ack"]);
+    });
+
+    it("graceful shutdown: readiness turns 503 (draining) before the server closes, and a request in flight during close() completes without a 500", async () => {
+      // A second app instance: closing the shared one would end the suite.
+      const own = await createTestApp();
+      try {
+        const primary = makeTestWallet("drain");
+        const server = own.app.getHttpServer() as Server;
+        const { cookie } = await signInWithWallet(request(server), primary);
+        own.wallet.seedInbound(primary.partyId, "1");
+        // Slow the history walk so the request is still running when close() starts.
+        const original = own.wallet.transferHistory.bind(own.wallet);
+        jest.spyOn(own.wallet, "transferHistory").mockImplementation(async (partyId: string) => {
+          await new Promise((r) => setTimeout(r, 400));
+          return original(partyId);
+        });
+        const inFlight = Promise.resolve(request(server).post("/api/v1/in-app-wallet/deposits/reconcile").set(own.csrf).set("x-requested-with", "truthoracle").set("Cookie", cookie).send({}));
+        await new Promise((r) => setTimeout(r, 100));
+        // Nest: destroy → beforeApplicationShutdown (draining flag) → HTTP close (waits for the socket) → Redis / NATS teardown.
+        const closing = own.app.close();
+        await new Promise((r) => setTimeout(r, 20));
+        expect((await own.get(AppService).readiness())).toEqual({ status: "degraded", checks: expect.any(Object) as unknown, draining: true });
+        const res = await inFlight;
+        await closing;
+        expect(res.status).toBe(200);
+        expect(bodyOf<ReconcileResult>(res)).toMatchObject({ credited: "1.0000000000", status: "confirmed" });
+      } finally {
+        jest.restoreAllMocks();
+      }
     });
 
     it("the Swagger document builds from the live routes (decorators do not break boot)", () => {

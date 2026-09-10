@@ -1,21 +1,34 @@
 import { randomBytes } from "node:crypto";
-import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { Injectable, Logger, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { Redis } from "ioredis";
 
 import { Config } from "../config";
+
+/** `defineCommand` adds methods at runtime; this is the one script the service registers. */
+interface RedisWithScripts extends Redis {
+  releaseLock(key: string, token: string): Promise<number>;
+}
+
+/** Holder-safe release: delete only while the key still carries this holder's token — one round trip, no window. */
+const RELEASE_LOCK_LUA = `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`;
 
 /**
  * Cross-instance state (docs/ARCHITECTURE.md §10): single-use claims, fixed-window rate
  * limits, short locks, JSON cache and small sets. Port of the Redis-backed half of
  * truthoracle-canton/api/_lib/sharedStore.mjs — without the in-memory fallback: here Redis is
  * REQUIRED at boot, so an outage is an error, never a silent downgrade. Only `SET NX PX`,
- * `INCR`, `PEXPIRE`, `PTTL`, `DEL`, `GET`, `SET EX/PX`, `SADD/SREM/SMEMBERS` are used.
+ * `INCR`, `PEXPIRE`, `PTTL`, `DEL`, `GET`, `GETDEL`, `SET EX/PX`, `SADD/SREM/SMEMBERS` and one
+ * `EVALSHA` (the lock release script) are used.
  *
  * Every key is prefixed `truthoracle:<APP_NETWORK>:` inside this service — callers pass bare
  * keys (`sess:<hash>`, `lock:deposit:<userId>`, …).
+ *
+ * The connection is closed in `onApplicationShutdown`, i.e. AFTER the HTTP server stopped
+ * accepting requests (Nest: destroy hooks → beforeShutdown → dispose → shutdown hooks): a
+ * request still in flight during a deploy must find Redis alive.
  */
 @Injectable()
-export class RedisService implements OnModuleInit, OnModuleDestroy {
+export class RedisService implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = new Logger(RedisService.name);
   readonly client: Redis;
   readonly keyPrefix: string;
@@ -28,6 +41,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       enableReadyCheck: true,
       connectionName: "truthoracle-backend",
     });
+    this.client.defineCommand("releaseLock", { numberOfKeys: 1, lua: RELEASE_LOCK_LUA });
     this.client.on("error", (err: Error) => this.logger.warn(`redis error: ${err.message}`));
   }
 
@@ -37,7 +51,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(`connected to ${this.describeUrl()} (${pong}); prefix ${this.keyPrefix}`);
   }
 
-  async onModuleDestroy(): Promise<void> {
+  async onApplicationShutdown(): Promise<void> {
     try {
       await this.client.quit();
     } catch {
@@ -82,8 +96,9 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Short-lived exclusive lock. The TTL is the crash ceiling — a holder that dies un-releases
-   * automatically. Release only deletes the key while it still carries this holder's token, so
-   * a slow holder cannot release a lock the TTL already handed to someone else.
+   * automatically. Release runs as ONE Lua script (compare token, then delete), so a slow holder
+   * cannot release a lock the TTL already handed to someone else — a plain GET-then-DEL would
+   * leave exactly that window open.
    */
   async acquireLock(key: string, ttlMs: number): Promise<{ acquired: boolean; release(): Promise<void> }> {
     const k = this.key(key);
@@ -94,8 +109,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       acquired: true,
       release: async () => {
         try {
-          const current = await this.client.get(k);
-          if (current === token) await this.client.del(k);
+          await (this.client as RedisWithScripts).releaseLock(k, token);
         } catch (err) {
           // TTL cleans it up.
           this.logger.warn(`lock release failed for ${key}: ${(err as Error).message}`);
@@ -106,6 +120,17 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
   async getJson<T>(key: string): Promise<T | null> {
     const raw = await this.client.get(this.key(key));
+    if (raw === null) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Read AND delete atomically (GETDEL): the single-use claim for challenges and OIDC state. */
+  async takeJson<T>(key: string): Promise<T | null> {
+    const raw = await this.client.getdel(this.key(key));
     if (raw === null) return null;
     try {
       return JSON.parse(raw) as T;

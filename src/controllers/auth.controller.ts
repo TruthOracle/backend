@@ -3,7 +3,7 @@ import { ApiTags } from "@nestjs/swagger";
 import type { Response } from "express";
 
 import { Public } from "../auth/decorators";
-import type { AuthedRequest } from "../auth/request";
+import { type AuthedRequest, optionalPrincipalOf } from "../auth/request";
 import { Config } from "../config";
 import { GoogleLoginDto, TelegramMiniAppDto, TelegramWidgetDto, WalletChallengeDto, WalletLoginDto } from "../dto/auth.dto";
 import { AuditService } from "../services/audit.service";
@@ -25,7 +25,11 @@ import { ApiError } from "../util/errors";
  * Sign-in routes (docs/API.md "Auth", ARCHITECTURE §6–§7). Every login route is @Public: with a
  * session cookie present it runs in link mode (the identity is attached to the current account
  * and no new session is issued). Rate limits: login 10/min/IP + 5/min/subject, nonce 30/min/IP,
- * challenge 30/min/IP + 10/min/party, telegram 10/min/IP, link 10/min/user (§13).
+ * challenge 30/min/IP + 10/min per (IP, party), telegram 10/min/IP, link 10/min/user (§13).
+ *
+ * Every per-SUBJECT login limit is applied only AFTER the credential verified (Google, Telegram
+ * and wallet alike): a party id or account id is public, so a limit keyed on the unverified body
+ * would let anyone lock the real owner out — including every ADMIN_OPERATORS party.
  */
 @ApiTags("auth")
 @Controller("auth")
@@ -47,12 +51,13 @@ export class AuthController {
   @Public()
   @Get("session")
   session(@Req() req: AuthedRequest): ApiSessionState {
-    if (!req.user || !req.session) return { authenticated: false };
+    const principal = optionalPrincipalOf(req);
+    if (!principal) return { authenticated: false };
     return {
       authenticated: true,
-      kind: req.session.kind,
-      user: this.users.toApi(req.user),
-      expiresAt: req.session.expiresAt.toISOString(),
+      kind: principal.session.kind,
+      user: this.users.toApi(principal.user),
+      expiresAt: principal.session.expiresAt.toISOString(),
     };
   }
 
@@ -183,11 +188,12 @@ export class AuthController {
   @Post("wallet/challenge")
   @HttpCode(200)
   async walletChallenge(@Body() body: WalletChallengeDto, @Req() req: AuthedRequest): Promise<ApiChallenge> {
-    await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: body.partyId });
+    // The party dimension is keyed together with the IP: a stranger cannot spend the owner's quota.
+    await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: `${req.clientIp ?? "unknown"}:${body.partyId}` });
     return this.challenges.issue({
       partyId: body.partyId,
       purpose: body.purpose,
-      sessionId: req.session?.id ?? null,
+      sessionId: optionalPrincipalOf(req)?.session.id ?? null,
       host: req.requestHost ?? "",
     });
   }
@@ -203,9 +209,10 @@ export class AuthController {
   @Post("wallet")
   @HttpCode(200)
   async wallet(@Body() body: WalletLoginDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
-    await this.rateLimit.enforce("login", { ip: req.clientIp, subject: `wallet:${body.partyId}` });
-    const session = req.user && req.session ? req.session : null;
-    const user = session ? (req.user ?? null) : null;
+    await this.rateLimit.enforce("login", { ip: req.clientIp });
+    const principal = optionalPrincipalOf(req);
+    const session = principal?.session ?? null;
+    const user = principal?.user ?? null;
 
     const verified = await this.challenges.verify({
       challengeId: body.challengeId,
@@ -215,6 +222,8 @@ export class AuthController {
       expectedPurpose: session ? "link-wallet" : ["sign-in", "admin-sign-in"],
       sessionId: session?.id ?? null,
     });
+    // Per-subject limit only once the signature proved control of the party (same order as Google / Telegram).
+    await this.rateLimit.enforce("login", { subject: `wallet:${verified.partyId}` });
 
     if (session && user) {
       await this.rateLimit.enforce("link", { userId: user.id });
@@ -249,15 +258,14 @@ export class AuthController {
     });
   }
 
-
   // ── Logout ─────────────────────────────────────────────────────────────────
 
   @Post("logout")
   @HttpCode(200)
   async logout(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<{ ok: true }> {
-    const session = req.session;
-    const user = req.user;
-    if (session && user) {
+    const principal = optionalPrincipalOf(req);
+    if (principal) {
+      const { session, user } = principal;
       await this.sessions.revoke(session.id);
       await this.audit.record({
         actorType: session.kind === "admin" ? "admin" : "user",

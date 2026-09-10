@@ -8,7 +8,7 @@ const USER_ID = "11111111-1111-4111-8111-111111111111";
 function request(overrides: Partial<AuthedRequest> = {}): AuthedRequest {
   return {
     user: { id: "admin-user" },
-    session: { id: "admin-sess" },
+    session: { id: "admin-sess", kind: "admin" },
     clientIp: "10.0.0.1",
     ...overrides,
   } as unknown as AuthedRequest;
@@ -20,14 +20,18 @@ describe("adminActorOf", () => {
     expect(adminActorOf(request({ clientIp: undefined })).ip).toBeNull();
   });
 
-  it("refuses a request that somehow has no session or user", () => {
-    for (const bad of [request({ user: undefined }), request({ session: undefined })]) {
+  it("refuses a request that somehow has no session or user (401) or a user session (403)", () => {
+    for (const [bad, code] of [
+      [request({ user: undefined }), "unauthenticated"],
+      [request({ session: undefined }), "unauthenticated"],
+      [request({ session: { id: "s", kind: "user" } as unknown as AuthedRequest["session"] }), "forbidden"],
+    ] as const) {
       try {
         adminActorOf(bad);
         throw new Error("expected an ApiError");
       } catch (err) {
         expect(err).toBeInstanceOf(ApiError);
-        expect((err as ApiError).code).toBe("unauthenticated");
+        expect((err as ApiError).code).toBe(code);
       }
     }
   });
@@ -41,6 +45,7 @@ describe("AdminController", () => {
     listPayouts: jest.fn().mockResolvedValue({ items: [] }),
   };
   const controller = new AdminController(admin as unknown as AdminService);
+  const req = request({ clientIp: undefined });
   const actor = { type: "admin" as const, userId: "admin-user", sessionId: "admin-sess", ip: null };
 
   it("applies query defaults for the user search", async () => {
@@ -51,9 +56,9 @@ describe("AdminController", () => {
   });
 
   it("coerces force to a strict boolean on settle", async () => {
-    await controller.settlePayout("pp-1", { reason: "why" }, actor);
+    await controller.settlePayout({ cid: "pp-1" }, { reason: "why" }, req);
     expect(admin.settlePayout).toHaveBeenCalledWith("pp-1", { force: false, reason: "why" }, actor);
-    await controller.settlePayout("pp-1", { reason: "why", force: true }, actor);
+    await controller.settlePayout({ cid: "pp-1" }, { reason: "why", force: true }, req);
     expect(admin.settlePayout).toHaveBeenLastCalledWith("pp-1", { force: true, reason: "why" }, actor);
   });
 

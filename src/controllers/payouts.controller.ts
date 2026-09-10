@@ -1,13 +1,11 @@
-import { Controller, Get, HttpCode, Param, Post } from "@nestjs/common";
-import { ApiTags } from "@nestjs/swagger";
+import { Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
+import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
-import { ClientIp, CurrentSession, CurrentUser } from "../auth/decorators";
+import { type AuthedRequest, principalOf } from "../auth/request";
 import { PayoutCidParamDto } from "../dto/payouts.dto";
-import type { SessionEntity } from "../entities/session.entity";
-import type { UserEntity } from "../entities/user.entity";
 import { PayoutService } from "../services/payout.service";
 import { RateLimitService } from "../services/rate-limit.service";
-import type { ApiPayout, PayoutStatus } from "../types";
+import type { ApiPayout } from "../types";
 
 /**
  * User payout routes (docs/API.md "In-app wallet"). Both are session-only (the global
@@ -15,6 +13,8 @@ import type { ApiPayout, PayoutStatus } from "../types";
  * `PayoutService.settle`, which answers 404 for anything else.
  */
 @ApiTags("payouts")
+@ApiCookieAuth("to_session")
+@ApiBearerAuth()
 @Controller("in-app-wallet/payouts")
 export class PayoutsController {
   constructor(
@@ -24,7 +24,8 @@ export class PayoutsController {
 
   /** Ledger PendingPayouts addressed to the user's wallets merged with their `to_payouts` rows. */
   @Get()
-  async list(@CurrentUser() user: UserEntity): Promise<{ payouts: ApiPayout[] }> {
+  async list(@Req() req: AuthedRequest): Promise<{ payouts: ApiPayout[] }> {
+    const { user } = principalOf(req);
     return { payouts: await this.payouts.listMergedForUser(user.id) };
   }
 
@@ -35,16 +36,10 @@ export class PayoutsController {
    */
   @Post(":cid/settle")
   @HttpCode(200)
-  async settle(
-    @Param() params: PayoutCidParamDto,
-    @CurrentUser() user: UserEntity,
-    @CurrentSession() session: SessionEntity,
-    @ClientIp() ip: string,
-  ): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
+  async settle(@Param() params: PayoutCidParamDto, @Req() req: AuthedRequest): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
+    const { user, session } = principalOf(req);
     await this.rateLimit.enforce("settle", { userId: user.id });
-    const result = await this.payouts.settle(params.cid, { type: "user", userId: user.id, sessionId: session.id, ip });
+    const result = await this.payouts.settle(params.cid, { type: "user", userId: user.id, sessionId: session.id, ip: req.clientIp ?? null });
     return { payout: this.payouts.toApi(result.payout, result.onLedger), mode: result.mode };
   }
 }
-
-export type { PayoutStatus };

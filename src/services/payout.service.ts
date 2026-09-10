@@ -9,7 +9,6 @@ import type { WalletEntity } from "../entities/wallet.entity";
 import {
   type ApiPayout,
   type ErrorCode,
-  type NatsSubject,
   NatsSubjects,
   type PayoutStatus,
   type PendingPayoutRecord,
@@ -17,9 +16,9 @@ import {
 import { ApiError } from "../util/errors";
 import { formatCC } from "../util/money";
 import { AuditService, type AuditInput } from "./audit.service";
-import { EnterpriseWalletService } from "./enterprise-wallet.service";
+import { EnterpriseWalletService, type TransferStatusResult } from "./enterprise-wallet.service";
 import { KycService } from "./kyc.service";
-import { LedgerClientService } from "./ledger-client.service";
+import { LedgerClientService, userWalletCreateCommand, walletCreateCommandIdFor } from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { RedisService } from "./redis.service";
 import { SentryService } from "./sentry.service";
@@ -42,13 +41,19 @@ import { WalletLinkService } from "./wallet-link.service";
  *
  *   1. The transfer commandId is DERIVED from the cid, so every settlement attempt for one
  *      payout submits the same id and ledger command-dedup rejects the copies.
- *   2. `to_payouts` records `settling` + the command id BEFORE the wallet is called. Once that
- *      row commits, `transfer()` is never called again for the payout — a retry asks the wallet
+ *   2. `to_payouts` records `settling` + the command id BEFORE the wallet is called, as a
+ *      compare-and-set (`UPDATE … WHERE <command id column> IS NULL`): two instances that both
+ *      got past the lock cannot both win it, and the loser never calls upstream. Once the row
+ *      commits, `transfer()` is never called again for the payout — a retry asks the wallet
  *      whether the recorded id was submitted (failing CLOSED when it cannot tell) and resumes at
  *      MarkPaid, or hands the row to an operator. This doubles as crash recovery.
- *   3. Attempts are capped (`PAYOUT_MAX_ATTEMPTS`) → `failed` (admin queue).
+ *   3. Attempts are capped (`PAYOUT_MAX_ATTEMPTS`) → `failed` (admin queue). System scans that
+ *      merely poll a recorded id do not count.
  *   4. A Redis lock `lock:payout:<cid>` turns most races into an immediate 409 before any
  *      upstream work happens. It is a crash ceiling, not the correctness mechanism.
+ *
+ * A consuming submit (MarkPaid / SettleToWallet) is only ever called "settled" once the ledger
+ * shows the PendingPayout gone: the wallet accepting a command is not the ledger executing it.
  */
 
 export interface PayoutActor {
@@ -89,6 +94,12 @@ const NON_TERMINAL: PayoutStatus[] = [
   "blocked_wallet_revoked",
   "failed",
 ];
+const COMMAND_COLUMNS = {
+  transferCommandId: "transfer_command_id",
+  walletCreateCommandId: "wallet_create_command_id",
+  settleCommandId: "settle_command_id",
+} as const;
+type CommandField = keyof typeof COMMAND_COLUMNS;
 
 function hash40(input: string): string {
   return createHash("sha256").update(input).digest("hex").slice(0, 40);
@@ -113,13 +124,16 @@ export function commandIdsFor(pendingPayoutCid: string): {
 }
 
 /**
- * One UserWallet per payee, derived from the party alone: UserWallet has no contract key, so two
- * racing CreateCommands would mint two wallets (see deposit.mjs) — the shared id makes them
- * collide on ledger command-dedup instead.
+ * A consuming choice the wallet reported as failed (or never saw) may be retried — the ledger
+ * rejects it once the contract is gone, so it cannot pay twice — but not under an id the ledger
+ * may already have completed: the retry carries the attempt number.
  */
-export function walletCreateCommandIdFor(payeeParty: string): string {
-  return `wallet-create-${hash40(payeeParty)}`;
+export function retryCommandId(base: string, attempt: number): string {
+  return `${base}-r${attempt}`;
 }
+
+/** One UserWallet per payee — the shared deterministic id (ledger-client.service), re-exported for callers and tests. */
+export { walletCreateCommandIdFor };
 
 interface SettleContext {
   cid: string;
@@ -210,10 +224,12 @@ export class PayoutService {
   }
 
   private async settleLocked(cid: string, actor: PayoutActor): Promise<SettleResult> {
-    const known = await this.payouts.findOne({ where: { pendingPayoutCid: cid } });
+    let known = await this.payouts.findOne({ where: { pendingPayoutCid: cid } });
     // Always a fresh read: a cached view could show a payout the user cancelled a moment ago as
     // still owed, and the transfer below is irreversible.
     const live = await this.ledger.fetchPendingPayout(cid, { uncached: true });
+    // The ledger read takes a while; another instance may have moved the row meanwhile.
+    if (known) known = (await this.payouts.findOne({ where: { id: known.id } })) ?? known;
     if (!live && !known) throw notFound();
 
     const payee = live?.user ?? known?.payeeParty ?? "";
@@ -306,25 +322,18 @@ export class PayoutService {
   // ───────────────────────────────────────────── external path ───────────────────────────────
 
   private async executeExternal(ctx: LiveContext): Promise<SettleResult> {
-    const { cid, live, row } = ctx;
+    const { cid, row, actor } = ctx;
     const { transferCommandId, markPaidCommandId } = commandIdsFor(cid);
     const treasury = this.config.treasuryPartyId;
 
     if (!row.transferCommandId) {
-      // Write-ahead: once this commits, transfer() is called at most once for this payout, ever.
-      await this.transition(row, { status: "settling", transferCommandId, attempts: row.attempts + 1, lastError: null });
+      // Write-ahead (compare-and-set): once this commits, transfer() is called at most once for
+      // this payout, ever — and an instance that lost the race never calls the wallet.
+      if (!(await this.claimCommand(row, "transferCommandId", transferCommandId, { previous: null, countAttempt: true }))) {
+        throw await this.lostRace(ctx, transferCommandId);
+      }
       try {
-        await this.wallet.transfer({
-          to: live.user,
-          amountCC: live.amountCC,
-          reason: live.reason || "payout",
-          commandId: transferCommandId,
-          metadata: {
-            kind: "truthoracle_admin_payout",
-            pending_payout_cid: cid,
-            reason: live.reason || "payout",
-          },
-        });
+        await this.wallet.transfer(this.transferArgs(ctx, transferCommandId));
       } catch (err) {
         // Unknown whether the wallet accepted it: the row keeps the id, the next attempt asks.
         throw await this.attemptFailed(ctx, err, "transfer");
@@ -336,32 +345,75 @@ export class PayoutService {
       const status = await this.wallet.transferStatus(treasury, row.transferCommandId);
       if (!status.known) throw await this.stopUnknown(ctx, row.transferCommandId);
       if (!status.submitted) {
-        // The wallet says the recorded transfer never happened. It is still never re-sent: a
-        // "not found" from a lagging index is exactly the case that double-pays. Count the
-        // attempt; the cap hands the row to an operator.
-        await this.transition(row, { status: "settling", attempts: row.attempts + 1 });
-        throw await this.attemptFailed(
-          ctx,
-          new Error(`transfer ${row.transferCommandId} is recorded but the wallet reports "${status.status ?? "unknown"}"; refusing to transfer again`),
-          "transfer-status",
-        );
+        if (this.mayResendTransfer(ctx)) {
+          // The operator's way out of a transfer that died before the wallet recorded it: force +
+          // reason, past PAYOUT_RESEND_GRACE_MS (a lagging index has caught up by then), audited;
+          // the identical command id keeps ledger dedup as the backstop.
+          await this.audit.record({
+            ...this.actorFields(actor),
+            action: "payout.admin_override",
+            subjectType: "payout",
+            subjectId: cid,
+            metadata: { detail: "resend_transfer", transferCommandId: row.transferCommandId, walletStatus: status.status, reason: actor.reason, userId: row.userId },
+          });
+          this.logger.warn(`payout ${cid}: operator re-sends transfer ${row.transferCommandId} (wallet reported "${status.status ?? "unknown"}")`);
+          await this.transition(row, { status: "settling", attempts: row.attempts + 1, lastError: null });
+          try {
+            await this.wallet.transfer(this.transferArgs(ctx, row.transferCommandId));
+          } catch (err) {
+            throw await this.attemptFailed(ctx, err, "transfer");
+          }
+        } else {
+          // The wallet says the recorded transfer never happened. It is still never re-sent by
+          // itself: a "not found" from a lagging index is exactly the case that double-pays. A
+          // user's or operator's retry counts toward the cap (→ operator queue); the scan's own
+          // polls do not, or every stuck row would be `failed` within minutes.
+          await this.transition(row, { status: "settling", ...(actor.type === "system" ? {} : { attempts: row.attempts + 1 }) });
+          throw await this.attemptFailed(
+            ctx,
+            new Error(`transfer ${row.transferCommandId} is recorded but the wallet reports "${status.status ?? "unknown"}"; refusing to transfer again`),
+            "transfer-status",
+          );
+        }
+      } else {
+        this.logger.warn(`payout ${cid}: transfer ${row.transferCommandId} already submitted — resuming at MarkPaid`);
+        await this.transition(row, { status: "settling", attempts: row.attempts + 1, lastError: null });
       }
-      this.logger.warn(`payout ${cid}: transfer ${row.transferCommandId} already submitted — resuming at MarkPaid`);
-      await this.transition(row, { status: "settling", attempts: row.attempts + 1, lastError: null });
     }
 
     // The CC has moved. If MarkPaid fails the user still has their money; the row just lingers
-    // until the next settle attempt resumes here and archives it.
-    await this.transition(row, { markPaidCommandId });
+    // until the next settle attempt resumes here and archives it. A MarkPaid that was already
+    // attempted (contract still live, so it did not land) is retried under a fresh id.
+    const markPaidId = row.markPaidCommandId ? retryCommandId(markPaidCommandId, row.attempts) : markPaidCommandId;
+    await this.transition(row, { markPaidCommandId: markPaidId });
     try {
       await this.wallet.externalSubmit({
-        commandId: markPaidCommandId,
+        commandId: markPaidId,
         commands: [this.exercisePayout(cid, "MarkPaid", { txHash: row.transferCommandId ?? transferCommandId })],
       });
     } catch (err) {
       throw await this.attemptFailed(ctx, err, "markpaid");
     }
+    if (await this.stillLive(cid)) throw await this.inFlight(ctx, markPaidId);
     return this.settled(ctx, "settled_external", "external");
+  }
+
+  private transferArgs(ctx: LiveContext, commandId: string): Parameters<EnterpriseWalletService["transfer"]>[0] {
+    const { cid, live } = ctx;
+    return {
+      to: live.user,
+      amountCC: live.amountCC,
+      reason: live.reason || "payout",
+      commandId,
+      metadata: { kind: "truthoracle_admin_payout", pending_payout_cid: cid, reason: live.reason || "payout" },
+    };
+  }
+
+  /** Admin + force + reason (validated in settle()) and a row older than PAYOUT_RESEND_GRACE_MS. */
+  private mayResendTransfer(ctx: SettleContext): boolean {
+    const { actor, row } = ctx;
+    if (actor.type !== "admin" || !actor.force) return false;
+    return Date.now() - row.firstSeenAt.getTime() >= this.config.payoutResendGraceMs;
   }
 
   // ───────────────────────────────────────────── in-app path ─────────────────────────────────
@@ -373,24 +425,31 @@ export class PayoutService {
     const treasury = this.config.treasuryPartyId;
     // One attempt per call, however many submissions it takes.
     let counted = false;
-    const bump = (): number => {
-      if (counted) return row.attempts;
+    const countOnce = (): boolean => {
+      if (counted) return false;
       counted = true;
-      return row.attempts + 1;
+      return true;
     };
 
     let ledgerWallet = await this.ledger.fetchUserWallet(payee, { uncached: true });
     if (!ledgerWallet) {
       const walletCreateCommandId = walletCreateCommandIdFor(payee);
       if (row.walletCreateCommandId) {
-        const status = await this.wallet.transferStatus(treasury, row.walletCreateCommandId);
-        if (!status.known) throw await this.stopUnknown(ctx, row.walletCreateCommandId);
+        const status = await this.wallet.commandStatus(treasury, row.walletCreateCommandId);
+        if (this.readFailed(status)) throw await this.stopUnknown(ctx, row.walletCreateCommandId);
         // Accepted but not yet visible on the ledger: creating again would race it.
-        if (status.submitted) throw await this.inFlight(ctx, row.walletCreateCommandId);
+        if (status.known && status.submitted) throw await this.inFlight(ctx, row.walletCreateCommandId);
+        // Failed or unknown to the wallet: re-submit the SAME id — the per-owner id makes a Create
+        // that did land (unindexed) collide on dedup instead of minting a second wallet.
+        await this.transition(row, { status: "settling", attempts: countOnce() ? row.attempts + 1 : row.attempts, lastError: null });
+      } else if (!(await this.claimCommand(row, "walletCreateCommandId", walletCreateCommandId, { previous: null, countAttempt: countOnce() }))) {
+        throw await this.lostRace(ctx, walletCreateCommandId);
       }
-      await this.transition(row, { status: "settling", walletCreateCommandId, attempts: bump(), lastError: null });
       try {
-        await this.wallet.externalSubmit({ commandId: walletCreateCommandId, commands: [this.createWalletCommand(payee)] });
+        await this.wallet.externalSubmit({
+          commandId: walletCreateCommandId,
+          commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: treasury, owner: payee, withDepositRefs: this.config.damlUserWalletHasDepositRefs })],
+        });
       } catch (err) {
         throw await this.attemptFailed(ctx, err, "wallet-create");
       }
@@ -398,71 +457,78 @@ export class PayoutService {
       if (!ledgerWallet) throw await this.attemptFailed(ctx, new Error("UserWallet is not visible after create"), "wallet-create");
     }
 
+    let settleId = settleCommandId;
     if (row.settleCommandId) {
-      const status = await this.wallet.transferStatus(treasury, row.settleCommandId);
-      if (!status.known) throw await this.stopUnknown(ctx, row.settleCommandId);
-      if (status.submitted) throw await this.inFlight(ctx, row.settleCommandId);
-      // The wallet says the recorded SettleToWallet never happened. Unlike an external transfer,
-      // re-submitting a CONSUMING choice cannot pay twice — the ledger rejects it once the
-      // contract is gone — so the in-app path may retry.
+      const status = await this.wallet.commandStatus(treasury, row.settleCommandId);
+      if (this.readFailed(status)) throw await this.stopUnknown(ctx, row.settleCommandId);
+      if (status.known && status.submitted) throw await this.inFlight(ctx, row.settleCommandId);
+      // The wallet says the recorded SettleToWallet failed (or never saw it). Unlike an external
+      // transfer, re-submitting a CONSUMING choice cannot pay twice — the ledger rejects it once
+      // the contract is gone — so the in-app path retries, under a fresh id.
+      settleId = retryCommandId(settleCommandId, row.attempts + 1);
     }
     // `walletCid` is always the cid read moments ago: every Deposit / Credit replaces it.
-    await this.transition(row, { status: "settling", settleCommandId, attempts: bump(), lastError: null });
+    if (!(await this.claimCommand(row, "settleCommandId", settleId, { previous: row.settleCommandId, countAttempt: countOnce() }))) {
+      throw await this.lostRace(ctx, settleId);
+    }
     try {
       await this.wallet.externalSubmit({
-        commandId: settleCommandId,
+        commandId: settleId,
         commands: [this.exercisePayout(cid, "SettleToWallet", { walletCid: ledgerWallet.contractId })],
       });
     } catch (err) {
       throw await this.attemptFailed(ctx, err, "settle-to-wallet");
     }
+    if (await this.stillLive(cid)) throw await this.inFlight(ctx, settleId);
     return this.settled(ctx, "settled_in_app", "in_app");
-  }
-
-  /** Treasury-created, empty UserWallet for a payee who has never deposited. */
-  private createWalletCommand(owner: string): unknown {
-    const zero = formatCC(0n);
-    const createArguments: Record<string, unknown> = {
-      admin: this.config.treasuryPartyId,
-      owner,
-      balanceCC: zero,
-      depositedCC: zero,
-      withdrawnCC: zero,
-    };
-    // 1.0.0 has no depositRefs, and on 2.0.0 an omitted Optional defaults to None (deposit.mjs):
-    // only send the field when the Daml is known to carry it.
-    if (this.config.damlUserWalletHasDepositRefs) createArguments.depositRefs = [];
-    return { CreateCommand: { templateId: this.ledger.templateId("UserWallet"), createArguments } };
   }
 
   private exercisePayout(cid: string, choice: "MarkPaid" | "SettleToWallet", choiceArgument: Record<string, unknown>): unknown {
     return { ExerciseCommand: { templateId: this.ledger.templateId("PendingPayout"), contractId: cid, choice, choiceArgument } };
   }
 
+  /** The wallet accepted a consuming command; only the ledger says whether it executed. */
+  private async stillLive(cid: string): Promise<boolean> {
+    return (await this.ledger.fetchPendingPayout(cid, { uncached: true })) !== null;
+  }
+
+  /** A command-status read that failed outright (network / 5xx) — not a 404, which is merely "unknown to the wallet". */
+  private readFailed(status: TransferStatusResult): boolean {
+    return !status.known && status.status !== "not_found";
+  }
+
   // ───────────────────────────────────────────── archived contracts ──────────────────────────
 
   /**
    * The contract is gone: either a recorded submit consumed it (settled) or the user exercised
-   * CancelPayout (archived). The wallet's view of the recorded id decides; an unreadable status
-   * pauses the row instead of guessing.
+   * CancelPayout (archived). A recorded MarkPaid means the transfer was confirmed before it, so
+   * the payout is settled without asking; a recorded transfer is asked about on the transfer
+   * index; a recorded SettleToWallet the wallet cannot confirm is parked for an operator —
+   * never labelled "archived" (the user would read "Cancelled" for a bond that may have landed).
    */
   private async resolveArchived(ctx: SettleContext): Promise<SettleResult> {
-    const { row } = ctx;
+    const { row, cid } = ctx;
     if (TERMINAL.has(row.status)) return { payout: row, mode: "already_settled", onLedger: false };
 
-    const recorded = row.transferCommandId
-      ? { id: row.transferCommandId, status: "settled_external" as const, mode: "external" as const }
-      : row.settleCommandId
-        ? { id: row.settleCommandId, status: "settled_in_app" as const, mode: "in_app" as const }
-        : null;
-    if (recorded) {
-      const status = await this.wallet.transferStatus(this.config.treasuryPartyId, recorded.id);
-      if (!status.known) throw await this.stopUnknown(ctx, recorded.id);
-      if (status.submitted) return this.settled(ctx, recorded.status, recorded.mode);
+    if (row.markPaidCommandId) return this.settled(ctx, "settled_external", "external");
+    if (row.transferCommandId) {
+      const status = await this.wallet.transferStatus(this.config.treasuryPartyId, row.transferCommandId);
+      if (!status.known) throw await this.stopUnknown(ctx, row.transferCommandId);
+      if (status.submitted) return this.settled(ctx, "settled_external", "external");
       // Recorded but never submitted: the user cancelled between the write-ahead and the call.
+    } else if (row.settleCommandId) {
+      const status = await this.wallet.commandStatus(this.config.treasuryPartyId, row.settleCommandId);
+      if (this.readFailed(status)) throw await this.stopUnknown(ctx, row.settleCommandId);
+      if (status.known && status.submitted) return this.settled(ctx, "settled_in_app", "in_app");
+      const detail = `PendingPayout is gone but the wallet reports SettleToWallet ${row.settleCommandId} as ${status.status ?? "unknown"}; operator review required`;
+      if (row.status !== "failed") {
+        this.sentry.captureMessage("in-app payout archived without a confirmed settlement", "error", { processor: "payout", cid });
+        this.logger.error(`payout ${cid}: ${detail}`);
+      }
+      return this.block(ctx, "failed", detail);
     }
     await this.transition(row, { status: "archived", lastError: null });
-    this.logger.log(`payout ${ctx.cid}: archived on the ledger without a settlement (user cancel)`);
+    this.logger.log(`payout ${cid}: archived on the ledger without a settlement (user cancel)`);
     return { payout: row, mode: "already_settled", onLedger: false };
   }
 
@@ -496,7 +562,7 @@ export class PayoutService {
             action: "payout.seen",
             subjectType: "payout",
             subjectId: live.contractId,
-            metadata: { reason: live.reason, amountCC: live.amountCC, payeeParty: live.user, userId: saved.userId, walletId: saved.payeeWalletId },
+            metadata: { reason: live.reason, amountCC: formatCC(live.amountCC), payeeParty: live.user, userId: saved.userId, walletId: saved.payeeWalletId },
           },
           manager,
         );
@@ -530,6 +596,45 @@ export class PayoutService {
     });
   }
 
+  /**
+   * Compare-and-set write-ahead of a command id: the row must still carry `previous` in that
+   * column (null = never claimed) and be in a non-terminal status. `false` means another instance
+   * claimed it between our read and this write — the caller must not call upstream.
+   */
+  private async claimCommand(
+    row: PayoutEntity,
+    field: CommandField,
+    commandId: string,
+    opts: { previous: string | null; countAttempt: boolean },
+  ): Promise<boolean> {
+    const column = COMMAND_COLUMNS[field];
+    const qb = this.payouts
+      .createQueryBuilder()
+      .update(PayoutEntity)
+      .set({
+        status: "settling",
+        [field]: commandId,
+        lastError: null,
+        ...(opts.countAttempt ? { attempts: () => "attempts + 1" } : {}),
+      })
+      .where("id = :id AND status IN (:...statuses)", { id: row.id, statuses: NON_TERMINAL });
+    if (opts.previous === null) qb.andWhere(`${column} IS NULL`);
+    else qb.andWhere(`${column} = :previous`, { previous: opts.previous });
+    const res = await qb.execute();
+    if (!res.affected) return false;
+    const fresh = await this.payouts.findOneByOrFail({ id: row.id });
+    Object.assign(row, fresh);
+    return true;
+  }
+
+  /** Another instance recorded the command id first: no upstream call, the row already says so. */
+  private async lostRace(ctx: SettleContext, commandId: string): Promise<ApiError> {
+    const fresh = await this.payouts.findOne({ where: { id: ctx.row.id } });
+    if (fresh) Object.assign(ctx.row, fresh);
+    this.logger.warn(`payout ${ctx.cid}: ${commandId} was claimed by another settlement; standing down`);
+    return new ApiError(409, "payout_blocked", "a settlement for this payout is already in progress", { status: ctx.row.status, reason: "in_flight" });
+  }
+
   /** Persist a blocked (or failed) verdict and throw the matching 409. Audited/published on change only. */
   private async block(ctx: SettleContext, status: PayoutStatus, detail: string): Promise<never> {
     const { row, cid, actor } = ctx;
@@ -549,10 +654,10 @@ export class PayoutService {
         : undefined,
     );
     if (changed) {
-      await this.publish(
+      await this.nats.publishSafe(
         status === "failed" ? NatsSubjects.payoutFailed : NatsSubjects.payoutBlocked,
         { cid, userId: row.userId, payeeParty: row.payeeParty, status, detail },
-        `${action}:${cid}:${status}`,
+        { msgId: `${action}:${cid}:${status}` },
       );
       this.logger.warn(`payout ${cid}: ${status} (${detail})`);
     }
@@ -580,7 +685,7 @@ export class PayoutService {
         : undefined,
     );
     if (becameFailed) {
-      await this.publish(NatsSubjects.payoutFailed, { cid, userId: row.userId, payeeParty: row.payeeParty, status, attempts: row.attempts }, `payout.failed:${cid}`);
+      await this.nats.publishSafe(NatsSubjects.payoutFailed, { cid, userId: row.userId, payeeParty: row.payeeParty, status, attempts: row.attempts }, { msgId: `payout.failed:${cid}` });
       this.logger.error(`payout ${cid}: giving up after ${row.attempts} attempt(s) — ${detail}`);
       this.sentry.captureMessage(`payout settlement failed after ${row.attempts} attempts`, "error", { processor: "payout", phase });
     } else {
@@ -605,33 +710,47 @@ export class PayoutService {
     return new ApiError(409, "payout_blocked", "a previous submission for this payout is still in flight", { status: "settling", reason: "in_flight" });
   }
 
+  /** Terminal transition as a compare-and-set: whoever moves the row out of a non-terminal status audits and publishes once. */
   private async settled(ctx: SettleContext, status: "settled_external" | "settled_in_app", mode: "external" | "in_app"): Promise<SettleResult> {
     const { row, cid, actor } = ctx;
-    await this.transition(
-      row,
-      { status, settledAt: new Date(), lastError: null },
-      {
-        ...this.actorFields(actor),
-        action: "payout.settled",
-        subjectType: "payout",
-        subjectId: cid,
-        metadata: {
-          mode,
-          amountCC: row.amountCC,
-          reason: row.reason,
-          userId: row.userId,
-          transferCommandId: row.transferCommandId,
-          markPaidCommandId: row.markPaidCommandId,
-          walletCreateCommandId: row.walletCreateCommandId,
-          settleCommandId: row.settleCommandId,
-          attempts: row.attempts,
+    const won = await this.dataSource.transaction(async (manager) => {
+      const res = await manager
+        .getRepository(PayoutEntity)
+        .createQueryBuilder()
+        .update(PayoutEntity)
+        .set({ status, settledAt: new Date(), lastError: null })
+        .where("id = :id AND status IN (:...statuses)", { id: row.id, statuses: NON_TERMINAL })
+        .execute();
+      if (!res.affected) return false;
+      await this.audit.record(
+        {
+          ...this.actorFields(actor),
+          action: "payout.settled",
+          subjectType: "payout",
+          subjectId: cid,
+          metadata: {
+            mode,
+            amountCC: formatCC(row.amountCC),
+            reason: row.reason,
+            userId: row.userId,
+            transferCommandId: row.transferCommandId,
+            markPaidCommandId: row.markPaidCommandId,
+            walletCreateCommandId: row.walletCreateCommandId,
+            settleCommandId: row.settleCommandId,
+            attempts: row.attempts,
+          },
         },
-      },
-    );
-    await this.publish(
+        manager,
+      );
+      return true;
+    });
+    const fresh = await this.payouts.findOne({ where: { id: row.id } });
+    if (fresh) Object.assign(row, fresh);
+    if (!won) return { payout: row, mode: "already_settled", onLedger: false };
+    await this.nats.publishSafe(
       NatsSubjects.payoutSettled,
       { cid, userId: row.userId, payeeParty: row.payeeParty, mode, amountCC: formatCC(row.amountCC), reason: row.reason },
-      `payout.settled:${cid}`,
+      { msgId: `payout.settled:${cid}` },
     );
     this.logger.log(
       `payout ${cid}: settled ${formatCC(row.amountCC)} CC to ${row.payeeParty} (${row.reason}) ${mode}${actor.type === "system" ? "" : ` by ${actor.type}`}`,
@@ -641,15 +760,6 @@ export class PayoutService {
 
   private actorFields(actor: PayoutActor): Pick<AuditInput, "actorType" | "actorUserId" | "actorSessionId" | "ip"> {
     return { actorType: actor.type, actorUserId: actor.userId ?? null, actorSessionId: actor.sessionId ?? null, ip: actor.ip ?? null };
-  }
-
-  /** Best effort: the row is already committed; a bus outage must not fail a settlement that happened. */
-  private async publish(subject: NatsSubject, payload: object, msgId: string): Promise<void> {
-    try {
-      await this.nats.publish(subject, payload, { msgId });
-    } catch (err) {
-      this.logger.warn(`nats publish ${subject} failed: ${(err as Error).message}`);
-    }
   }
 
   // ───────────────────────────────────────────── processor entry points ──────────────────────
@@ -673,6 +783,12 @@ export class PayoutService {
     for (const p of live) {
       const row = byCid.get(p.contractId);
       if (!row || RETRIABLE.has(row.status)) todo.push(p.contractId);
+      // A live PendingPayout whose row says "settled" must never exist silently: the user sees
+      // "Settled", nothing was credited, and CancelPayout could still refund it (double pay).
+      if (row && TERMINAL.has(row.status) && row.status !== "archived") {
+        this.logger.error(`scan: ${p.contractId} is ${row.status} in to_payouts but still active on the ledger`);
+        this.sentry.captureMessage("settled payout still active on the ledger", "error", { processor: "payout-settlement", cid: p.contractId, status: row.status });
+      }
     }
     for (const r of rows) {
       if (!liveSet.has(r.pendingPayoutCid) && !TERMINAL.has(r.status)) todo.push(r.pendingPayoutCid);
@@ -732,10 +848,6 @@ export class PayoutService {
       order: { firstSeenAt: "DESC" },
       take: 500,
     });
-  }
-
-  async findByCid(cid: string): Promise<PayoutEntity | null> {
-    return this.payouts.findOne({ where: { pendingPayoutCid: cid } });
   }
 
   /**

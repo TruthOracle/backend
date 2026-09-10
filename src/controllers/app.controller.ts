@@ -1,4 +1,4 @@
-import { Controller, Get, HttpCode, Res } from "@nestjs/common";
+import { Controller, Get, Res } from "@nestjs/common";
 import { ApiOkResponse, ApiServiceUnavailableResponse, ApiTags } from "@nestjs/swagger";
 import type { Response } from "express";
 
@@ -20,9 +20,8 @@ export class AppController {
   }
 
   @Get("ready")
-  @HttpCode(200)
   @ApiOkResponse({ description: "Postgres, Redis and NATS are all reachable." })
-  @ApiServiceUnavailableResponse({ description: "At least one dependency is unreachable." })
+  @ApiServiceUnavailableResponse({ description: "At least one dependency is unreachable, or the process is draining for shutdown." })
   async ready(@Res({ passthrough: true }) res: Response): Promise<ReadinessResponse> {
     const readiness = await this.appService.readiness();
     if (readiness.status !== "ok") res.status(503);

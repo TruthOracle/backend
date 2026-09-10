@@ -17,3 +17,7 @@ export class PageQueryDto {
 }
 
 export const DEFAULT_PAGE_LIMIT = 25;
+
+/** Telegram's widget posts `id` / `auth_date` as JSON numbers; the verifier wants strings. */
+export const numberToString = ({ value }: { value: unknown }): unknown =>
+  typeof value === "number" && Number.isFinite(value) ? String(value) : value;

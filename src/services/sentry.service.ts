@@ -26,8 +26,4 @@ export class SentryService {
     Sentry.captureMessage(message, { level, ...(tags ? { tags } : {}) });
   }
 
-  async flush(timeoutMs = 2_000): Promise<void> {
-    if (!this.enabled) return;
-    await Sentry.flush(timeoutMs);
-  }
 }

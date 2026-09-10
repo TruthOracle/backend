@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res } from "@nestjs/common";
-import { ApiTags } from "@nestjs/swagger";
+import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 import type { Response } from "express";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
@@ -9,12 +9,10 @@ import { ReattachIdentityDto, UpdateMeDto } from "../dto/me.dto";
 import type { AuthIdentityEntity } from "../entities/auth-identity.entity";
 import type { SessionEntity } from "../entities/session.entity";
 import type { UserEntity } from "../entities/user.entity";
-import type { WalletEntity } from "../entities/wallet.entity";
 import { AuditService } from "../services/audit.service";
 import { GoogleAuthService } from "../services/google-auth.service";
 import { IdentityService } from "../services/identity.service";
 import { KycService } from "../services/kyc.service";
-import { LedgerClientService } from "../services/ledger-client.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { SessionService } from "../services/session.service";
 import { TelegramAuthService } from "../services/telegram-auth.service";
@@ -29,10 +27,8 @@ import type {
   ApiPage,
   ApiSession,
   ApiUser,
-  ApiWallet,
   IdentityClaim,
   IdentityProvider,
-  LedgerWallet,
 } from "../types";
 import { partyHint } from "../util/canton-crypto";
 import { ApiError } from "../util/errors";
@@ -43,6 +39,8 @@ import { ApiError } from "../util/errors";
  * them and shapes the wire objects.
  */
 @ApiTags("me")
+@ApiCookieAuth("to_session")
+@ApiBearerAuth()
 @Controller("me")
 export class MeController {
   constructor(
@@ -53,7 +51,6 @@ export class MeController {
     private readonly kyc: KycService,
     private readonly sessions: SessionService,
     private readonly audit: AuditService,
-    private readonly ledger: LedgerClientService,
     private readonly googleAuth: GoogleAuthService,
     private readonly telegram: TelegramAuthService,
     private readonly challenges: WalletChallengeService,
@@ -71,7 +68,7 @@ export class MeController {
       this.kyc.lockedIdentityId(user.id),
       this.kyc.withdrawalGate(user.id),
     ]);
-    const ownLedger = await this.ownLedgerWallets(walletRows, user.partyId);
+    const ownLedger = await this.walletLinks.ownLedgerWallets(walletRows, user.partyId);
     // API.md: `/me.kyc` is the summary; the attempt history is `GET /kyc`.
     const { history: _history, ...kyc } = summary;
     return {
@@ -227,20 +224,6 @@ export class MeController {
     };
   }
 
-  /** §8.1: a NON-primary party's own on-ledger UserWallet; one ledger read serves every row. */
-  private async ownLedgerWallets(wallets: WalletEntity[], primaryPartyId: string | null): Promise<Map<string, LedgerWallet | null>> {
-    const out = new Map<string, LedgerWallet | null>();
-    if (wallets.length === 0) return out;
-    let byOwner = new Map<string, LedgerWallet>();
-    try {
-      byOwner = new Map((await this.ledger.fetchAllUserWallets()).map((w) => [w.owner, w]));
-    } catch {
-      // A degraded ledger read must not hide the account view; ownLedgerWallet is then null.
-    }
-    for (const w of wallets) out.set(w.id, w.partyId === primaryPartyId ? null : (byOwner.get(w.partyId) ?? null));
-    return out;
-  }
-
   private async proofFor(identity: AuthIdentityEntity, body: ReattachIdentityDto, session: SessionEntity): Promise<IdentityClaim> {
     switch (identity.provider) {
       case "google": {
@@ -275,5 +258,3 @@ export class MeController {
     }
   }
 }
-
-export type { ApiWallet };

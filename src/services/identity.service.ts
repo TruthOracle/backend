@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { ModuleRef } from "@nestjs/core";
 import { InjectRepository } from "@nestjs/typeorm";
 import { DataSource, type EntityManager, Repository } from "typeorm";
@@ -43,8 +43,6 @@ export interface LoginResolution {
  */
 @Injectable()
 export class IdentityService {
-  private readonly logger = new Logger(IdentityService.name);
-
   constructor(
     private readonly dataSource: DataSource,
     @InjectRepository(AuthIdentityEntity) private readonly identities: Repository<AuthIdentityEntity>,
@@ -85,7 +83,9 @@ export class IdentityService {
   /**
    * §6.1–6.4:
    *  known active identity      → its user (login) / the same user (link, idempotent) / 409 for another user
-   *  known unlinked identity    → 403 identity_unlinked, except a link-mode action by the ORIGINAL user re-attaches
+   *  known unlinked identity    → 403 identity_unlinked on sign-in; a link-mode action by the ORIGINAL user
+   *                               re-attaches; a link-mode action by ANOTHER account is 409
+   *                               identity_already_linked (§6.2 "applies to unlinked rows too")
    *  unknown identity, no session → new user + identity
    *  unknown identity, session  → attached to the current user (link)
    */
@@ -109,8 +109,10 @@ export class IdentityService {
             const user = await this.requireActiveUser(manager, existing.userId);
             return { user, identity, mode: "link", created: false };
           }
-          // Deliberately NOT written through `manager`: the 403 below rolls this transaction back,
-          // and §6.4 requires the refusal itself to be audited — so the row commits on its own.
+          // Deliberately NOT written through `manager`: the refusal below rolls this transaction
+          // back, and §6.4 requires the refusal itself to be audited — so the row commits on its
+          // own. The owner's user id is NOT in the metadata: the actor is the refused requester,
+          // who reads this row through GET /me/audit; operators resolve the owner via subjectId.
           await this.audit.record({
             actorType: "user",
             actorUserId: ctx.currentUser?.id ?? null,
@@ -118,9 +120,13 @@ export class IdentityService {
             action: "identity.unlinked_signin_refused",
             subjectType: "identity",
             subjectId: existing.id,
-            metadata: { provider: existing.provider, userId: existing.userId, linkMode: Boolean(ctx.currentUser) },
+            metadata: { provider: existing.provider, linkMode: Boolean(ctx.currentUser) },
             ip: ctx.ip ?? null,
           });
+          if (ctx.currentUser) {
+            // Link mode by another account: the identity is bound to its first account (§6.2).
+            throw new ApiError(409, "identity_already_linked", "this sign-in method is linked to another account");
+          }
           throw new ApiError(403, "identity_unlinked", "this sign-in method was unlinked from its account; the original account owner or an operator can re-attach it");
         }
 
@@ -193,7 +199,7 @@ export class IdentityService {
         manager,
       );
       // Published after the row exists; a NATS failure must not roll back the account.
-      void this.publish(created ? NatsSubjects.userCreated : NatsSubjects.identityLinked, {
+      void this.nats.publishSafe(created ? NatsSubjects.userCreated : NatsSubjects.identityLinked, {
         userId: user.id,
         identityId: identity.id,
         provider: claim.provider,
@@ -203,13 +209,15 @@ export class IdentityService {
   }
 
   /**
-   * Unlink = revoke (§6.3–6.5, §8.2). Refused — in this order — for the wallet identity that owns
-   * the in-app balance (`primary_wallet_in_use`, every actor), for the identity locked by a
-   * standing KYC approval (`identity_locked_by_kyc`, admins excepted) and for the last active
-   * identity (`last_identity`). A `canton_wallet` identity's wallet row is revoked in the same transaction so
-   * `DELETE /me/identities/:id` and `DELETE /wallets/:id` behave identically.
+   * Unlink = revoke (§6.3–6.5, §8.2). Refused — in this order — for the identity locked by a
+   * standing KYC approval (`identity_locked_by_kyc`, admins excepted), for the wallet identity
+   * that owns the in-app balance (`primary_wallet_in_use`, every actor) and for the last active
+   * identity (`last_identity`). A `canton_wallet` identity's wallet row is revoked in the same
+   * transaction, with its own `wallet.unlinked` audit row and event, so `DELETE /me/identities/:id`
+   * and `DELETE /wallets/:id` leave an identical trail.
    */
   async unlink(userId: string, identityId: string, actor: Actor): Promise<void> {
+    let revokedWalletId: string | null = null;
     await this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(AuthIdentityEntity);
       const identity = await repo.findOne({ where: { id: identityId, userId } });
@@ -237,9 +245,25 @@ export class IdentityService {
       if (others <= 1) throw new ApiError(409, "last_identity", "an account must keep at least one sign-in method");
 
       if (identity.provider === "canton_wallet") {
-        await manager
-          .getRepository(WalletEntity)
-          .update({ userId, partyId: identity.subject, status: "active" }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
+        const wallets = manager.getRepository(WalletEntity);
+        const walletRow = await wallets.findOne({ where: { userId, partyId: identity.subject, status: "active" } });
+        if (walletRow) {
+          await wallets.update({ id: walletRow.id }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
+          revokedWalletId = walletRow.id;
+          await this.audit.record(
+            {
+              actorType: actor.type,
+              actorUserId: actor.userId ?? null,
+              actorSessionId: actor.sessionId ?? null,
+              action: "wallet.unlinked",
+              subjectType: "wallet",
+              subjectId: walletRow.id,
+              metadata: { userId, partyId: walletRow.partyId, identityId: identity.id },
+              ip: actor.ip ?? null,
+            },
+            manager,
+          );
+        }
       }
 
       identity.status = "unlinked";
@@ -261,7 +285,8 @@ export class IdentityService {
     });
     // Sessions that were authenticated by this identity die with it.
     await this.sessions.revokeByIdentity(identityId);
-    void this.publish(NatsSubjects.identityUnlinked, { userId, identityId });
+    void this.nats.publishSafe(NatsSubjects.identityUnlinked, { userId, identityId });
+    if (revokedWalletId) void this.nats.publishSafe(NatsSubjects.walletUnlinked, { userId, walletId: revokedWalletId, identityId });
   }
 
   /**
@@ -331,7 +356,7 @@ export class IdentityService {
       },
       manager,
     );
-    void this.publish(NatsSubjects.identityReattached, { userId: identity.userId, identityId: identity.id });
+    void this.nats.publishSafe(NatsSubjects.identityReattached, { userId: identity.userId, identityId: identity.id });
     return identity;
   }
 
@@ -340,14 +365,6 @@ export class IdentityService {
     if (!user) throw new ApiError(404, "not_found", "user not found");
     if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
     return user;
-  }
-
-  private async publish(subject: `truthoracle.${string}`, payload: object): Promise<void> {
-    try {
-      await this.nats.publish(subject, payload);
-    } catch (err) {
-      this.logger.warn(`publish ${subject} failed: ${(err as Error).message}`);
-    }
   }
 }
 

@@ -132,6 +132,18 @@ export interface TransferStatusResult {
   status: string | null;
 }
 
+/**
+ * `GET /api/v1/command/{partyId}/{commandId}` (CommandStatusResponse) — the status of an
+ * `external/submit` command. `known: false` covers BOTH a failed read and a 404: the wallet's
+ * command index "is not always wired through to the participant" (enterprise-wallet README), so
+ * an unknown id is no evidence that the command never happened. Only an explicit terminal
+ * failure status yields `known: true, submitted: false`.
+ */
+export type CommandStatusResult = TransferStatusResult;
+
+/** Statuses the wallet reports for a command the ledger rejected or that never ran. */
+const COMMAND_FAILED = new Set(["failed", "rejected", "error", "cancelled", "canceled", "aborted", "timeout", "timed_out"]);
+
 @Injectable()
 export class EnterpriseWalletService {
   private readonly logger = new Logger(EnterpriseWalletService.name);
@@ -236,9 +248,25 @@ export class EnterpriseWalletService {
     }
   }
 
-  async transferAlreadySubmitted(partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean }> {
-    const { known, submitted } = await this.transferStatus(partyId, commandId);
-    return { known, submitted };
+  /**
+   * Status of an `external/submit` command (Create / Exercise ids such as `deposit-…`,
+   * `wallet-create-…`, `settle-…`, `markpaid-…`). NOT the transfer endpoint: those ids are not
+   * transfers and `/api/v1/transfer/{party}/{commandId}` answers 404 for them, which the deposit
+   * confirm pass used to read as "never submitted".
+   */
+  async commandStatus(partyId: string, commandId: string): Promise<CommandStatusResult> {
+    try {
+      const row = await this.wallet<unknown>(`/api/v1/command/${encodeURIComponent(partyId)}/${encodeURIComponent(commandId)}`);
+      if (!row || typeof row !== "object") return { known: false, submitted: false, status: null };
+      const r = row as { status?: unknown; state?: unknown };
+      const status = asString(r.status ?? r.state).trim().toLowerCase();
+      if (!status) return { known: false, submitted: false, status: null };
+      return { known: true, submitted: !COMMAND_FAILED.has(status), status };
+    } catch (e) {
+      if (e instanceof UpstreamError && e.status === 404) return { known: false, submitted: false, status: "not_found" };
+      this.logger.warn(`command status check failed for ${commandId}: ${(e as Error).message}`);
+      return { known: false, submitted: false, status: null };
+    }
   }
 
   /** Treasury-signed Daml commands. Callers must have built `commands` server-side. */

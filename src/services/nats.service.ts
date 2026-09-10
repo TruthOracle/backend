@@ -1,4 +1,4 @@
-import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { Injectable, Logger, type BeforeApplicationShutdown, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import {
   AckPolicy,
   DeliverPolicy,
@@ -33,15 +33,37 @@ export type ConsumeHandler = (msg: ConsumedMessage) => Promise<void>;
 const ACK_WAIT_MS = 30_000;
 const MAX_DELIVER = 20;
 const NAK_DELAY_MS = 5_000;
+/** A consumer loop that ended (consumer deleted, stream recreated, heartbeat failure) is restarted with this backoff. */
+const CONSUMER_RESTART_MIN_MS = 1_000;
+const CONSUMER_RESTART_MAX_MS = 60_000;
 
+interface ConsumerLoop {
+  filterSubject: string;
+  handler: ConsumeHandler;
+  messages: ConsumerMessages | null;
+  done: Promise<void> | null;
+  restarts: number;
+  timer: NodeJS.Timeout | null;
+}
+
+/**
+ * Lifecycle order (Nest 12: destroy hooks → beforeApplicationShutdown → dispose (HTTP closed) →
+ * onApplicationShutdown): consumers stop taking messages in `beforeApplicationShutdown` while
+ * Postgres and Redis are still up for the handler in flight, and the connection is drained in
+ * `onApplicationShutdown` — after the HTTP server closed, so requests that publish during a
+ * deploy still find a live bus.
+ */
 @Injectable()
-export class NatsService implements OnModuleInit, OnModuleDestroy {
+export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger(NatsService.name);
   readonly streamName: string;
   private nc?: NatsConnection;
   private jsm?: JetStreamManager;
   private js?: JetStreamClient;
-  private readonly loops = new Map<string, { messages: ConsumerMessages; done: Promise<void> }>();
+  private readonly loops = new Map<string, ConsumerLoop>();
+  /** False while the client is disconnected / reconnecting: `/health/ready` reports `nats: fail`. */
+  private healthy = false;
+  private stopping = false;
 
   constructor(private readonly config: Config) {
     this.streamName = `TRUTHORACLE_${config.appNetwork.toUpperCase()}`;
@@ -54,10 +76,13 @@ export class NatsService implements OnModuleInit, OnModuleDestroy {
       maxReconnectAttempts: -1,
       reconnectTimeWait: 2_000,
     });
+    this.healthy = true;
     this.logger.log(`connected to ${this.nc.getServer()} (nats-server v${this.nc.info?.version ?? "?"})`);
     void this.nc.closed().then((err) => {
+      this.healthy = false;
       if (err) this.logger.error(`connection closed: ${err.message}`);
     });
+    void this.watchStatus(this.nc);
 
     this.jsm = await jetstreamManager(this.nc);
     this.js = this.jsm.jetstream();
@@ -67,27 +92,57 @@ export class NatsService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  async onModuleDestroy(): Promise<void> {
+  /** Stop taking messages while the datastores the handlers need are still up. */
+  async beforeApplicationShutdown(): Promise<void> {
+    this.stopping = true;
     for (const [durable, loop] of this.loops) {
+      if (loop.timer) clearTimeout(loop.timer);
       try {
-        loop.messages.stop();
+        loop.messages?.stop();
         await loop.done;
       } catch (err) {
         this.logger.warn(`consumer ${durable} did not stop cleanly: ${(err as Error).message}`);
       }
     }
     this.loops.clear();
+  }
+
+  async onApplicationShutdown(): Promise<void> {
     if (!this.nc) return;
     try {
       await this.nc.drain();
     } catch {
       await this.nc.close();
     }
+    this.healthy = false;
     this.logger.log("connection drained and closed");
   }
 
+  /** Connected AND not currently reconnecting — `maxReconnectAttempts: -1` means the client is never "closed" during an outage. */
   isConnected(): boolean {
-    return this.nc !== undefined && !this.nc.isClosed();
+    return this.nc !== undefined && !this.nc.isClosed() && this.healthy;
+  }
+
+  private async watchStatus(nc: NatsConnection): Promise<void> {
+    try {
+      for await (const s of nc.status()) {
+        switch (s.type) {
+          case "disconnect":
+          case "reconnecting":
+            if (this.healthy) this.logger.warn(`nats ${s.type}`);
+            this.healthy = false;
+            break;
+          case "reconnect":
+            this.healthy = true;
+            this.logger.log("nats reconnected");
+            break;
+          default:
+            break;
+        }
+      }
+    } catch {
+      // the status iterator ends with the connection
+    }
   }
 
   get jetstream(): JetStreamClient {
@@ -106,30 +161,64 @@ export class NatsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Best-effort publish for events that describe a change which is ALREADY committed: a bus
+   * outage must not fail the request that made the change, so the error is logged and swallowed.
+   */
+  async publishSafe(subject: NatsSubject, payload: object, opts?: { msgId?: string }): Promise<void> {
+    try {
+      await this.publish(subject, payload, opts);
+    } catch (err) {
+      this.logger.warn(`publish ${subject} failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
    * Start a background loop on a durable, explicit-ack pull consumer filtered to `filterSubject`.
    * Idempotent per durable name. A handler that throws NAKs the message with a delay; after
-   * MAX_DELIVER attempts JetStream stops redelivering it.
+   * MAX_DELIVER attempts JetStream stops redelivering it. A loop that ends for any reason other
+   * than shutdown (consumer deleted, stream recreated — RUNBOOK §4 —, heartbeat failure) is
+   * restarted with exponential backoff instead of staying silently dead until a redeploy.
    */
   async consume(durable: string, filterSubject: string, handler: ConsumeHandler): Promise<void> {
     const name = sanitizeDurable(durable);
     if (this.loops.has(name)) return;
+    const loop: ConsumerLoop = { filterSubject, handler, messages: null, done: null, restarts: 0, timer: null };
+    this.loops.set(name, loop);
+    await this.startLoop(name, loop);
+    this.logger.log(`consumer ${name} on ${filterSubject} started`);
+  }
 
-    await this.ensureConsumer(name, filterSubject);
+  private async startLoop(name: string, loop: ConsumerLoop): Promise<void> {
+    await this.ensureConsumer(name, loop.filterSubject);
     const consumer = await this.jetstream.consumers.get(this.streamName, name);
     const messages = await consumer.consume({ max_messages: 10 });
-
-    const done = (async () => {
+    loop.messages = messages;
+    loop.done = (async () => {
       try {
         for await (const m of messages) {
-          await this.dispatch(name, m, handler);
+          loop.restarts = 0;
+          await this.dispatch(name, m, loop.handler);
         }
       } catch (err) {
-        if (this.isConnected()) this.logger.error(`consumer ${name} loop ended: ${(err as Error).message}`);
+        if (!this.stopping) this.logger.error(`consumer ${name} loop ended: ${(err as Error).message}`);
       }
+      if (!this.stopping) this.scheduleRestart(name, loop);
     })();
+  }
 
-    this.loops.set(name, { messages, done });
-    this.logger.log(`consumer ${name} on ${filterSubject} started`);
+  private scheduleRestart(name: string, loop: ConsumerLoop): void {
+    const delay = Math.min(CONSUMER_RESTART_MAX_MS, CONSUMER_RESTART_MIN_MS * 2 ** Math.min(loop.restarts, 10));
+    loop.restarts += 1;
+    this.logger.warn(`consumer ${name}: restarting in ${delay} ms (restart #${loop.restarts})`);
+    loop.timer = setTimeout(() => {
+      loop.timer = null;
+      if (this.stopping || !this.loops.has(name)) return;
+      this.startLoop(name, loop).catch((err: unknown) => {
+        this.logger.error(`consumer ${name}: restart failed: ${(err as Error).message}`);
+        this.scheduleRestart(name, loop);
+      });
+    }, delay);
+    loop.timer.unref();
   }
 
   private async dispatch(name: string, m: JsMsg, handler: ConsumeHandler): Promise<void> {

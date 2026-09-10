@@ -1,7 +1,8 @@
 import { Injectable } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { type EntityManager, Repository } from "typeorm";
+import { DataSource, type EntityManager, Repository } from "typeorm";
 
+import { REASON_MAX_LENGTH } from "../dto/admin.dto";
 import { UserEntity } from "../entities/user.entity";
 import type { Actor, ApiUser } from "../types";
 import { ApiError } from "../util/errors";
@@ -15,6 +16,7 @@ const USER_CACHE_MS = 30_000;
 @Injectable()
 export class UserService {
   constructor(
+    private readonly dataSource: DataSource,
     @InjectRepository(UserEntity) private readonly users: Repository<UserEntity>,
     private readonly redis: RedisService,
     private readonly audit: AuditService,
@@ -77,41 +79,68 @@ export class UserService {
     await this.invalidate(userId);
   }
 
-  /** Suspension revokes every live session immediately (§6.6). */
+  /**
+   * Suspension revokes every live session immediately (§6.6). The status change and its audit
+   * row commit together; the session revocation follows (its own audit trail) and fails loud when
+   * the cache cannot be evicted, so an operator never sees "ok" for a suspension that left a
+   * session alive.
+   */
   async suspend(userId: string, reason: string, actor: Actor): Promise<void> {
     const user = await this.findById(userId);
     if (!user) throw new ApiError(404, "not_found", "user not found");
     if (user.status === "closed") throw new ApiError(409, "user_suspended", "user is closed");
-    await this.users.update({ id: userId }, { status: "suspended" });
+    await this.dataSource.transaction(async (manager) => {
+      await manager.getRepository(UserEntity).update({ id: userId }, { status: "suspended" });
+      await this.audit.record(
+        {
+          actorType: actor.type,
+          actorUserId: actor.userId ?? null,
+          actorSessionId: actor.sessionId ?? null,
+          action: "user.suspended",
+          subjectType: "user",
+          subjectId: userId,
+          metadata: { reason: clip(reason, REASON_MAX_LENGTH) },
+          ip: actor.ip ?? null,
+        },
+        manager,
+      );
+    });
     await this.invalidate(userId);
     const revoked = await this.sessions.revokeAllForUser(userId);
-    await this.audit.record({
-      actorType: actor.type,
-      actorUserId: actor.userId ?? null,
-      actorSessionId: actor.sessionId ?? null,
-      action: "user.suspended",
-      subjectType: "user",
-      subjectId: userId,
-      metadata: { reason: clip(reason, 500), sessionsRevoked: revoked },
-      ip: actor.ip ?? null,
-    });
+    if (revoked > 0) {
+      await this.audit.record({
+        actorType: actor.type,
+        actorUserId: actor.userId ?? null,
+        actorSessionId: actor.sessionId ?? null,
+        action: "session.revoked_all",
+        subjectType: "user",
+        subjectId: userId,
+        metadata: { reason: "user.suspended", revoked },
+        ip: actor.ip ?? null,
+      });
+    }
   }
 
   async reinstate(userId: string, reason: string, actor: Actor): Promise<void> {
     const user = await this.findById(userId);
     if (!user) throw new ApiError(404, "not_found", "user not found");
-    await this.users.update({ id: userId }, { status: "active" });
-    await this.invalidate(userId);
-    await this.audit.record({
-      actorType: actor.type,
-      actorUserId: actor.userId ?? null,
-      actorSessionId: actor.sessionId ?? null,
-      action: "user.reinstated",
-      subjectType: "user",
-      subjectId: userId,
-      metadata: { reason: clip(reason, 500) },
-      ip: actor.ip ?? null,
+    await this.dataSource.transaction(async (manager) => {
+      await manager.getRepository(UserEntity).update({ id: userId }, { status: "active" });
+      await this.audit.record(
+        {
+          actorType: actor.type,
+          actorUserId: actor.userId ?? null,
+          actorSessionId: actor.sessionId ?? null,
+          action: "user.reinstated",
+          subjectType: "user",
+          subjectId: userId,
+          metadata: { reason: clip(reason, REASON_MAX_LENGTH) },
+          ip: actor.ip ?? null,
+        },
+        manager,
+      );
     });
+    await this.invalidate(userId);
   }
 
   toApi(user: UserEntity): ApiUser {

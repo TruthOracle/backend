@@ -1,5 +1,5 @@
 import { Controller, Get, HttpCode, Post, Req } from "@nestjs/common";
-import { ApiTags } from "@nestjs/swagger";
+import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
 import { type KycSessionStart, KycService } from "../services/kyc.service";
@@ -12,6 +12,8 @@ import type { ApiKycSummary, ApiKycVerification } from "../types";
  * the KYC lock (§6.5) then protects while the approval stands.
  */
 @ApiTags("kyc")
+@ApiCookieAuth("to_session")
+@ApiBearerAuth()
 @Controller("kyc")
 export class KycController {
   constructor(

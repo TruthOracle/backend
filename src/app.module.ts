@@ -10,7 +10,7 @@ import { SessionGuard } from "./auth/session.guard";
 import { Config } from "./config";
 import * as controllers from "./controllers";
 import { KycMockController } from "./controllers/kyc-mock.controller";
-import { buildDataSourceOptions } from "./data-source";
+import { buildDataSourceOptions, resolveDbSslCa } from "./data-source";
 import { postgresEntities } from "./entities";
 import * as processors from "./processors";
 import * as services from "./services";
@@ -69,8 +69,10 @@ export class AppModule {
         ScheduleModule.forRoot(),
         TypeOrmModule.forRootAsync({
           useFactory: () => ({
-            ...buildDataSourceOptions(config),
-            migrationsRun: config.dbMigrateOnBoot,
+            ...buildDataSourceOptions({ ...config, dbSslCa: resolveDbSslCa(config.dbSslCa) }),
+            // Migrations run in AppService.onModuleInit under a Postgres advisory lock (several
+            // replicas booting together must not all run them), never inside initialize().
+            migrationsRun: false,
             retryAttempts: 3,
             retryDelay: 2_000,
           }),

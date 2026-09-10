@@ -1,4 +1,4 @@
-import { absCC, addCC, cmpCC, DUST, formatCC, isDust, moneyTransformer, parseCC, round10FromNumber, subCC, sumCC, tryParseCC } from "./money";
+import { absCC, addCC, cmpCC, DUST, formatCC, isDust, moneyTransformer, parseCC, subCC, sumCC, tryParseCC } from "./money";
 
 describe("util/money", () => {
   it("parses plain decimals into 1e-10 units", () => {
@@ -16,7 +16,7 @@ describe("util/money", () => {
     expect(parseCC(0.1 + 0.2)).toBe(3_000_000_000n);
     expect(parseCC(1e-7)).toBe(1_000n);
     expect(parseCC(12.5)).toBe(125_000_000_000n);
-    expect(round10FromNumber(2.0000000001)).toBe(20_000_000_001n);
+    expect(parseCC(2.0000000001)).toBe(20_000_000_001n);
   });
 
   it("rounds digits beyond 10 decimals half away from zero", () => {

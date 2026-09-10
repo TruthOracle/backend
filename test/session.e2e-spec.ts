@@ -4,6 +4,8 @@
  * A 200 from a session-only route after a guard is the proof the guard passed; the routes used
  * as probes (`GET /me`, `POST /me/sessions/revoke-others`, `GET /admin/users`) are idempotent.
  */
+import { createHash, createHmac } from "node:crypto";
+
 import { AuditEventEntity } from "../src/entities/audit-event.entity";
 import { AuthIdentityEntity } from "../src/entities/auth-identity.entity";
 import { SessionEntity } from "../src/entities/session.entity";
@@ -57,8 +59,11 @@ describe("foundation (e2e)", () => {
       expect(token.length).toBeGreaterThanOrEqual(43);
 
       const row = await ctx.dataSource.getRepository(SessionEntity).findOneByOrFail({ id: session.id });
-      expect(row.tokenHash).toBe(SessionService.hashToken(token));
+      expect(row.tokenHash).toBe(sessions.hashToken(token));
       expect(row.tokenHash).not.toContain(token);
+      // HMAC keyed by SESSION_SECRET: a leaked to_sessions dump is useless without the key, and a plain sha256 does not match.
+      expect(row.tokenHash).toBe(createHmac("sha256", ctx.config.sessionSecret).update(token, "utf8").digest("base64url"));
+      expect(row.tokenHash).not.toBe(createHash("sha256").update(token, "utf8").digest("base64url"));
       expect(row.kind).toBe("user");
       expect(row.expiresAt.getTime() - row.createdAt.getTime()).toBeCloseTo(ctx.config.sessionTtlMs, -4);
 
@@ -91,16 +96,37 @@ describe("foundation (e2e)", () => {
 
       await sessions.revoke(c.session.id, { type: "user", userId: a.user.id });
       expect(await sessions.verify(c.token)).toBeNull();
-      expect(await ctx.redis.getJson(`sess:${SessionService.hashToken(c.token)}`)).toBeNull();
+      expect(await ctx.redis.getJson(`sess:${sessions.hashToken(c.token)}`)).toBeNull();
 
       expect(await sessions.revokeAllForUser(a.user.id, a.session.id)).toBe(1);
       expect(await sessions.verify(b.token)).toBeNull();
       expect(await sessions.verify(a.token)).not.toBeNull();
-      expect(await ctx.redis.smembers(`user_sessions:${a.user.id}`)).toEqual([SessionService.hashToken(a.token)]);
+      expect(await ctx.redis.smembers(`user_sessions:${a.user.id}`)).toEqual([sessions.hashToken(a.token)]);
 
       const audits = await ctx.dataSource.getRepository(AuditEventEntity).find({ where: { action: "session.revoked" } });
       expect(audits).toHaveLength(1);
       expect(audits[0].subjectId).toBe(c.session.id);
+    });
+
+    it("revocation fails LOUD when the cache eviction fails, and the cached session dies at the next re-check anyway", async () => {
+      const w = makeTestWallet("evict");
+      const { token, session } = await issueSessionDirect(ctx, w);
+      const sessions = ctx.get(SessionService);
+      expect(await sessions.verify(token)).not.toBeNull();
+
+      const del = jest.spyOn(ctx.redis, "del").mockRejectedValueOnce(new Error("redis: connection lost"));
+      try {
+        await expectApiError(sessions.revoke(session.id, { type: "user", userId: session.userId }), 502, "upstream_failed");
+      } finally {
+        del.mockRestore();
+      }
+      // Postgres already says revoked; the stale cache entry is caught by the periodic re-check.
+      expect((await ctx.dataSource.getRepository(SessionEntity).findOneByOrFail({ id: session.id })).revokedAt).not.toBeNull();
+      await ctx.redis.del(`sess_recheck:${session.id}`);
+      expect(await sessions.verify(token)).toBeNull();
+      expect(await ctx.redis.getJson(`sess:${sessions.hashToken(token)}`)).toBeNull();
+      // The retry the 502 asked for is idempotent and succeeds.
+      await expect(sessions.revoke(session.id, { type: "user", userId: session.userId })).resolves.toBeUndefined();
     });
 
     it("expired sessions verify as null even when cached", async () => {
@@ -164,10 +190,16 @@ describe("foundation (e2e)", () => {
       const refused = await ctx.dataSource.getRepository(AuditEventEntity).find({ where: { action: "identity.unlinked_signin_refused" } });
       expect(refused).toHaveLength(1);
 
-      // Another account cannot take it over either — the row persists forever.
+      // The refusal is audited without naming the owner: the refused requester reads this row through GET /me/audit (§9.3 / §11).
+      expect(refused[0].metadata).toEqual({ provider: "telegram", linkMode: false });
+
+      // Another account cannot take it over either — the row persists forever; in link mode the
+      // answer is §6.2's 409 identity_already_linked ("applies to unlinked rows too"), never a hint
+      // that the identity was unlinked elsewhere.
       const b = await identities().resolveForLogin({ provider: "google", subject: "g-other" }, { currentUser: null });
-      await expectApiError(identities().resolveForLogin({ provider: "telegram", subject: "777" }, { currentUser: b.user }), 403, "identity_unlinked");
+      await expectApiError(identities().resolveForLogin({ provider: "telegram", subject: "777" }, { currentUser: b.user }), 409, "identity_already_linked");
       await expectApiError(identities().reattach(b.user.id, tg.identity.id, { provider: "telegram", subject: "777" }, { type: "user", userId: b.user.id }), 404, "not_found");
+      expect(await ctx.dataSource.getRepository(AuditEventEntity).count({ where: { action: "identity.unlinked_signin_refused" } })).toBe(2);
 
       // The original owner re-attaches in link mode …
       const back = await identities().resolveForLogin({ provider: "telegram", subject: "777" }, { currentUser: a.user });
@@ -307,8 +339,15 @@ describe("foundation (e2e)", () => {
       );
     });
 
-    it("admin-sign-in requires an operator party and honours the pinned key", async () => {
-      await expectApiError(challenges().issue({ partyId: makeTestWallet("nobody").partyId, purpose: "admin-sign-in", host: "app.test" }), 403, "forbidden");
+    it("admin-sign-in requires an operator party (checked at verify time, never at issue time) and honours the pinned key", async () => {
+      // Issuing never reveals operator membership (an anonymous 403-vs-200 oracle over ADMIN_OPERATORS): the refusal comes after the signature proved key control.
+      const nobody = makeTestWallet("nobody");
+      const cn = await challenges().issue({ partyId: nobody.partyId, purpose: "admin-sign-in", host: "app.test" });
+      await expectApiError(
+        challenges().verify({ challengeId: cn.challengeId, partyId: nobody.partyId, publicKey: nobody.publicKeyBase64, signature: nobody.sign(cn.message), expectedPurpose: "admin-sign-in" }),
+        403,
+        "forbidden",
+      );
 
       const c = await challenges().issue({ partyId: operator.partyId, purpose: "admin-sign-in", host: "app.test" });
       const ok = await challenges().verify({ challengeId: c.challengeId, partyId: operator.partyId, publicKey: operator.publicKeyBase64, signature: operator.sign(c.message), expectedPurpose: "admin-sign-in" });
@@ -321,6 +360,17 @@ describe("foundation (e2e)", () => {
         401,
         "wallet_key_mismatch",
       );
+    });
+
+    it("consumes a challenge atomically: two concurrent presentations of one signature yield exactly one session claim", async () => {
+      const w = makeTestWallet("race");
+      const c = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
+      const proof = { challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c.message), expectedPurpose: "sign-in" as const };
+      const results = await Promise.allSettled([challenges().verify(proof), challenges().verify(proof), challenges().verify(proof)]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      for (const r of results) {
+        if (r.status === "rejected") expect((r.reason as ApiError).code).toBe("challenge_rejected");
+      }
     });
 
     it("rejects malformed party ids at issue time", async () => {

@@ -29,9 +29,11 @@ export async function authedJson<T = unknown>(
   opts: UpstreamRequest,
 ): Promise<T> {
   const method = opts.method ?? "GET";
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30_000);
+  // One deadline for headers AND body: `AbortSignal.timeout` aborts a stalled body read too, so
+  // an upstream that answers 200 and then hangs cannot pin a handler (and its lock) forever.
+  const signal = AbortSignal.timeout(opts.timeoutMs ?? 30_000);
   let res: Response;
+  let text: string;
   try {
     res = await fetch(`${baseUrl}${path}`, {
       method,
@@ -41,19 +43,17 @@ export async function authedJson<T = unknown>(
         ...(opts.body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-      signal: controller.signal,
+      signal,
     });
+    text = await res.text();
   } catch (err) {
     throw new UpstreamError(
       `${method} ${path} failed: ${err instanceof Error ? err.message : String(err)}`,
       0,
       "",
     );
-  } finally {
-    clearTimeout(timer);
   }
 
-  const text = await res.text();
   if (!res.ok) {
     throw new UpstreamError(`${method} ${path} failed: HTTP ${res.status} ${text.slice(0, 600)}`, res.status, text.slice(0, 2000));
   }

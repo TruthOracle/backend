@@ -19,7 +19,9 @@ import { DepositCreditEntity } from "../src/entities/deposit-credit.entity";
 import { PayoutEntity } from "../src/entities/payout.entity";
 import { UserEntity } from "../src/entities/user.entity";
 import { WalletEntity } from "../src/entities/wallet.entity";
+import { DepositConfirmProcessor } from "../src/processors/deposit-confirm.processor";
 import { GoogleAuthService } from "../src/services/google-auth.service";
+import { walletCreateCommandIdFor } from "../src/services/ledger-client.service";
 import { UserService } from "../src/services/user.service";
 import type {
   ApiChallenge,
@@ -100,6 +102,51 @@ type LedgerCommand = {
 };
 
 // ─────────────────────────────────────────── spec ────────────────────────────────────────────────
+
+describe("Wallets + deposits (e2e, DAML_USER_WALLET_HAS_DEPOSIT_REFS=true — the deployed 2.0.0 Daml)", () => {
+  const refs = useTestApp({
+    env: { DAML_USER_WALLET_HAS_DEPOSIT_REFS: "true" },
+    configure: (b) => b.overrideProvider(GoogleAuthService).useValue(new FakeGoogleAuthService()),
+  });
+  const http = (): request.Agent => request(refs.app.getHttpServer() as Server);
+  const credits = (): ReturnType<typeof refs.dataSource.getRepository<DepositCreditEntity>> => refs.dataSource.getRepository(DepositCreditEntity);
+
+  it("Create carries depositRefs: [], Deposit carries the txRef, and confirmation keys on depositRefs — not on the amount", async () => {
+    const A = makeTestWallet("alice");
+    const { cookie } = await signInWithWallet(http(), A);
+    refs.wallet.seedInbound(A.partyId, "5");
+
+    const res = await http().post("/api/v1/in-app-wallet/deposits/reconcile").set(H).set("Cookie", cookie).send({});
+    expectStatus(res, 200);
+    const body = bodyOf<ReconcileResult>(res);
+    expect(body).toMatchObject({ credited: CC("5"), status: "confirmed" });
+    const [create] = refs.wallet.submits[0].commands as LedgerCommand[];
+    expect(create.CreateCommand?.createArguments).toMatchObject({ owner: A.partyId, depositedCC: CC("0"), depositRefs: [] });
+    const [deposit] = refs.wallet.submits[1].commands as LedgerCommand[];
+    const txRef = `reconcile:${body.commandId ?? ""}`;
+    expect(deposit.ExerciseCommand?.choiceArgument).toEqual({ amountCC: CC("5"), txRef });
+    expect(refs.ledger.wallets.get(A.partyId)?.depositRefs).toEqual([txRef]);
+
+    // A second credit: the ledger shows the RIGHT depositedCC but a FOREIGN ref → not confirmed;
+    // only the row's own txRef confirms it.
+    refs.wallet.seedInbound(A.partyId, "1");
+    refs.wallet.lagLedger = true;
+    const second = bodyOf<ReconcileResult>(expectStatus(await http().post("/api/v1/in-app-wallet/deposits/reconcile").set(H).set("Cookie", cookie).send({}), 200));
+    expect(second.status).toBe("submitted");
+    const row = await credits().findOneByOrFail({ commandId: second.commandId ?? "" });
+    const w = refs.ledger.wallets.get(A.partyId);
+    if (!w) throw new Error("wallet missing");
+    refs.ledger.wallets.set(A.partyId, { ...w, contractId: refs.ledger.nextCid("uw"), balanceCC: w.balanceCC + parseCC("1"), depositedCC: w.depositedCC + parseCC("1"), depositRefs: [...w.depositRefs, "reconcile:someone-else"] });
+    await expect(refs.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 0 });
+    expect((await credits().findOneByOrFail({ id: row.id })).status).toBe("submitted");
+    const w2 = refs.ledger.wallets.get(A.partyId);
+    if (!w2) throw new Error("wallet missing");
+    refs.ledger.wallets.set(A.partyId, { ...w2, depositRefs: [...w2.depositRefs, row.txRef] });
+    await expect(refs.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 1, failed: 0 });
+    expect((await credits().findOneByOrFail({ id: row.id })).status).toBe("confirmed");
+    refs.wallet.lagLedger = false;
+  });
+});
 
 describe("Wallets + deposits (e2e)", () => {
   const ctx = useTestApp({
@@ -532,17 +579,21 @@ describe("Wallets + deposits (e2e)", () => {
       });
       expect(res.perWallet).toHaveLength(2);
 
-      // The treasury-signed Create UserWallet reached the (fake) ledger; B's money is folded into A's wallet.
+      // The treasury first created A's EMPTY UserWallet under the one deterministic per-owner id
+      // (shared with the in-app payout path, so two racing Creates collide on ledger dedup instead
+      // of minting two wallets), then credited it with an Exercise Deposit; B's money is folded in.
       const onLedger = ctx.ledger.wallets.get(A.partyId);
       expect(onLedger).toMatchObject({ owner: A.partyId, balanceCC: parseCC("12.5"), depositedCC: parseCC("12.5"), withdrawnCC: 0n });
       expect(ctx.ledger.wallets.has(B.partyId)).toBe(false);
-      expect(ctx.wallet.submits).toHaveLength(1);
-      expect(ctx.wallet.submits[0].commandId).toBe(res.commandId);
+      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(A.partyId), res.commandId]);
       const [create] = ctx.wallet.submits[0].commands as LedgerCommand[];
       expect(create.CreateCommand?.templateId).toMatch(/:UserWallet$/);
-      expect(create.CreateCommand?.createArguments).toMatchObject({ owner: A.partyId, balanceCC: CC("12.5"), depositedCC: CC("12.5"), withdrawnCC: CC("0") });
+      expect(create.CreateCommand?.createArguments).toEqual({ admin: ctx.config.treasuryPartyId, owner: A.partyId, balanceCC: CC("0"), depositedCC: CC("0"), withdrawnCC: CC("0") });
+      const [deposit] = ctx.wallet.submits[1].commands as LedgerCommand[];
+      expect(deposit.ExerciseCommand).toMatchObject({ choice: "Deposit", choiceArgument: { amountCC: CC("12.5"), txRef: `reconcile:${res.commandId ?? ""}` } });
 
-      // Write-ahead row: submitted → confirmed (§8.3 steps 6–8), both transitions audited.
+      // Write-ahead row: submitted → confirmed (§8.3 steps 7–9), both transitions audited; the row
+      // always records an Exercise against the wallet that existed before the submit.
       const rows = await credits().find();
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
@@ -552,10 +603,11 @@ describe("Wallets + deposits (e2e)", () => {
         txRef: `reconcile:${res.commandId ?? ""}`,
         amountCC: parseCC("12.5"),
         depositedCCBefore: 0n,
-        walletCidBefore: null,
+        walletCidBefore: deposit.ExerciseCommand?.contractId,
         status: "confirmed",
         error: null,
       });
+      expect(rows[0].submittedAt).toBeInstanceOf(Date);
       expect(rows[0].confirmedAt).not.toBeNull();
       expect(rows[0].attribution).toEqual(
         expect.arrayContaining([
@@ -585,7 +637,7 @@ describe("Wallets + deposits (e2e)", () => {
         perWallet: [],
         ledger: expect.objectContaining({ owner: A.partyId, depositedCC: CC("12.5") }) as unknown,
       });
-      expect(ctx.wallet.submits).toHaveLength(1);
+      expect(ctx.wallet.submits).toHaveLength(2);
       expect(await credits().count()).toBe(1);
 
       // A later deposit exercises Deposit on the existing UserWallet instead of creating another.
@@ -599,7 +651,8 @@ describe("Wallets + deposits (e2e)", () => {
       });
       expect(third.commandId).toMatch(COMMAND_ID_RE);
       expect(third.commandId).not.toBe(res.commandId);
-      const [exercise] = ctx.wallet.submits[1].commands as LedgerCommand[];
+      expect(ctx.wallet.submits).toHaveLength(3);
+      const [exercise] = ctx.wallet.submits[2].commands as LedgerCommand[];
       expect(exercise.ExerciseCommand).toMatchObject({
         contractId: onLedger?.contractId,
         choice: "Deposit",
@@ -675,7 +728,7 @@ describe("Wallets + deposits (e2e)", () => {
       const res = await reconcileOk(a.cookie);
       expect(res).toMatchObject({ credited: CC("0"), status: "nothing_outstanding", perWallet: [], ledger: { depositedCC: CC("12") } });
       // Nothing was re-credited on the ledger.
-      expect(ctx.wallet.submits).toHaveLength(1);
+      expect(ctx.wallet.submits).toHaveLength(2);
       expect(await credits().count()).toBe(1);
 
       const list = await listWallets(a.cookie);
@@ -704,7 +757,7 @@ describe("Wallets + deposits (e2e)", () => {
 
       const res = await reconcile(a.cookie);
       expectError(res, 409, "deposit_attribution_drift");
-      expect(ctx.wallet.submits).toHaveLength(1);
+      expect(ctx.wallet.submits).toHaveLength(2);
       expect(await credits().count()).toBe(1);
       expect((await listWallets(a.cookie))[0].creditedCC).toBe(CC("10"));
       // The audit row survives the thrown ApiError.
@@ -728,7 +781,7 @@ describe("Wallets + deposits (e2e)", () => {
       // B never sent anything, yet claims 5 CC of attribution.
       await wallets().update({ id: linked.wallet.id }, { creditedCC: parseCC("5") });
       expectError(await reconcile(a.cookie), 409, "deposit_attribution_drift");
-      expect(ctx.wallet.submits).toHaveLength(1);
+      expect(ctx.wallet.submits).toHaveLength(2);
       expect(await auditRows("deposit.attribution_drift")).toHaveLength(1);
       expect(ctx.ledger.wallets.get(A.partyId)?.depositedCC).toBe(parseCC("10"));
     });
@@ -766,7 +819,7 @@ describe("Wallets + deposits (e2e)", () => {
       if (!winner || !loser) throw new Error("unreachable");
       expect(bodyOf<ReconcileResult>(winner)).toMatchObject({ credited: CC("10"), status: "confirmed" });
       expect(bodyOf<ErrorBody>(loser).error).toBe("deposit_in_progress");
-      expect(ctx.wallet.submits).toHaveLength(1);
+      expect(ctx.wallet.submits).toHaveLength(2);
       expect(await credits().count()).toBe(1);
       expect(ctx.ledger.wallets.get(A.partyId)?.depositedCC).toBe(parseCC("10"));
 
@@ -804,6 +857,134 @@ describe("Wallets + deposits (e2e)", () => {
       expect(ctx.wallet.submits).toHaveLength(0);
       expect(await credits().count()).toBe(0);
       expect(ctx.ledger.wallets.has(A.partyId)).toBe(false);
+    });
+
+    it("reuses a UserWallet another path created (an in-app payout's empty Create): no second Create, the credit is an Exercise", async () => {
+      const A = makeTestWallet("alice");
+      const a = await signIn(A);
+      // PayoutService created A's wallet moments ago under the shared deterministic id.
+      const existing = ctx.ledger.seedUserWallet(A.partyId, {});
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(A.partyId), "completed");
+      ctx.wallet.seedInbound(A.partyId, "4");
+
+      const res = await reconcileOk(a.cookie);
+      expect(res).toMatchObject({ credited: CC("4"), status: "confirmed", ledger: { owner: A.partyId, depositedCC: CC("4") } });
+      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([res.commandId]);
+      const [deposit] = ctx.wallet.submits[0].commands as LedgerCommand[];
+      expect(deposit.ExerciseCommand).toMatchObject({ contractId: existing.contractId, choice: "Deposit" });
+      expect([...ctx.ledger.wallets.values()].filter((w) => w.owner === A.partyId)).toHaveLength(1);
+    });
+
+    it("a credit the ledger has not shown yet stays `submitted` (grace period), and the confirm processor credits it exactly once when the ledger catches up", async () => {
+      const A = makeTestWallet("alice");
+      const a = await signIn(A);
+      ctx.wallet.seedInbound(A.partyId, "10");
+      ctx.wallet.lagLedger = true;
+
+      // The wallet accepts both the Create and the Deposit; the ACS lags. The Create is awaited
+      // (the wallet must be visible before the Exercise), so let it land first.
+      const first = await reconcile(a.cookie);
+      expectError(first, 502, "upstream_failed"); // the empty wallet is accepted but not yet visible
+      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(A.partyId)]);
+      ctx.wallet.applyPending();
+      const res = await reconcileOk(a.cookie);
+      expect(res).toMatchObject({ credited: CC("10"), status: "submitted", perWallet: [{ partyId: A.partyId, amountCC: CC("10") }] });
+      expect(ctx.wallet.submits).toHaveLength(2);
+      let row = (await credits().find())[0];
+      expect(row).toMatchObject({ status: "submitted", commandId: res.commandId, depositedCCBefore: 0n });
+      expect((await listWallets(a.cookie))[0].creditedCC).toBe(CC("0"));
+      expect((await overview(a.cookie)).pending).toEqual({ submitted: 1 });
+
+      // While the credit is in flight no new derivation may run (it would double count), and the
+      // processor's pass leaves the young row alone — whatever the command index says.
+      expectError(await reconcile(a.cookie), 409, "deposit_in_progress");
+      ctx.wallet.unknownCommandIds = true;
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 0 });
+      ctx.wallet.unknownCommandIds = false;
+      expect((await credits().findOneByOrFail({ id: row.id })).status).toBe("submitted");
+
+      // The ledger catches up: the processor confirms and bumps the attribution — once.
+      ctx.wallet.applyPending();
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 1, failed: 0 });
+      row = await credits().findOneByOrFail({ id: row.id });
+      expect(row.status).toBe("confirmed");
+      expect(row.confirmedAt).not.toBeNull();
+      expect((await listWallets(a.cookie))[0].creditedCC).toBe(CC("10"));
+      expect(await auditRows("deposit.credited")).toHaveLength(1);
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 0 });
+      expect((await listWallets(a.cookie))[0].creditedCC).toBe(CC("10"));
+      ctx.wallet.lagLedger = false;
+      expect(await reconcileOk(a.cookie)).toMatchObject({ credited: CC("0"), status: "nothing_outstanding" });
+      expect((await overview(a.cookie)).attribution).toEqual({ legacyPrimaryCC: CC("0"), creditedTotalCC: CC("10"), ledgerDepositedCC: CC("10"), delta: CC("0") });
+    });
+
+    it("a submit that never reached the wallet fails only after the grace period; the next reconcile re-arms the same command id", async () => {
+      const A = makeTestWallet("alice");
+      const a = await signIn(A);
+      ctx.wallet.seedInbound(A.partyId, "3");
+      ctx.ledger.seedUserWallet(A.partyId, {});
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(A.partyId), "completed");
+
+      // The Deposit submit dies before the wallet records anything: the row stays `submitted`.
+      ctx.wallet.failNext = new Error("ECONNRESET");
+      const res = await reconcile(a.cookie);
+      expectError(res, 502, "upstream_failed");
+      expect(bodyOf<ErrorBody>(res).details).toMatchObject({ creditStatus: "submitted" });
+      const commandId = bodyOf<ErrorBody>(res).details?.commandId as string;
+      expect(commandId).toMatch(COMMAND_ID_RE);
+      expect(ctx.wallet.submits).toHaveLength(0);
+      const row = (await credits().find())[0];
+      expect(row).toMatchObject({ status: "submitted", commandId });
+
+      // Inside the grace period the pass never touches the wallet's command index (a lagging ACS
+      // looks exactly like this) and the row stays submitted.
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 0 });
+      expect((await credits().findOneByOrFail({ id: row.id })).status).toBe("submitted");
+
+      // Past the grace period: a failed status read still fails closed …
+      await credits().update({ id: row.id }, { submittedAt: new Date(Date.now() - ctx.config.depositConfirmGraceMs - 1000) });
+      ctx.wallet.statusReadsFail = true;
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 0 });
+      ctx.wallet.statusReadsFail = false;
+      expect((await credits().findOneByOrFail({ id: row.id })).status).toBe("submitted");
+
+      // … and a wallet that does not know the command marks the row failed (audited, nothing credited).
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 1 });
+      const failed = await credits().findOneByOrFail({ id: row.id });
+      expect(failed.status).toBe("failed");
+      expect(failed.error).toMatch(/does not know the command/);
+      expect(await auditRows("deposit.failed")).toEqual([expect.objectContaining({ actorType: "system", subjectId: row.id })]);
+      expect((await listWallets(a.cookie))[0].creditedCC).toBe(CC("0"));
+
+      // The next reconcile re-arms the very same command id (ledger dedup is the backstop) and confirms.
+      const again = await reconcileOk(a.cookie);
+      expect(again).toMatchObject({ credited: CC("3"), status: "confirmed", commandId });
+      expect(await credits().count()).toBe(1);
+      const rearmed = (await auditRows("deposit.submitted")).map((e) => e.metadata.rearmed);
+      expect(rearmed).toEqual([false, true]);
+      expect((await credits().findOneByOrFail({ id: row.id })).submittedAt.getTime()).toBeGreaterThan(Date.now() - 60_000);
+      expect((await listWallets(a.cookie))[0].creditedCC).toBe(CC("3"));
+    });
+
+    it("a credit the wallet reports as landed but the ledger does not show after the grace period is never failed (operator alert, no re-arm)", async () => {
+      const A = makeTestWallet("alice");
+      const a = await signIn(A);
+      ctx.wallet.seedInbound(A.partyId, "2");
+      ctx.ledger.seedUserWallet(A.partyId, {});
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(A.partyId), "completed");
+      ctx.wallet.lagLedger = true;
+      const res = await reconcileOk(a.cookie);
+      expect(res.status).toBe("submitted");
+      const row = (await credits().find())[0];
+      await credits().update({ id: row.id }, { submittedAt: new Date(Date.now() - ctx.config.depositConfirmGraceMs - 1000) });
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 0 });
+      expect((await credits().findOneByOrFail({ id: row.id })).status).toBe("submitted");
+      expectError(await reconcile(a.cookie), 409, "deposit_in_progress");
+      // A wallet that reports the command failed, however, does fail the row.
+      ctx.wallet.rejectPending();
+      await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({ confirmed: 0, failed: 1 });
+      expect((await credits().findOneByOrFail({ id: row.id }))).toMatchObject({ status: "failed", error: expect.stringMatching(/failed/) as string });
+      ctx.wallet.lagLedger = false;
     });
 
     it("GET /in-app-wallet composes ledger, wallets with receivedCC, attribution, pending and payouts — API.md 'In-app wallet'", async () => {

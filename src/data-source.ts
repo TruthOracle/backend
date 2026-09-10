@@ -1,26 +1,39 @@
 import "reflect-metadata";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DataSource, type DataSourceOptions } from "typeorm";
 
 import type { DbSslMode } from "./config";
 import { postgresEntities } from "./entities";
 
-export function resolveDbSsl(
-  databaseUrl: string,
-  mode: DbSslMode,
-): false | { rejectUnauthorized: boolean } {
+export type DbSslOptions = false | { rejectUnauthorized: boolean; ca?: string };
+
+/** `DB_SSL_CA` is either a PEM block inline or the path of a PEM file. */
+export function resolveDbSslCa(raw: string | undefined): string | undefined {
+  const value = (raw ?? "").trim();
+  if (!value) return undefined;
+  if (value.includes("-----BEGIN")) return value;
+  return readFileSync(value, "utf8");
+}
+
+/**
+ * `verify` = TLS with the server certificate checked (against `DB_SSL_CA` when the managed
+ * database uses a private CA); `true` = TLS without verification (opportunistic, MITM-able —
+ * refused in prod without DB_SSL_INSECURE_ACK, see config.ts); `auto` = plain TCP for local /
+ * docker-compose hosts, unverified TLS everywhere else; `false` = plain TCP.
+ */
+export function resolveDbSsl(databaseUrl: string, mode: DbSslMode, ca?: string): DbSslOptions {
   if (mode === "false") return false;
+  if (mode === "verify") return ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true };
   if (mode === "true") return { rejectUnauthorized: false };
-  // auto: plain TCP for local / docker-compose hosts, TLS everywhere else (managed Postgres).
-  return /(localhost|127\.0\.0\.1|@postgres[:/])/.test(databaseUrl)
-    ? false
-    : { rejectUnauthorized: false };
+  return /(localhost|127\.0\.0\.1|@postgres[:/])/.test(databaseUrl) ? false : { rejectUnauthorized: false };
 }
 
 /** Shared by the Nest TypeOrmModule and the TypeORM CLI so both see the same options. */
 export function buildDataSourceOptions(input: {
   databaseUrl: string;
   dbSsl: DbSslMode;
+  dbSslCa?: string;
 }): DataSourceOptions {
   return {
     type: "postgres",
@@ -33,7 +46,7 @@ export function buildDataSourceOptions(input: {
     uuidExtension: "pgcrypto",
     synchronize: false,
     logging: false,
-    ssl: resolveDbSsl(input.databaseUrl, input.dbSsl),
+    ssl: resolveDbSsl(input.databaseUrl, input.dbSsl, input.dbSslCa),
   };
 }
 
@@ -49,6 +62,7 @@ const AppDataSource = new DataSource(
   buildDataSourceOptions({
     databaseUrl: process.env.DATABASE_URL ?? "",
     dbSsl: (process.env.DB_SSL as DbSslMode | undefined) ?? "auto",
+    dbSslCa: resolveDbSslCa(process.env.DB_SSL_CA),
   }),
 );
 

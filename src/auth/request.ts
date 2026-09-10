@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 import type { Request } from "express";
 
@@ -7,6 +6,7 @@ import type { SessionEntity } from "../entities/session.entity";
 import type { UserEntity } from "../entities/user.entity";
 import type { Actor } from "../types";
 import { ApiError } from "../util/errors";
+import { timingSafeStringEqual } from "../util/strings";
 
 export type AuthKind = "cookie" | "bearer";
 
@@ -43,9 +43,7 @@ export function isTrustedProxyRequest(req: Pick<MinimalRequest, "headers">, conf
   if (!secret) return false;
   const presented = header(req, "x-truthoracle-proxy");
   if (!presented) return false;
-  const a = Buffer.from(presented, "utf8");
-  const b = Buffer.from(secret, "utf8");
-  return a.length === b.length && timingSafeEqual(a, b);
+  return timingSafeStringEqual(presented, secret);
 }
 
 /**
@@ -103,6 +101,11 @@ export function originMatchesPattern(origin: string, pattern: string): boolean {
 export function principalOf(req: AuthedRequest): { user: UserEntity; session: SessionEntity } {
   if (!req.user || !req.session) throw new ApiError(401, "unauthenticated", "authentication required");
   return { user: req.user, session: req.session };
+}
+
+/** The session on a @Public route, when the browser presented one (the login routes' "link mode"). */
+export function optionalPrincipalOf(req: AuthedRequest): { user: UserEntity; session: SessionEntity } | null {
+  return req.user && req.session ? { user: req.user, session: req.session } : null;
 }
 
 /** The audit actor behind a session-only request (admin sessions act as `admin`). */

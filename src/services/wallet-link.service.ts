@@ -1,6 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { DataSource, type EntityManager, In, Repository } from "typeorm";
+import { DataSource, In, Repository } from "typeorm";
 
 import { Config } from "../config";
 import { AuthIdentityEntity } from "../entities/auth-identity.entity";
@@ -279,13 +279,16 @@ export class WalletLinkService {
       return row;
     });
 
-    void this.publish(NatsSubjects.walletLinked, { userId, walletId: wallet.id, identityId: identity.id, relinked: Boolean(existing) });
+    void this.nats.publishSafe(NatsSubjects.walletLinked, { userId, walletId: wallet.id, identityId: identity.id, relinked: Boolean(existing) });
     return { wallet, identity, seededLegacyCreditedCC: wallet.legacyCreditedCC };
   }
 
   /**
-   * §8.1 / §6.5: unlink goes through IdentityService.unlink (last_identity, identity_locked_by_kyc)
-   * which also revokes the wallet row; the primary is refused while users.party_id points at it.
+   * §8.1 / §6.5: unlink IS IdentityService.unlink (last_identity, identity_locked_by_kyc,
+   * primary_wallet_in_use), which revokes the wallet row and writes the `wallet.unlinked` audit
+   * row and event in the same transaction — so this route and `DELETE /me/identities/:id` leave
+   * one identical trail. Only a row whose identity is already gone (seeded directly) is revoked
+   * here, with the same audit row and event.
    */
   async unlink(userId: string, walletId: string, actor: Actor): Promise<void> {
     const wallet = await this.wallets.findOne({ where: { id: walletId, userId } });
@@ -299,22 +302,25 @@ export class WalletLinkService {
     const identity = await this.identities.findByProviderSubject("canton_wallet", wallet.partyId);
     if (identity && identity.userId === userId && identity.status === "active") {
       await this.identities.unlink(userId, identity.id, actor);
+      return;
     }
-    // IdentityService.unlink revokes the row in its transaction; this covers a row whose identity
-    // was already unlinked (e.g. seeded directly) and is a no-op otherwise.
-    await this.wallets.update({ id: walletId, status: "active" }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
-
-    await this.audit.record({
-      actorType: actor.type,
-      actorUserId: actor.userId ?? null,
-      actorSessionId: actor.sessionId ?? null,
-      action: "wallet.unlinked",
-      subjectType: "wallet",
-      subjectId: wallet.id,
-      metadata: { userId, partyId: wallet.partyId, identityId: identity?.id ?? null },
-      ip: actor.ip ?? null,
+    await this.dataSource.transaction(async (manager) => {
+      await manager.getRepository(WalletEntity).update({ id: walletId, status: "active" }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
+      await this.audit.record(
+        {
+          actorType: actor.type,
+          actorUserId: actor.userId ?? null,
+          actorSessionId: actor.sessionId ?? null,
+          action: "wallet.unlinked",
+          subjectType: "wallet",
+          subjectId: wallet.id,
+          metadata: { userId, partyId: wallet.partyId, identityId: identity?.id ?? null },
+          ip: actor.ip ?? null,
+        },
+        manager,
+      );
     });
-    void this.publish(NatsSubjects.walletUnlinked, { userId, walletId: wallet.id, identityId: identity?.id ?? null });
+    void this.nats.publishSafe(NatsSubjects.walletUnlinked, { userId, walletId: wallet.id, identityId: identity?.id ?? null });
   }
 
   /**
@@ -380,7 +386,7 @@ export class WalletLinkService {
         );
         return (await repo.findOne({ where: { id: wallet.id } })) ?? { ...wallet, isPrimary: true };
       });
-      void this.publish(NatsSubjects.walletPrimaryChanged, { userId, walletId: wallet.id, from, to: wallet.partyId });
+      void this.nats.publishSafe(NatsSubjects.walletPrimaryChanged, { userId, walletId: wallet.id, from, to: wallet.partyId });
       return updated;
     } finally {
       await lock.release();
@@ -415,23 +421,10 @@ export class WalletLinkService {
   toApi(wallet: WalletEntity, extras?: { ownLedgerWallet?: LedgerWallet | null; receivedCC?: bigint }): ApiWallet {
     return walletToApi(wallet, extras ?? {});
   }
-
-  private async publish(subject: `truthoracle.${string}`, payload: object): Promise<void> {
-    try {
-      await this.nats.publish(subject, payload);
-    } catch (err) {
-      this.logger.warn(`publish ${subject} failed: ${(err as Error).message}`);
-    }
-  }
 }
 
 function clipLabel(label: string | null): string | null {
   if (label === null) return null;
   const trimmed = String(label).trim();
   return trimmed ? trimmed.slice(0, 64) : null;
-}
-
-/** Test/diagnostic helper — the manager form of `findById` for composing packages. */
-export async function findWalletForUpdate(manager: EntityManager, walletId: string): Promise<WalletEntity | null> {
-  return manager.getRepository(WalletEntity).findOne({ where: { id: walletId }, lock: { mode: "pessimistic_write" } });
 }

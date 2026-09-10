@@ -50,10 +50,10 @@ export const ERROR_CODES = [
   "unsupported_media_type",
   "upstream_failed",
   "not_ready",
-  "not_implemented",
   "internal_error",
   // emitted by the Vercel proxy only (never by this process); listed so clients see one union
   "backend_unconfigured",
+  "backend_unreachable",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
@@ -168,6 +168,8 @@ export interface KycSessionResult {
 
 export interface KycProvider {
   readonly name: KycProviderName;
+  /** false → `POST /kyc/sessions` answers 503 kyc_provider_unavailable and `GET /kyc.provider` is null. */
+  isConfigured(): boolean;
   createSession(
     user: { id: string; email?: string | null },
     applicantId: string | null,
@@ -285,7 +287,8 @@ export type AuditAction =
   | "kyc.needs_review"
   | "kyc.admin_override"
   | "kyc.person_transferred"
-  | "kyc.webhook_received";
+  | "kyc.webhook_received"
+  | "kyc.webhook_replayed";
 
 // ---------------------------------------------------------------------------------------------
 // Wire shapes (docs/API.md) — money is a 10-dp string, timestamps ISO-8601
@@ -382,17 +385,22 @@ export interface ApiSession {
   current: boolean;
 }
 
-export type PayoutStatus =
-  | "queued"
-  | "settling"
-  | "settled_external"
-  | "settled_in_app"
-  | "blocked_kyc"
-  | "blocked_unknown_user"
-  | "blocked_unknown_reason"
-  | "blocked_wallet_revoked"
-  | "failed"
-  | "archived";
+/** Every `to_payouts.status` (ARCHITECTURE §5) — the one closed list DTOs and services share. */
+export const PAYOUT_STATUSES = [
+  "queued",
+  "settling",
+  "settled_external",
+  "settled_in_app",
+  "blocked_kyc",
+  "blocked_unknown_user",
+  "blocked_unknown_reason",
+  "blocked_wallet_revoked",
+  "failed",
+  "archived",
+] as const;
+export type PayoutStatus = (typeof PAYOUT_STATUSES)[number];
+
+export const CHALLENGE_PURPOSES: readonly ChallengePurpose[] = ["sign-in", "link-wallet", "admin-sign-in"];
 
 export interface ApiPayout {
   pendingPayoutCid: string;
@@ -499,4 +507,6 @@ export type CheckState = "ok" | "fail";
 export interface ReadinessResponse {
   status: "ok" | "degraded";
   checks: { postgres: CheckState; redis: CheckState; nats: CheckState };
+  /** Present (true) only while the process is shutting down: the load balancer must stop routing here. */
+  draining?: true;
 }

@@ -1,13 +1,15 @@
+import { createHash } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 
 import { Config } from "../config";
 import type { LedgerWallet, PendingPayoutRecord } from "../types";
 import { ApiError } from "../util/errors";
-import { parseCC, tryParseCC } from "../util/money";
+import { formatCC, tryParseCC } from "../util/money";
 import { asString } from "../util/strings";
 import { authedJson, UpstreamError } from "../util/upstream-http";
 import { KeycloakTokenService } from "./keycloak-token.service";
 import { RedisService } from "./redis.service";
+import { SentryService } from "./sentry.service";
 
 /**
  * Read-only access to the Canton JSON Ledger API as the treasury party. Port of
@@ -38,6 +40,7 @@ export class LedgerClientService {
     private readonly config: Config,
     private readonly keycloak: KeycloakTokenService,
     private readonly redis: RedisService,
+    private readonly sentry: SentryService,
   ) {}
 
   get baseUrl(): string {
@@ -163,14 +166,26 @@ export class LedgerClientService {
   /**
    * The owner's UserWallet, read as the treasury (signatory, so it sees every wallet). Returns
    * null when the user has never deposited — the caller creates one.
+   *
+   * UserWallet has no contract key, so two racing Creates could mint two wallets for one owner.
+   * The backend keys every Create on one deterministic command id per owner precisely so that
+   * cannot happen; should it happen anyway (a legacy tool, a hand-run command) the balance is
+   * split across contracts and every attribution invariant is void. That is never silently
+   * resolved to "the first one": it is reported and refused as attribution drift.
    */
   async fetchUserWallet(ownerParty: string, opts: ReadOptions = {}): Promise<LedgerWallet | null> {
     const rows = await this.activeContracts(this.config.treasuryPartyId, "UserWallet", opts);
-    for (const row of rows) {
-      if (asString(row.payload.owner) !== ownerParty) continue;
-      return this.walletFrom(row);
+    const mine = rows.filter((row) => asString(row.payload.owner) === ownerParty);
+    if (mine.length > 1) {
+      const cids = mine.map((r) => r.contractId);
+      this.logger.error(`${mine.length} active UserWallets for ${ownerParty}: ${cids.join(", ")}`);
+      this.sentry.captureMessage("duplicate UserWallet contracts for one owner", "error", { owner: ownerParty, count: String(mine.length) });
+      throw new ApiError(409, "deposit_attribution_drift", "more than one in-app wallet exists for this party; an operator has been notified", {
+        kind: "duplicate_user_wallet",
+        contractIds: cids,
+      });
     }
-    return null;
+    return mine.length === 1 ? this.walletFrom(mine[0]) : null;
   }
 
   async fetchAllUserWallets(opts: ReadOptions = {}): Promise<LedgerWallet[]> {
@@ -207,11 +222,32 @@ export class LedgerClientService {
     }
     return null;
   }
+}
 
-  /** Test/diagnostic helper: parse a Daml Decimal string strictly. */
-  static parseDecimal(value: unknown): bigint {
-    return parseCC(String(value));
-  }
+/**
+ * The one shape of a treasury-created UserWallet: empty (0 / 0 / 0). Both the deposit path and
+ * the in-app payout path create wallets through this with the SAME deterministic command id
+ * (`walletCreateCommandIdFor(owner)`), so two racing Creates collide on ledger command-dedup
+ * instead of minting two wallets — UserWallet has no contract key to stop that on-ledger.
+ * `depositRefs` is only sent when the deployed Daml carries the field (1.0.0 has none; on 2.0.0
+ * an omitted Optional defaults to None — port of api/wallet/deposit.mjs).
+ */
+export function userWalletCreateCommand(input: { templateId: string; admin: string; owner: string; withDepositRefs: boolean }): unknown {
+  const zero = formatCC(0n);
+  const createArguments: Record<string, unknown> = {
+    admin: input.admin,
+    owner: input.owner,
+    balanceCC: zero,
+    depositedCC: zero,
+    withdrawnCC: zero,
+  };
+  if (input.withDepositRefs) createArguments.depositRefs = [];
+  return { CreateCommand: { templateId: input.templateId, createArguments } };
+}
+
+/** `wallet-create-<sha256(owner)[:40]>` — one Create per owner, whoever submits it first. */
+export function walletCreateCommandIdFor(ownerParty: string): string {
+  return `wallet-create-${createHash("sha256").update(ownerParty).digest("hex").slice(0, 40)}`;
 }
 
 /**

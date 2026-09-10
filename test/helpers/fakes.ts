@@ -54,6 +54,10 @@ export class FakeNatsService {
     this.published.push({ subject, payload, msgId: opts?.msgId });
   }
 
+  async publishSafe(subject: string, payload: object, opts?: { msgId?: string }): Promise<void> {
+    await this.publish(subject, payload, opts);
+  }
+
   async consume(durable: string, filterSubject: string, handler: ConsumeHandler): Promise<void> {
     if (this.consumers.some((c) => c.durable === durable)) return;
     this.consumers.push({ durable, filterSubject, handler });
@@ -230,16 +234,28 @@ export interface RecordedTransfer {
 /**
  * Applies treasury-signed commands to the FakeLedgerClient the way the real ledger would
  * (Deposit / Create UserWallet / SettleToWallet / MarkPaid), records every submit and transfer,
- * and dedups on commandId. Toggle `statusReadsFail` to exercise the fail-closed paths.
+ * and dedups on commandId. Two status books mirror the real wallet: `statuses` is the TRANSFER
+ * index (`/api/v1/transfer/{party}/{commandId}` — only `transfer()` ids live there) and
+ * `commandStatuses` the COMMAND index (`/api/v1/command/{party}/{commandId}` — external submits).
+ * Toggles: `statusReadsFail` (both reads fail), `unknownCommandIds` (the command index answers
+ * 404 for everything, the "not wired through" wallet), `lagLedger` (submits are accepted and
+ * recorded but the ledger does not move until `applyPending()`; `rejectPending()` instead marks
+ * them failed, the ledger-rejected-after-accept case).
  */
 export class FakeEnterpriseWallet {
   readonly rows: TransferRow[] = [];
   readonly submits: RecordedSubmit[] = [];
   readonly transfers: RecordedTransfer[] = [];
+  /** Transfer index: `transfer()` command ids only. */
   readonly statuses = new Map<string, string>();
+  /** Command index: `externalSubmit()` command ids only. */
+  readonly commandStatuses = new Map<string, string>();
   statusReadsFail = false;
+  unknownCommandIds = false;
+  lagLedger = false;
   /** Set to make the next externalSubmit / transfer throw (then cleared). */
   failNext: Error | null = null;
+  private readonly pending: RecordedSubmit[] = [];
   private tick = 0;
 
   constructor(
@@ -282,20 +298,46 @@ export class FakeEnterpriseWallet {
     return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
   }
 
-  async transferAlreadySubmitted(partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean }> {
-    const { known, submitted } = await this.transferStatus(partyId, commandId);
-    return { known, submitted };
+  async commandStatus(_partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
+    if (this.statusReadsFail) return { known: false, submitted: false, status: null };
+    const status = this.unknownCommandIds ? undefined : this.commandStatuses.get(commandId);
+    if (status === undefined) return { known: false, submitted: false, status: "not_found" };
+    return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
   }
 
   async externalSubmit(args: { commandId: string; commands: unknown[]; disclosedContracts?: unknown[] }): Promise<{ commandId: string; status: string }> {
     this.consumeFailNext();
-    if (this.statuses.has(args.commandId)) {
+    if (this.commandStatuses.has(args.commandId)) {
       throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, { upstreamStatus: 409 });
     }
+    const submit = { commandId: args.commandId, commands: args.commands };
+    if (this.lagLedger) {
+      this.submits.push(submit);
+      this.pending.push(submit);
+      this.commandStatuses.set(args.commandId, "submitted");
+      return { commandId: args.commandId, status: "submitted" };
+    }
     for (const command of args.commands) this.apply(command);
-    this.submits.push({ commandId: args.commandId, commands: args.commands });
-    this.statuses.set(args.commandId, "completed");
+    this.submits.push(submit);
+    this.commandStatuses.set(args.commandId, "completed");
     return { commandId: args.commandId, status: "completed" };
+  }
+
+  /** `lagLedger`: the ledger catches up — every accepted command lands (or is recorded as failed when it cannot). */
+  applyPending(): void {
+    for (const submit of this.pending.splice(0)) {
+      try {
+        for (const command of submit.commands) this.apply(command);
+        this.commandStatuses.set(submit.commandId, "completed");
+      } catch {
+        this.commandStatuses.set(submit.commandId, "failed");
+      }
+    }
+  }
+
+  /** `lagLedger`: the ledger rejects every accepted command (stale contract id, assertion) — nothing lands. */
+  rejectPending(): void {
+    for (const submit of this.pending.splice(0)) this.commandStatuses.set(submit.commandId, "failed");
   }
 
   async transfer(args: { to: string; amountCC: bigint; reason: string; commandId: string; metadata?: Record<string, string> }): Promise<{ commandId: string; status: string }> {
@@ -323,8 +365,12 @@ export class FakeEnterpriseWallet {
     this.rows.length = 0;
     this.submits.length = 0;
     this.transfers.length = 0;
+    this.pending.length = 0;
     this.statuses.clear();
+    this.commandStatuses.clear();
     this.statusReadsFail = false;
+    this.unknownCommandIds = false;
+    this.lagLedger = false;
     this.failNext = null;
     this.tick = 0;
   }
@@ -399,10 +445,16 @@ export class FakeKycProvider implements KycProvider {
   readonly applicants = new Map<string, ApplicantSummary>();
   readonly sessions: { userId: string; applicantId: string | null; level: string }[] = [];
   nextEvent: KycEvent | null = null;
+  /** false → the service answers 503 kyc_provider_unavailable. */
+  configured = true;
   private seq = 0;
 
   constructor(name: KycProviderName = "sumsub") {
     this.name = name;
+  }
+
+  isConfigured(): boolean {
+    return this.configured;
   }
 
   async createSession(user: { id: string }, applicantId: string | null, level: string): Promise<KycSessionResult> {
@@ -425,5 +477,6 @@ export class FakeKycProvider implements KycProvider {
     this.applicants.clear();
     this.sessions.length = 0;
     this.nextEvent = null;
+    this.configured = true;
   }
 }

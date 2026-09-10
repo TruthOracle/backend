@@ -10,21 +10,34 @@ import type { KycProviderName } from "../types";
 export const KYC_WEBHOOK_CONSUMER = "kyc-webhook-apply";
 /** `truthoracle.kyc.webhook.<provider>` — one token, any provider. */
 export const KYC_WEBHOOK_FILTER = "truthoracle.kyc.webhook.*";
-/** A transient failure (provider API down, DB hiccup) is retried this often, this many times. */
+/**
+ * A transient failure (provider API down, DB hiccup) is NAKed with exponential backoff:
+ * 5 s, 10 s, 20 s, … capped at 10 min, for up to 20 attempts — a horizon of hours, not the
+ * 100 s a fixed 5 s delay would give. Exhausted rows are re-armed by the sweep after a cooldown.
+ */
 export const KYC_WEBHOOK_NAK_DELAY_MS = 5_000;
+export const KYC_WEBHOOK_NAK_DELAY_MAX_MS = 10 * 60_000;
 export const KYC_WEBHOOK_MAX_ATTEMPTS = 20;
+export const KYC_WEBHOOK_RETRY_COOLDOWN_MS = 60 * 60_000;
 /** The sweep re-publishes stored-but-unprocessed events (a publish that failed after the 200). */
 export const KYC_WEBHOOK_SWEEP_MS = 5 * 60_000;
 export const KYC_WEBHOOK_SWEEP_MIN_AGE_MS = 2 * 60_000;
+
+/** NAK delay for the attempt that just failed (`attempt` ≥ 1). */
+export function kycWebhookNakDelayMs(attempt: number): number {
+  return Math.min(KYC_WEBHOOK_NAK_DELAY_MAX_MS, KYC_WEBHOOK_NAK_DELAY_MS * 2 ** Math.max(0, attempt - 1));
+}
 
 /**
  * Durable consumer of `truthoracle.kyc.webhook.<provider>` (ARCHITECTURE §9.2): the webhook
  * route stores the verified event, answers 200 and publishes `{ eventId }`; this loop re-reads
  * the row and applies the transition (`KycService.applyEvent`), which re-reads the applicant
  * from the provider API before any approval. Expected conditions (stale, sandbox on mainnet,
- * unknown user) are recorded on the row and acked; a retryable failure is NAKed with a delay
- * until the attempt cap, anything else is terminated and reported. A periodic sweep re-publishes
- * rows whose trigger never made it onto the bus.
+ * unknown user) are recorded on the row and acked; a retryable failure is NAKed with growing
+ * delays until the attempt cap, anything else is terminated and reported. A periodic sweep
+ * re-publishes rows whose trigger never made it onto the bus and, after a cooldown, rows the
+ * consumer exhausted — so a provider outage delays an approval instead of dropping it. An
+ * operator can force one with `POST /admin/kyc/webhooks/:id/replay`.
  */
 @Injectable()
 export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDestroy {
@@ -72,8 +85,9 @@ export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDest
     } catch (err) {
       if (err instanceof KycEventProcessingError) {
         if (err.retryable && err.attempts < KYC_WEBHOOK_MAX_ATTEMPTS) {
-          this.logger.warn(`event ${eventId}: attempt ${err.attempts} failed (${err.message}); retrying`);
-          msg.nak(KYC_WEBHOOK_NAK_DELAY_MS);
+          const delay = kycWebhookNakDelayMs(err.attempts);
+          this.logger.warn(`event ${eventId}: attempt ${err.attempts} failed (${err.message}); retrying in ${delay} ms`);
+          msg.nak(delay);
           return;
         }
         this.logger.error(`event ${eventId}: giving up after ${err.attempts} attempt(s): ${err.message}`);
@@ -99,12 +113,12 @@ export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDest
     }
     let republished = 0;
     try {
-      const rows = await this.kyc.unprocessedWebhookEvents(KYC_WEBHOOK_SWEEP_MIN_AGE_MS, KYC_WEBHOOK_MAX_ATTEMPTS);
+      const rows = await this.kyc.unprocessedWebhookEvents(KYC_WEBHOOK_SWEEP_MIN_AGE_MS, KYC_WEBHOOK_MAX_ATTEMPTS, KYC_WEBHOOK_RETRY_COOLDOWN_MS);
       for (const row of rows) {
         const provider: KycProviderName = row.provider === "sumsub" ? "sumsub" : "mock";
-        // A distinct msgId per attempt: the original publish used the bare event key and
-        // JetStream would otherwise drop the re-publish as a duplicate inside its window.
-        await this.kyc.publishWebhookTrigger(provider, row.id, `${row.eventKey}:sweep:${row.attempts}`);
+        // A distinct msgId per sweep: the original publish used the bare event key and JetStream
+        // would otherwise drop the re-publish as a duplicate inside its window.
+        await this.kyc.publishWebhookTrigger(provider, row.id, `${row.eventKey}:sweep:${Date.now()}`);
         republished += 1;
       }
       if (republished > 0) this.logger.log(`sweep: re-published ${republished} unprocessed webhook event(s)`);

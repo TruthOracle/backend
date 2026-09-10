@@ -57,6 +57,10 @@ export class DepositCreditEntity {
   @CreateDateColumn({ name: "created_at", type: "timestamptz" })
   createdAt!: Date;
 
+  /** When the row was (re-)armed `submitted`; the confirm pass grace period counts from here. */
+  @Column({ name: "submitted_at", type: "timestamptz", default: () => "now()" })
+  submittedAt!: Date;
+
   @Column({ name: "confirmed_at", type: "timestamptz", nullable: true })
   confirmedAt!: Date | null;
 }

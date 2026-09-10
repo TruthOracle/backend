@@ -11,13 +11,15 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   MaxLength,
 } from "class-validator";
 
-import type { KycVerificationStatus, PayoutStatus } from "../types";
+import { type KycVerificationStatus, PAYOUT_STATUSES, type PayoutStatus } from "../types";
 import { PageQueryDto } from "./common.dto";
 
-export const ADMIN_REASON_MAX_LENGTH = 500;
+/** One cap for every operator / KYC reason (audit metadata, `manual_reason`). */
+export const REASON_MAX_LENGTH = 500;
 
 /** `POST /admin/users/:id/kyc/override` accepts only these target states (ARCHITECTURE §11). */
 export const ADMIN_KYC_OVERRIDE_STATUSES = ["approved", "rejected_final", "expired"] as const;
@@ -25,20 +27,6 @@ export type AdminKycOverrideStatus = Extract<
   KycVerificationStatus,
   (typeof ADMIN_KYC_OVERRIDE_STATUSES)[number]
 >;
-
-/** Closed list of `to_payouts.status` values accepted by `GET /admin/payouts?status=`. */
-export const PAYOUT_STATUSES: readonly PayoutStatus[] = [
-  "queued",
-  "settling",
-  "settled_external",
-  "settled_in_app",
-  "blocked_kyc",
-  "blocked_unknown_user",
-  "blocked_unknown_reason",
-  "blocked_wallet_revoked",
-  "failed",
-  "archived",
-];
 
 const trimmed = (): PropertyDecorator =>
   Transform(({ value }: { value: unknown }) => (typeof value === "string" ? value.trim() : value));
@@ -48,7 +36,7 @@ export class AdminReasonDto {
   @trimmed()
   @IsString()
   @IsNotEmpty({ message: "reason is required" })
-  @MaxLength(ADMIN_REASON_MAX_LENGTH)
+  @MaxLength(REASON_MAX_LENGTH)
   reason!: string;
 }
 
@@ -73,6 +61,18 @@ export class AdminKycOverrideDto extends AdminReasonDto {
 export class AdminPersonTransferDto extends AdminReasonDto {
   @IsUUID()
   toUserId!: string;
+}
+
+/** `:fingerprint` route param — always the sha256-hex HMAC `fingerprintOf` produces (§9.3). */
+export class FingerprintParamDto {
+  @Matches(/^[0-9a-f]{64}$/, { message: "fingerprint must be a 64-char lowercase hex digest" })
+  fingerprint!: string;
+}
+
+/** `POST /admin/kyc/webhooks/:id/replay` */
+export class WebhookEventParamDto {
+  @IsUUID()
+  id!: string;
 }
 
 /** `GET /admin/payouts?status=` */

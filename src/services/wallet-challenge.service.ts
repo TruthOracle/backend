@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 
 import { Config } from "../config";
-import type { ApiChallenge, ChallengePurpose } from "../types";
+import { type ApiChallenge, CHALLENGE_PURPOSES, type ChallengePurpose } from "../types";
 import {
   describeAttempt,
   isValidPartyId,
@@ -16,7 +16,6 @@ import { MINUTE_MS } from "../util/time";
 import { RedisService } from "./redis.service";
 
 export const CHALLENGE_TTL_MS = 5 * MINUTE_MS;
-export const CHALLENGE_PURPOSES: readonly ChallengePurpose[] = ["sign-in", "link-wallet", "admin-sign-in"];
 
 interface ChallengeRecord {
   partyId: string;
@@ -77,9 +76,9 @@ export class WalletChallengeService {
     if (input.purpose !== "link-wallet" && input.sessionId) {
       throw new ApiError(409, "challenge_purpose_mismatch", "sign-in challenges cannot be issued to an existing session; use link-wallet");
     }
-    if (input.purpose === "admin-sign-in" && !this.config.adminOperators.has(partyId)) {
-      throw new ApiError(403, "forbidden", "this party is not an operator");
-    }
+    // Deliberately NO operator check here: an admin-sign-in challenge is issued to any well-formed
+    // party and the operator list is consulted at verify time only, so an anonymous caller cannot
+    // enumerate ADMIN_OPERATORS by watching 403 vs 200 on this route.
     const host = String(input.host ?? "").trim();
     if (!host) throw new ApiError(400, "validation_failed", "request host is unknown");
 
@@ -109,9 +108,9 @@ export class WalletChallengeService {
     const challengeId = String(input.challengeId ?? "").trim();
     if (!/^[0-9a-f-]{36}$/i.test(challengeId)) throw new ApiError(401, "challenge_rejected", "unknown challenge");
 
-    // Consume first: whatever happens next, this challenge is spent.
-    const record = await this.redis.getJson<ChallengeRecord>(`wc:${challengeId}`);
-    await this.redis.del(`wc:${challengeId}`);
+    // Consume first — atomically (GETDEL): whatever happens next this challenge is spent, and two
+    // concurrent presentations of one signature can never both read the record.
+    const record = await this.redis.takeJson<ChallengeRecord>(`wc:${challengeId}`);
     if (!record) throw new ApiError(401, "challenge_rejected", "challenge unknown, expired or already used");
     if (Date.parse(record.expiresAt) <= Date.now()) throw new ApiError(401, "challenge_rejected", "challenge expired");
 

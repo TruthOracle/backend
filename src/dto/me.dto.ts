@@ -5,13 +5,11 @@
  * the ones its provider needs). `GET /me/audit` reuses PageQueryDto.
  */
 import { Transform } from "class-transformer";
-import { IsIn, IsOptional, IsString, Matches, MaxLength, MinLength, ValidateIf } from "class-validator";
+import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength, ValidateIf } from "class-validator";
 
 import { WALLET_KIND_ALLOWLIST, type WalletKind } from "../types";
 import { PARTY_ID_RE } from "../util/canton-crypto";
-
-const numberToString = ({ value }: { value: unknown }): unknown =>
-  typeof value === "number" && Number.isFinite(value) ? String(value) : value;
+import { numberToString } from "./common.dto";
 
 export class UpdateMeDto {
   /** `null` clears the field. */
@@ -85,10 +83,9 @@ export class ReattachIdentityDto {
   @MaxLength(8192)
   initData?: string;
 
-  // ── canton wallet (a `link-wallet` challenge issued to this session) ─────────
+  // ── canton wallet (a `link-wallet` challenge issued to this session; bounds as WalletProofDto) ─
   @IsOptional()
-  @IsString()
-  @Matches(/^[0-9a-fA-F-]{36}$/)
+  @IsUUID()
   challengeId?: string;
 
   @IsOptional()

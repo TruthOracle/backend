@@ -1,14 +1,14 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { DataSource, type EntityManager, In, IsNull, LessThan, Not, Repository } from "typeorm";
+import { DataSource, type EntityManager, In, IsNull, LessThan, MoreThanOrEqual, Not, Repository } from "typeorm";
 
 import { Config } from "../config";
+import { REASON_MAX_LENGTH } from "../dto/admin.dto";
 import { KYC_DOC_TYPES, type KycMockSubmitDto } from "../dto/kyc.dto";
 import { KycPersonEntity } from "../entities/kyc-person.entity";
 import { KycVerificationEntity } from "../entities/kyc-verification.entity";
 import { KycWebhookEventEntity } from "../entities/kyc-webhook-event.entity";
-import { SETTING_KYC_PEPPER_HASH, SettingEntity } from "../entities/setting.entity";
 import type { SessionEntity } from "../entities/session.entity";
 import { UserEntity } from "../entities/user.entity";
 import {
@@ -27,7 +27,8 @@ import {
   type UserStatus,
 } from "../types";
 import { ApiError } from "../util/errors";
-import { DAY_MS } from "../util/time";
+import { isUuid } from "../util/strings";
+import { DAY_MS, toIso } from "../util/time";
 import { AuditService } from "./audit.service";
 import { KycProviderMockService } from "./kyc-provider-mock.service";
 import { NatsService } from "./nats.service";
@@ -44,9 +45,9 @@ export const REVIEWABLE_STATUSES: readonly KycVerificationStatus[] = [...IN_FLIG
 export const ADMIN_OVERRIDE_STATUSES: readonly KycVerificationStatus[] = ["approved", "rejected_final", "expired"];
 export const WEBHOOK_PAYLOAD_RETENTION_MS = 30 * DAY_MS;
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ISO_DATE_RE = /^(\d{4}-\d{2}-\d{2})/;
-const REASON_MAX = 500;
+/** Event kinds the state machine acts on — only these advance `provider_event_at` (§9.2 ordering). */
+const TRANSITION_KINDS: ReadonlySet<KycEvent["kind"]> = new Set(["pending", "onHold", "reset", "reviewed"]);
 
 /** NFKC-normalised, upper-cased, trimmed, internal whitespace collapsed to one space. */
 export function nfkcUpper(value: string): string {
@@ -146,10 +147,6 @@ export function gateDecision(input: {
   return input.hasApprovedAtLevel && input.hasBinding ? { allowed: true } : { allowed: false, reason: "kyc_required" };
 }
 
-export function isUuid(value: unknown): value is string {
-  return typeof value === "string" && UUID_RE.test(value);
-}
-
 // ---------------------------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------------------------
@@ -168,6 +165,31 @@ export type ApplyOutcome =
   | { outcome: "applied"; verificationId: string; status: KycVerificationStatus; changed: boolean }
   | { outcome: "skipped"; reason: string };
 
+/** Wire shape of a verification (docs/API.md `KycVerification`); never includes applicant data or the operator's note. */
+export function verificationToApi(v: KycVerificationEntity): ApiKycVerification {
+  return {
+    id: v.id,
+    provider: v.provider as ApiKycVerification["provider"],
+    levelName: v.levelName,
+    attemptNo: v.attemptNo,
+    status: v.status,
+    rejectLabels: Array.isArray(v.rejectLabels) ? v.rejectLabels : [],
+    moderationComment: v.moderationComment,
+    reviewedAt: toIso(v.reviewedAt),
+    createdAt: v.createdAt.toISOString(),
+  };
+}
+
+/** A `kyc.status_changed` payload, published only after the transaction that produced it committed. */
+interface StatusChangedEvent {
+  userId: string;
+  verificationId: string | null;
+  provider: string;
+  status: KycVerificationStatus;
+  userKycStatus: UserKycStatus;
+  duplicate?: boolean;
+}
+
 /** Thrown by `applyEvent` so the processor can decide between retry (nak) and give-up (term). */
 export class KycEventProcessingError extends Error {
   constructor(
@@ -178,10 +200,6 @@ export class KycEventProcessingError extends Error {
     super(message);
     this.name = "KycEventProcessingError";
   }
-}
-
-interface ProviderWithConfig extends KycProvider {
-  isConfigured?(): boolean;
 }
 
 /** The colliding keys of one binding attempt, carried out of a savepoint. */
@@ -207,7 +225,7 @@ export class KycService implements KycLockLookup {
     @InjectRepository(KycPersonEntity) private readonly persons: Repository<KycPersonEntity>,
     @InjectRepository(KycWebhookEventEntity) private readonly webhookEvents: Repository<KycWebhookEventEntity>,
     @InjectRepository(UserEntity) private readonly users: Repository<UserEntity>,
-    @Inject(KYC_PROVIDER) private readonly provider: ProviderWithConfig,
+    @Inject(KYC_PROVIDER) private readonly provider: KycProvider,
     private readonly mockProvider: KycProviderMockService,
     private readonly userService: UserService,
     private readonly audit: AuditService,
@@ -217,7 +235,7 @@ export class KycService implements KycLockLookup {
   // ─────────────────────────────────────────────── reads ──────────────────────────────────────
 
   providerConfigured(): boolean {
-    return typeof this.provider.isConfigured === "function" ? this.provider.isConfigured() : true;
+    return this.provider.isConfigured();
   }
 
   get providerName(): KycProviderName {
@@ -264,26 +282,8 @@ export class KycService implements KycLockLookup {
     return v && v.status === "approved" ? v.initiatedIdentityId : null;
   }
 
-  async listByStatus(status: KycVerificationStatus): Promise<KycVerificationEntity[]> {
-    return this.verifications.find({ where: { status }, order: { updatedAt: "DESC" } });
-  }
-
-  async personsForUser(userId: string): Promise<KycPersonEntity[]> {
-    return this.persons.find({ where: { userId }, order: { boundAt: "ASC" } });
-  }
-
   toApi(v: KycVerificationEntity): ApiKycVerification {
-    return {
-      id: v.id,
-      provider: v.provider as ApiKycVerification["provider"],
-      levelName: v.levelName,
-      attemptNo: v.attemptNo,
-      status: v.status,
-      rejectLabels: v.rejectLabels ?? [],
-      moderationComment: v.moderationComment,
-      reviewedAt: v.reviewedAt ? v.reviewedAt.toISOString() : null,
-      createdAt: v.createdAt.toISOString(),
-    };
+    return verificationToApi(v);
   }
 
   // ─────────────────────────────────────────────── sessions ───────────────────────────────────
@@ -359,7 +359,7 @@ export class KycService implements KycLockLookup {
       await this.bindApplicant(user.id, provider, result.applicantId, verification.id);
     }
     if (created) {
-      void this.publish(NatsSubjects.kycSessionStarted, { userId: user.id, verificationId: verification.id, provider });
+      void this.nats.publishSafe(NatsSubjects.kycSessionStarted, { userId: user.id, verificationId: verification.id, provider });
     }
     if (provider === "mock") return { provider: "mock", verificationId: verification.id, levelName: level };
     return {
@@ -472,7 +472,7 @@ export class KycService implements KycLockLookup {
     if (!row) return { outcome: "skipped", reason: "unknown_event" };
     if (row.processedAt) return { outcome: "skipped", reason: "already_processed" };
     const attempts = row.attempts + 1;
-    await this.webhookEvents.update({ id: row.id }, { attempts });
+    await this.webhookEvents.update({ id: row.id }, { attempts, lastAttemptAt: new Date() });
     try {
       const outcome = await this.applyRow(row);
       await this.webhookEvents.update(
@@ -506,7 +506,8 @@ export class KycService implements KycLockLookup {
       summary = await this.provider.fetchApplicant(event.applicantId);
     }
 
-    return this.dataSource.transaction(async (manager) => {
+    const events: StatusChangedEvent[] = [];
+    const outcome = await this.dataSource.transaction(async (manager): Promise<ApplyOutcome> => {
       const userRepo = manager.getRepository(UserEntity);
       const user = await userRepo.findOne({ where: { id: event.externalUserId }, lock: { mode: "pessimistic_write" } });
       if (!user) return { outcome: "skipped", reason: "unknown_user" };
@@ -530,7 +531,9 @@ export class KycService implements KycLockLookup {
 
       const before = verification.status;
       const next = await this.transition(manager, user, verification, event, summary);
-      verification.providerEventAt = event.occurredAt;
+      // Only an event the state machine acts on moves the ordering watermark: an unknown or
+      // `created` kind delivered out of order must not make the real `reviewed` event "stale".
+      if (TRANSITION_KINDS.has(event.kind)) verification.providerEventAt = event.occurredAt;
       if (next.status !== before) {
         verification.status = next.status;
         verification.reviewedAt = next.reviewed ? event.occurredAt : verification.reviewedAt;
@@ -540,9 +543,20 @@ export class KycService implements KycLockLookup {
       await repo.save(verification);
 
       const changed = next.status !== before;
-      if (changed) await this.recordStatusChange(manager, user.id, verification, { type: "system" }, next.collisions);
+      if (changed) events.push(await this.recordStatusChange(manager, user.id, verification, { type: "system" }, next.collisions));
       return { outcome: "applied", verificationId: verification.id, status: verification.status, changed };
     });
+    // Published once the transaction committed: a consumer (payout re-queue) that reads the user's
+    // KYC state on receipt must see the approval, not the pre-commit row.
+    this.publishStatusChanges(events);
+    return outcome;
+  }
+
+  private publishStatusChanges(events: StatusChangedEvent[]): void {
+    for (const { duplicate, ...e } of events) {
+      if (duplicate) void this.nats.publishSafe(NatsSubjects.kycDuplicateDetected, { userId: e.userId, verificationId: e.verificationId, provider: e.provider });
+      void this.nats.publishSafe(NatsSubjects.kycStatusChanged, e);
+    }
   }
 
   /** The verification a provider event addresses: the open attempt, else the newest one. */
@@ -627,6 +641,9 @@ export class KycService implements KycLockLookup {
       return { status: "blocked_duplicate", reviewed: true, rejectLabels: labels, moderationComment: comment };
     }
 
+    // A `reviewed` event with no answer (missing / unrecognised `reviewResult`) carries no decision:
+    // the attempt keeps its status rather than being told "not successful" by a payload gap.
+    if (event.answer === undefined) return { status: current };
     if (event.answer !== "GREEN") {
       const rejectType = event.rejectType ?? "RETRY";
       return { status: rejectType === "FINAL" ? "rejected_final" : "rejected_retry", reviewed: true, rejectLabels: labels, moderationComment: comment };
@@ -684,7 +701,12 @@ export class KycService implements KycLockLookup {
       );
       const row = await repo.findOne({ where: { fingerprint: key.fingerprint } });
       if (!row) throw new Error("kyc person row vanished after insert");
-      if (row.userId === userId && !row.releasedAt) continue;
+      if (row.userId === userId && !row.releasedAt) {
+        // Renewal: the binding follows the approving attempt, so a later transfer or expiry
+        // operates on the verification that currently stands.
+        if (row.verificationId !== verificationId) await repo.update({ fingerprint: key.fingerprint }, { verificationId });
+        continue;
+      }
       if (row.releasedAt) {
         // A released binding (transfer / pepper rotation) is free to take.
         await repo.update(
@@ -705,8 +727,10 @@ export class KycService implements KycLockLookup {
 
   private async bindApplicant(userId: string, provider: string, applicantId: string, verificationId: string): Promise<void> {
     try {
-      await this.users.update({ id: userId, kycApplicantId: IsNull() }, { kycProvider: provider, kycApplicantId: applicantId });
-      await this.verifications.update({ id: verificationId, providerApplicantId: IsNull() }, { providerApplicantId: applicantId });
+      await this.dataSource.transaction(async (manager) => {
+        await manager.getRepository(UserEntity).update({ id: userId, kycApplicantId: IsNull() }, { kycProvider: provider, kycApplicantId: applicantId });
+        await manager.getRepository(KycVerificationEntity).update({ id: verificationId, providerApplicantId: IsNull() }, { providerApplicantId: applicantId });
+      });
       await this.userService.invalidate(userId);
     } catch (err) {
       if (isUniqueViolation(err)) {
@@ -720,9 +744,13 @@ export class KycService implements KycLockLookup {
 
   /**
    * `POST /admin/users/:id/kyc/override`: a `provider = admin` verification. An approval binds
-   * the person keys re-read from the provider and is refused (409) when they belong to another
-   * account — the transfer action exists for that. Rejections / expiries retire the standing
-   * approval so the precedence drops.
+   * the person keys re-read from the provider — the §9.4 gate needs a `to_kyc_persons` binding,
+   * so an approval that cannot bind anything is refused (409) rather than saved as an approval
+   * the withdrawal gate never honours. Keys bound to another account are refused (409) too —
+   * the transfer action exists for that — except when ONLY the person key collides and a
+   * document key binds: same name + date of birth + country is a plausible false positive and
+   * the operator has vouched for the documents, so the document keys bind and the skipped person
+   * key is audited. Rejections / expiries retire the standing approval so the precedence drops.
    */
   async adminOverride(userId: string, status: KycVerificationStatus, reason: string, actor: Actor): Promise<KycVerificationEntity> {
     if (!ADMIN_OVERRIDE_STATUSES.includes(status)) {
@@ -734,14 +762,22 @@ export class KycService implements KycLockLookup {
     if (!user) throw new ApiError(404, "not_found", "user not found");
 
     let keys: PersonKey[] = [];
-    if (status === "approved" && user.kycApplicantId && user.kycProvider === this.provider.name) {
+    if (status === "approved") {
+      if (!user.kycApplicantId || user.kycProvider !== this.provider.name) {
+        throw new ApiError(409, "bad_request", "this account has no applicant with the configured provider; the user must start a verification session first", {
+          provider: this.provider.name,
+        });
+      }
       // Fail closed: without the provider's data there is nothing to bind, so retry later.
       const summary = await this.provider.fetchApplicant(user.kycApplicantId);
       keys = personKeysFor(this.config.kycFingerprintPepper, summary);
+      if (keys.length === 0) {
+        throw new ApiError(409, "bad_request", "the provider holds no usable document or person data for this applicant; nothing can be bound");
+      }
     }
     const level = this.config.kycRequiredLevel;
 
-    const verification = await this.dataSource.transaction(async (manager) => {
+    const { row, event } = await this.dataSource.transaction(async (manager) => {
       await lockUser(manager, userId);
       const repo = manager.getRepository(KycVerificationEntity);
       const attemptNo = await this.nextAttempt(manager, userId, "admin", level);
@@ -763,14 +799,18 @@ export class KycService implements KycLockLookup {
       });
       await repo.save(row);
 
+      let skippedFingerprints: string[] = [];
       if (status === "approved") {
-        if (keys.length > 0) {
-          const collisions = await this.bindKeys(manager, userId, row.id, keys);
-          if (collisions.length > 0) {
-            throw new ApiError(409, "kyc_duplicate_identity", "this person is bound to another account; transfer the binding first", {
-              fingerprints: collisions.map((c) => c.key.fingerprint),
-            });
-          }
+        let collisions = await this.bindKeys(manager, userId, row.id, keys);
+        const docKeys = keys.filter((k) => k.kind === "doc");
+        if (collisions.length > 0 && collisions.every((c) => c.key.kind === "person") && docKeys.length > 0) {
+          skippedFingerprints = collisions.map((c) => c.key.fingerprint);
+          collisions = await this.bindKeys(manager, userId, row.id, docKeys);
+        }
+        if (collisions.length > 0) {
+          throw new ApiError(409, "kyc_duplicate_identity", "this person is bound to another account; transfer the binding first", {
+            fingerprints: collisions.map((c) => c.key.fingerprint),
+          });
         }
         // The admin decision supersedes a standing duplicate block and closes open attempts.
         await repo.update({ userId, status: In(["blocked_duplicate", ...IN_FLIGHT_STATUSES]) }, { status: "expired", manual: true, manualReason: cleanReason });
@@ -789,15 +829,24 @@ export class KycService implements KycLockLookup {
           action: "kyc.admin_override",
           subjectType: "user",
           subjectId: userId,
-          metadata: { verificationId: row.id, provider: "admin", level, status, attemptNo, reason: cleanReason },
+          metadata: {
+            verificationId: row.id,
+            provider: "admin",
+            level,
+            status,
+            attemptNo,
+            reason: cleanReason,
+            ...(skippedFingerprints.length > 0 ? { skippedPersonFingerprints: skippedFingerprints } : {}),
+          },
           ip: actor.ip ?? null,
         },
         manager,
       );
-      void this.publish(NatsSubjects.kycStatusChanged, { userId, verificationId: row.id, provider: "admin", status, userKycStatus: userStatus });
-      return row;
+      const event: StatusChangedEvent = { userId, verificationId: row.id, provider: "admin", status, userKycStatus: userStatus };
+      return { row, event };
     });
-    return verification;
+    this.publishStatusChanges([event]);
+    return row;
   }
 
   /**
@@ -860,15 +909,10 @@ export class KycService implements KycLockLookup {
         );
       }
 
-      // The source approval no longer has a person behind it.
+      // The source account no longer has a person behind ANY of its approvals (a renewal may have
+      // approved a later attempt than the one the binding names): every standing approval expires.
       if (fromUserId !== toUserId) {
-        const source = await repo.findOne({ where: { id: anchor.verificationId } });
-        if (source && source.status === "approved") {
-          source.status = "expired";
-          source.manual = true;
-          source.manualReason = `person transferred: ${cleanReason}`;
-          await repo.save(source);
-        }
+        await repo.update({ userId: fromUserId, status: "approved" }, { status: "expired", manual: true, manualReason: `person transferred: ${cleanReason}` });
       }
 
       const toStatus = await this.refreshUserKycStatus(manager, toUserId);
@@ -895,22 +939,40 @@ export class KycService implements KycLockLookup {
       return { fromUserId, toUserId, targetId: target.id, toStatus, fromStatus };
     });
 
-    void this.publish(NatsSubjects.kycStatusChanged, {
-      userId: outcome.toUserId,
-      verificationId: outcome.targetId,
-      provider: "admin",
-      status: "approved",
-      userKycStatus: outcome.toStatus,
-    });
+    const events: StatusChangedEvent[] = [{ userId: outcome.toUserId, verificationId: outcome.targetId, provider: "admin", status: "approved", userKycStatus: outcome.toStatus }];
     if (outcome.fromUserId !== outcome.toUserId) {
-      void this.publish(NatsSubjects.kycStatusChanged, {
-        userId: outcome.fromUserId,
-        verificationId: null,
-        provider: "admin",
-        status: "expired",
-        userKycStatus: outcome.fromStatus,
-      });
+      events.push({ userId: outcome.fromUserId, verificationId: null, provider: "admin", status: "expired", userKycStatus: outcome.fromStatus });
     }
+    this.publishStatusChanges(events);
+  }
+
+  /**
+   * `POST /admin/kyc/webhooks/:id/replay`: re-publish the trigger for a stored event the durable
+   * consumer gave up on (RUNBOOK §4). Attempts are reset so the consumer's cap applies afresh;
+   * an event that was already applied is refused — replaying it would be a no-op the operator
+   * did not intend.
+   */
+  async replayWebhook(eventId: string, reason: string, actor: Actor): Promise<{ eventId: string }> {
+    const cleanReason = clipReason(reason);
+    if (!cleanReason) throw new ApiError(400, "validation_failed", "reason is required");
+    const row = await this.webhookEvents.findOne({ where: { id: eventId } });
+    if (!row) throw new ApiError(404, "not_found", "webhook event not found");
+    if (row.processedAt) throw new ApiError(409, "bad_request", "this webhook event was already processed", { processedAt: row.processedAt.toISOString() });
+    if (!row.payload) throw new ApiError(409, "bad_request", "this webhook event's payload was purged (30-day retention); it cannot be replayed");
+    await this.webhookEvents.update({ id: row.id }, { attempts: 0, error: null });
+    await this.audit.record({
+      actorType: actor.type,
+      actorUserId: actor.userId ?? null,
+      actorSessionId: actor.sessionId ?? null,
+      action: "kyc.webhook_replayed",
+      subjectType: "kyc_webhook_event",
+      subjectId: row.id,
+      metadata: { provider: row.provider, type: row.type, previousAttempts: row.attempts, reason: cleanReason },
+      ip: actor.ip ?? null,
+    });
+    const provider: KycProviderName = row.provider === "sumsub" ? "sumsub" : "mock";
+    await this.publishWebhookTrigger(provider, row.id, `${row.eventKey}:replay:${Date.now()}`);
+    return { eventId: row.id };
   }
 
   // ─────────────────────────────────────────────── housekeeping ───────────────────────────────
@@ -923,35 +985,29 @@ export class KycService implements KycLockLookup {
   }
 
   /**
-   * §9.6 boot hook: record `sha256(KYC_FINGERPRINT_PEPPER)` on first boot, refuse a silent
-   * rotation afterwards (throws), accept an acknowledged one. AppService may delegate here.
+   * Unprocessed rows the sweep may re-publish: those under the attempt cap whose trigger never
+   * made it onto the bus, plus rows the consumer exhausted whose last attempt is older than
+   * `retryCooldownMs` — their attempts are reset so a long provider outage parks an approval for
+   * a cooldown, never forever.
    */
-  async checkPepperSetting(): Promise<"initialised" | "ok" | "rotated"> {
-    const repo = this.dataSource.getRepository(SettingEntity);
-    const expected = this.config.kycPepperHash;
-    const row = await repo.findOne({ where: { key: SETTING_KYC_PEPPER_HASH } });
-    if (!row) {
-      await repo.insert({ key: SETTING_KYC_PEPPER_HASH, value: expected });
-      return "initialised";
-    }
-    if (row.value === expected) return "ok";
-    if (this.config.kycPepperRotationAck === expected) {
-      await repo.update({ key: SETTING_KYC_PEPPER_HASH }, { value: expected });
-      this.logger.warn("KYC_FINGERPRINT_PEPPER rotated: existing to_kyc_persons rows carry the old pepper (docs/KYC.md runbook)");
-      return "rotated";
-    }
-    throw new Error(
-      "Refusing to boot: KYC_FINGERPRINT_PEPPER does not match to_settings.kyc_pepper_hash. Set KYC_PEPPER_ROTATION_ACK=<sha256 hex of the new pepper> to acknowledge a rotation (docs/KYC.md).",
-    );
-  }
-
-  /** Unprocessed rows the sweep may re-publish (attempt cap applied by the caller). */
-  async unprocessedWebhookEvents(olderThanMs: number, maxAttempts: number): Promise<KycWebhookEventEntity[]> {
-    return this.webhookEvents.find({
-      where: { processedAt: IsNull(), receivedAt: LessThan(new Date(Date.now() - olderThanMs)), attempts: LessThan(maxAttempts) },
+  async unprocessedWebhookEvents(olderThanMs: number, maxAttempts: number, retryCooldownMs: number): Promise<KycWebhookEventEntity[]> {
+    const receivedBefore = new Date(Date.now() - olderThanMs);
+    const fresh = await this.webhookEvents.find({
+      where: { processedAt: IsNull(), receivedAt: LessThan(receivedBefore), attempts: LessThan(maxAttempts) },
       order: { receivedAt: "ASC" },
       take: 200,
     });
+    const exhausted = await this.webhookEvents.find({
+      where: { processedAt: IsNull(), payload: Not(IsNull()), attempts: MoreThanOrEqual(maxAttempts), lastAttemptAt: LessThan(new Date(Date.now() - retryCooldownMs)) },
+      order: { receivedAt: "ASC" },
+      take: 50,
+    });
+    for (const row of exhausted) {
+      this.logger.warn(`webhook event ${row.id}: re-arming after ${row.attempts} failed attempts (last error: ${row.error ?? "?"})`);
+      await this.webhookEvents.update({ id: row.id }, { attempts: 0 });
+      row.attempts = 0;
+    }
+    return [...fresh, ...exhausted];
   }
 
   // ─────────────────────────────────────────────── internals ──────────────────────────────────
@@ -970,13 +1026,14 @@ export class KycService implements KycLockLookup {
     return status;
   }
 
+  /** Writes the audit rows inside the caller's transaction and RETURNS the event to publish after commit. */
   private async recordStatusChange(
     manager: EntityManager,
     userId: string,
     verification: KycVerificationEntity,
     actor: Actor,
     collisions?: Collision[],
-  ): Promise<void> {
+  ): Promise<StatusChangedEvent> {
     const userStatus = await this.refreshUserKycStatus(manager, userId);
     const metadata = {
       verificationId: verification.id,
@@ -1004,23 +1061,15 @@ export class KycService implements KycLockLookup {
         },
         manager,
       );
-      void this.publish(NatsSubjects.kycDuplicateDetected, { userId, verificationId: verification.id, provider: verification.provider });
     }
-    void this.publish(NatsSubjects.kycStatusChanged, {
+    return {
       userId,
       verificationId: verification.id,
       provider: verification.provider,
       status: verification.status,
       userKycStatus: userStatus,
-    });
-  }
-
-  private async publish(subject: `truthoracle.${string}`, payload: object): Promise<void> {
-    try {
-      await this.nats.publish(subject, payload);
-    } catch (err) {
-      this.logger.warn(`publish ${subject} failed: ${(err as Error).message}`);
-    }
+      duplicate: verification.status === "blocked_duplicate",
+    };
   }
 }
 
@@ -1037,7 +1086,7 @@ function duplicateIdentityError(): ApiError {
 }
 
 function clipReason(reason: string): string {
-  return typeof reason === "string" ? reason.trim().slice(0, REASON_MAX) : "";
+  return typeof reason === "string" ? reason.trim().slice(0, REASON_MAX_LENGTH) : "";
 }
 
 async function lockUser(manager: EntityManager, userId: string): Promise<UserEntity> {

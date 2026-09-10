@@ -76,25 +76,12 @@ export function cmpCC(a: bigint, b: bigint): -1 | 0 | 1 {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-export function maxCC(a: bigint, b: bigint): bigint {
-  return a > b ? a : b;
-}
-
-export function minCC(a: bigint, b: bigint): bigint {
-  return a < b ? a : b;
-}
-
 export function absCC(a: bigint): bigint {
   return a < 0n ? -a : a;
 }
 
 export function isDust(a: bigint): boolean {
   return absCC(a) <= DUST;
-}
-
-/** A JS number (only ever from legacy code paths) rounded to 10 decimals in fixed point. */
-export function round10FromNumber(n: number): bigint {
-  return parseCC(n);
 }
 
 /** Sum a list in fixed point. */

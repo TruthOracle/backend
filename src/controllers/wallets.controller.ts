@@ -1,15 +1,13 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Post, Req } from "@nestjs/common";
-import { ApiTags } from "@nestjs/swagger";
+import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
 import { LinkChallengeDto, LinkWalletDto } from "../dto/wallets.dto";
-import type { WalletEntity } from "../entities/wallet.entity";
 import { IdentityService } from "../services/identity.service";
-import { LedgerClientService } from "../services/ledger-client.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { WalletChallengeService } from "../services/wallet-challenge.service";
 import { WalletLinkService } from "../services/wallet-link.service";
-import type { ApiChallenge, ApiIdentity, ApiMoney, ApiWallet, LedgerWallet } from "../types";
+import type { ApiChallenge, ApiIdentity, ApiMoney, ApiWallet } from "../types";
 import { formatCC } from "../util/money";
 
 /**
@@ -19,13 +17,14 @@ import { formatCC } from "../util/money";
  * with `POST /auth/wallet` in link mode.
  */
 @ApiTags("wallets")
+@ApiCookieAuth("to_session")
+@ApiBearerAuth()
 @Controller("wallets")
 export class WalletsController {
   constructor(
     private readonly walletLinks: WalletLinkService,
     private readonly identities: IdentityService,
     private readonly challenges: WalletChallengeService,
-    private readonly ledger: LedgerClientService,
     private readonly rateLimit: RateLimitService,
   ) {}
 
@@ -34,16 +33,16 @@ export class WalletsController {
   async list(@Req() req: AuthedRequest): Promise<{ wallets: ApiWallet[] }> {
     const { user } = principalOf(req);
     const rows = await this.walletLinks.listForUser(user.id);
-    const own = await this.ownLedgerWallets(rows, user.partyId);
+    const own = await this.walletLinks.ownLedgerWallets(rows, user.partyId);
     return { wallets: rows.map((w) => this.walletLinks.toApi(w, { ownLedgerWallet: own.get(w.id) ?? null })) };
   }
 
-  /** Rate limits: challenge 30/min/IP + 10/min/party (§13). */
+  /** Rate limits: challenge 30/min/IP + 10/min per (IP, party) — the party alone is public and must not be spendable by strangers (§13). */
   @Post("link-challenge")
   @HttpCode(200)
   async linkChallenge(@Body() body: LinkChallengeDto, @Req() req: AuthedRequest): Promise<ApiChallenge> {
     const { session } = principalOf(req);
-    await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: body.partyId });
+    await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: `${req.clientIp ?? "unknown"}:${body.partyId}` });
     return this.challenges.issue({ partyId: body.partyId, purpose: "link-wallet", sessionId: session.id, host: req.requestHost ?? "" });
   }
 
@@ -97,19 +96,5 @@ export class WalletsController {
     const { user } = principalOf(req);
     const wallet = await this.walletLinks.setPrimary(user.id, id, actorOf(req));
     return { wallet: this.walletLinks.toApi(wallet) };
-  }
-
-  /** §8.1: a NON-primary party's own on-ledger UserWallet; one ledger read serves every row. */
-  private async ownLedgerWallets(wallets: WalletEntity[], primaryPartyId: string | null): Promise<Map<string, LedgerWallet | null>> {
-    const out = new Map<string, LedgerWallet | null>();
-    if (wallets.length === 0) return out;
-    let byOwner = new Map<string, LedgerWallet>();
-    try {
-      byOwner = new Map((await this.ledger.fetchAllUserWallets()).map((w) => [w.owner, w]));
-    } catch {
-      // A degraded ledger read must not hide the wallet list; ownLedgerWallet is then null.
-    }
-    for (const w of wallets) out.set(w.id, w.partyId === primaryPartyId ? null : (byOwner.get(w.partyId) ?? null));
-    return out;
   }
 }

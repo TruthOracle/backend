@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import { type JWTPayload, type JWTVerifyGetKey, jwtVerify } from "jose";
 
@@ -8,6 +8,7 @@ import type { ErrorCode, IdentityClaim } from "../types";
 import { oidcCookie } from "../util/cookies";
 import { ApiError } from "../util/errors";
 import { getRemoteJwks } from "../util/jwks";
+import { timingSafeStringEqual } from "../util/strings";
 import { type TelegramUser, verifyLoginWidget, verifyMiniAppInitData } from "../util/telegram";
 import { HOUR_MS, MINUTE_MS } from "../util/time";
 import { RedisService } from "./redis.service";
@@ -76,12 +77,6 @@ const RETURN_TO_RE = /^\/(?!\/)/;
 
 function sha256b64url(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("base64url");
-}
-
-function stringsEqual(a: string, b: string): boolean {
-  const x = Buffer.from(a, "utf8");
-  const y = Buffer.from(b, "utf8");
-  return x.length === y.length && timingSafeEqual(x, y);
 }
 
 function isHttpsUrl(value: unknown): value is string {
@@ -231,10 +226,9 @@ export class TelegramAuthService {
     const state = String(input.state ?? "").trim();
     if (!TOKEN_RE.test(state)) throw new OidcCallbackError(401, "oidc_failed", "state is missing or malformed", null);
 
-    // Consume first: the state is spent whatever happens next.
-    const key = `oidc:state:${state}`;
-    const record = await this.redis.getJson<OidcStateRecord>(key);
-    await this.redis.del(key);
+    // Consume first — atomically: two callbacks presenting the same state race on one GETDEL, so
+    // exactly one of them ever sees the record.
+    const record = await this.redis.takeJson<OidcStateRecord>(`oidc:state:${state}`);
     if (!record) throw new OidcCallbackError(401, "oidc_failed", "state unknown, expired or already used", null);
     if (!this.hostAllowed(record.proto, record.host)) {
       throw new OidcCallbackError(401, "oidc_failed", "the stored app host is no longer an allowed origin", null);
@@ -242,7 +236,7 @@ export class TelegramAuthService {
     const target: OidcRedirectTarget = { host: record.host, proto: record.proto, returnTo: record.returnTo };
 
     const cookieValue = String(input.cookieValue ?? "").trim();
-    if (!TOKEN_RE.test(cookieValue) || !stringsEqual(sha256b64url(cookieValue), record.cookieHash)) {
+    if (!TOKEN_RE.test(cookieValue) || !timingSafeStringEqual(sha256b64url(cookieValue), record.cookieHash)) {
       throw new OidcCallbackError(401, "oidc_failed", "this browser did not start the sign-in", target);
     }
     if (input.providerError) {
@@ -290,7 +284,7 @@ export class TelegramAuthService {
       this.logger.warn(`telegram id_token rejected: ${err instanceof Error ? err.name : "error"}`);
       throw new OidcCallbackError(401, "oidc_failed", "telegram id_token could not be verified", target);
     }
-    if (typeof payload.nonce !== "string" || !stringsEqual(payload.nonce, record.nonce)) {
+    if (typeof payload.nonce !== "string" || !timingSafeStringEqual(payload.nonce, record.nonce)) {
       throw new OidcCallbackError(401, "oidc_failed", "telegram id_token nonce does not match", target);
     }
     // Fail closed: without a numeric Telegram user id there is no identity to resolve.

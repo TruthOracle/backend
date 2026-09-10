@@ -12,9 +12,11 @@ export const DEPOSIT_CONFIRM_LOCK_TTL_MS = 5 * 60_000;
 /**
  * Periodic confirm pass over `to_deposit_credits` rows still `submitted` (ARCHITECTURE §8.3 step
  * 1): a reconcile that crashed between submit and confirm — or whose immediate confirm saw the
- * command still in flight — is repaired here instead of crediting twice. Started in
- * `onApplicationBootstrap` (Redis is connected by then); the timer is unref'd so it never keeps
- * a process alive; a Redis lock keeps multiple instances from sweeping together.
+ * command still in flight — is repaired here instead of crediting twice. Runs once at boot
+ * (rows a crashed instance left behind are picked up right away, not 60 s later) and then every
+ * DEPOSIT_CONFIRM_INTERVAL_MS. Started in `onApplicationBootstrap` (Redis is connected by then);
+ * the timer is unref'd so it never keeps a process alive; a Redis lock keeps multiple instances
+ * from sweeping together.
  */
 @Injectable()
 export class DepositConfirmProcessor implements OnApplicationBootstrap, OnModuleDestroy {
@@ -28,9 +30,10 @@ export class DepositConfirmProcessor implements OnApplicationBootstrap, OnModule
     private readonly sentry: SentryService,
   ) {}
 
-  onApplicationBootstrap(): void {
+  async onApplicationBootstrap(): Promise<void> {
     this.timer = setInterval(() => void this.tick(), DEPOSIT_CONFIRM_INTERVAL_MS);
     this.timer.unref();
+    await this.tick();
   }
 
   onModuleDestroy(): void {

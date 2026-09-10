@@ -1,10 +1,11 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import { OAuth2Client, type TokenPayload } from "google-auth-library";
 
 import { Config } from "../config";
 import type { IdentityClaim } from "../types";
 import { ApiError } from "../util/errors";
+import { timingSafeStringEqual } from "../util/strings";
 import { MINUTE_MS } from "../util/time";
 import { RedisService } from "./redis.service";
 
@@ -14,12 +15,6 @@ const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
 function nonceKey(nonce: string): string {
   return createHash("sha256").update(nonce, "utf8").digest("base64url");
-}
-
-function stringsEqual(a: string, b: string): boolean {
-  const x = Buffer.from(a, "utf8");
-  const y = Buffer.from(b, "utf8");
-  return x.length === y.length && timingSafeEqual(x, y);
 }
 
 /** Never echo a token-looking run into the log, whatever google-auth-library put in its message. */
@@ -37,8 +32,8 @@ function safeMessage(err: unknown): string {
 @Injectable()
 export class GoogleAuthService {
   private readonly logger = new Logger(GoogleAuthService.name);
-  /** Audience is passed per call, so one client serves every configured client id. */
-  private readonly client = new OAuth2Client();
+  /** Audience is passed per call, so one client serves every configured client id. The cert fetch gets a deadline too. */
+  private readonly client = new OAuth2Client({ transporterOptions: { timeout: 10_000 } });
 
   constructor(
     private readonly config: Config,
@@ -87,7 +82,7 @@ export class GoogleAuthService {
     if (payload.email_verified !== true) {
       throw new ApiError(401, "invalid_credential", "google account email is not verified");
     }
-    if (presented && (typeof payload.nonce !== "string" || !stringsEqual(payload.nonce, presented))) {
+    if (presented && (typeof payload.nonce !== "string" || !timingSafeStringEqual(payload.nonce, presented))) {
       throw new ApiError(401, "invalid_credential", "google credential nonce does not match");
     }
 

@@ -1,5 +1,5 @@
 import { Controller, Get, HttpCode, Post, Req } from "@nestjs/common";
-import { ApiTags } from "@nestjs/swagger";
+import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
 import { DepositService } from "../services/deposit.service";
@@ -12,6 +12,8 @@ import type { InAppWalletOverview, ReconcileResult } from "../types";
  * and the ledger. Payout routes live in PayoutsController (`in-app-wallet/payouts`).
  */
 @ApiTags("in-app-wallet")
+@ApiCookieAuth("to_session")
+@ApiBearerAuth()
 @Controller("in-app-wallet")
 export class InAppWalletController {
   constructor(

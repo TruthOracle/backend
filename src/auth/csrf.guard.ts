@@ -47,15 +47,10 @@ export class CsrfGuard implements CanActivate {
     return true;
   }
 
+  /** The request's own origin (scheme AND host from the proxy contract) or an allowed frontend origin. */
   private originAllowed(origin: string, req: AuthedRequest): boolean {
     const host = (req.requestHost ?? "").toLowerCase();
-    if (host) {
-      try {
-        if (new URL(origin).host === host) return true;
-      } catch {
-        // fall through
-      }
-    }
+    if (host && origin === `${req.requestProto ?? "https"}://${host}`) return true;
     return this.config.frontendOrigins.some((pattern) => originMatchesPattern(origin, pattern));
   }
 }

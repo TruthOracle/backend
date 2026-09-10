@@ -32,12 +32,21 @@ import { RedisService } from "../src/services/redis.service";
 import type { ApiChallenge, ApiIdentity, ApiLoginResult, ApiMe, ApiSession, ApiSessionState, ChallengePurpose } from "../src/types";
 import { SESSION_COOKIE } from "../src/util/cookies";
 import type { ErrorBody } from "../src/util/errors";
+import { signMiniAppInitData } from "../src/util/telegram";
 import { TEST_ORIGIN, useTestApp } from "./helpers/app";
 import { bodyOf, cookieFromResponse, signInWithWallet } from "./helpers/session";
 import { makeTestWallet, type TestWallet } from "./helpers/wallet";
 
 const operator = makeTestWallet("operator");
 const GOOGLE_CLIENT_ID = "e2e-client.apps.googleusercontent.com";
+/** Lets a test present a client IP through the proxy contract (§4.1): `x-truthoracle-proxy` + `x-real-ip`. */
+const PROXY_SECRET = "e2e-proxy-secret-that-is-at-least-32-chars-long";
+const OIDC_DISCOVERY = {
+  issuer: "https://oauth.telegram.org",
+  authorization_endpoint: "https://oauth.telegram.org/auth",
+  token_endpoint: "https://oauth.telegram.org/token",
+  jwks_uri: "https://oauth.telegram.org/.well-known/jwks.json",
+};
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const CHALLENGE_URL = "/api/v1/auth/wallet/challenge";
@@ -89,6 +98,9 @@ describe("auth (e2e)", () => {
       GOOGLE_CLIENT_IDS: GOOGLE_CLIENT_ID,
       // Production default outside dev (§7.1): the nonce is mandatory.
       GOOGLE_NONCE_REQUIRED: "true",
+      BACKEND_PROXY_SECRET: PROXY_SECRET,
+      TELEGRAM_OIDC_CLIENT_ID: "e2e-oidc-client",
+      TELEGRAM_OIDC_CLIENT_SECRET: "e2e-oidc-secret",
     },
     configure: (b) =>
       b.overrideProvider(GoogleAuthService).useFactory({
@@ -130,6 +142,9 @@ describe("auth (e2e)", () => {
     if (cookie) req.set("Cookie", cookie);
     return req.send(body);
   }
+
+  /** Headers that make the backend see `ip` as the client (the relay's contract, secret + x-real-ip). */
+  const fromIp = (ip: string): Record<string, string> => ({ ...CSRF, "x-truthoracle-proxy": PROXY_SECRET, "x-real-ip": ip, "x-forwarded-host": "app.test", "x-forwarded-proto": "http" });
 
   /** The house helper over a fresh (empty-jar) agent so its cookie handling stays explicit. */
   const signIn = (wallet: TestWallet, purpose: ChallengePurpose = "sign-in", opts: { client?: "web" | "native"; cookie?: string } = {}) =>
@@ -489,10 +504,13 @@ describe("auth (e2e)", () => {
       expect(await auditRows("auth.login")).toHaveLength(1);
     });
 
-    it("a non-operator party cannot obtain an admin-sign-in challenge (403 forbidden); admin-sign-in never runs in link mode", async () => {
+    it("a non-operator party is refused admin-sign-in at verify time (403 forbidden), never at issue time; admin-sign-in never runs in link mode", async () => {
+      // Issue answers 200 for any well-formed party: the operator list is not an anonymous 403-vs-200 oracle.
       const nobody = makeTestWallet("nobody");
-      const res = await http().post(CHALLENGE_URL).set(CSRF).send({ partyId: nobody.partyId, purpose: "admin-sign-in" }).expect(403);
+      const challenge = await issueChallenge(nobody, "admin-sign-in");
+      const res = await postWallet(proof(nobody, challenge)).expect(403);
       expect(errorOf(res).error).toBe("forbidden");
+      expect(sessionCookieOf(res)).toBeUndefined();
       expect(await repo(UserEntity).count()).toBe(0);
 
       const { cookie } = await signIn(operator, "sign-in");
@@ -733,13 +751,91 @@ describe("auth (e2e)", () => {
       expect(limited.headers["cache-control"]).toBe("no-store");
     });
 
-    it("more than 5 login attempts per minute for one subject → 429 even under the IP limit", async () => {
+    it("more than 5 VERIFIED sign-ins per minute for one wallet → 429, even from different IPs and under every IP limit", async () => {
       const w = makeTestWallet("hammered");
-      const attempt = () => postWallet({ challengeId: randomUUID(), partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign("nope"), kind: "cantor8" });
-      for (let i = 0; i < 5; i += 1) expect((await attempt()).status).toBe(401);
-      const limited = await attempt().expect(429);
+      const attempt = async (ip: string) => {
+        const challenge = bodyOf<ApiChallenge>(await http().post(CHALLENGE_URL).set(fromIp(ip)).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200));
+        return http().post(WALLET_URL).set(fromIp(ip)).send(proof(w, challenge));
+      };
+      for (let i = 0; i < 5; i += 1) expect((await attempt(`10.9.0.${i + 1}`)).status).toBe(200);
+      const limited = await attempt("10.9.0.99");
+      expect(limited.status).toBe(429);
       expect(errorOf(limited)).toMatchObject({ error: "rate_limited", details: { scope: "login" } });
       expect(Number(limited.headers["retry-after"])).toBeGreaterThanOrEqual(1);
+    });
+
+    it("junk sign-in attempts naming a party never spend that party's quota: 10 from IP A, then the real owner signs in from IP B", async () => {
+      // The party id is public (it is on the ledger); before this fix five junk posts kept its owner — an
+      // ADMIN_OPERATORS party included — at 429 for as long as the attacker cared to continue.
+      const victim = operator;
+      const junk = () => http().post(WALLET_URL).set(fromIp("203.0.113.66")).send({ challengeId: randomUUID(), partyId: victim.partyId, publicKey: victim.publicKeyBase64, signature: victim.sign("junk"), kind: "cantor8" });
+      for (let i = 0; i < 10; i += 1) {
+        const res = await junk();
+        expect(res.status).toBe(401);
+        expect(errorOf(res).error).toBe("challenge_rejected");
+      }
+      // The attacker's own IP is now exhausted …
+      expect((await junk()).status).toBe(429);
+      // … the victim's party is not: challenge and admin sign-in from another IP succeed.
+      const challenge = bodyOf<ApiChallenge>(await http().post(CHALLENGE_URL).set(fromIp("198.51.100.7")).send({ partyId: victim.partyId, purpose: "admin-sign-in" }).expect(200));
+      const login = await http().post(WALLET_URL).set(fromIp("198.51.100.7")).send(proof(victim, challenge)).expect(200);
+      expect(bodyOf<ApiLoginResult>(login).kind).toBe("admin");
+    });
+
+    it("the per-party challenge limit is keyed by (IP, party): 10 challenges for a party from IP A leave IP B's quota for that party untouched", async () => {
+      const w = makeTestWallet("challenged");
+      for (let i = 0; i < 10; i += 1) await http().post(CHALLENGE_URL).set(fromIp("203.0.113.1")).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200);
+      const limited = await http().post(CHALLENGE_URL).set(fromIp("203.0.113.1")).send({ partyId: w.partyId, purpose: "sign-in" }).expect(429);
+      expect(errorOf(limited).details).toMatchObject({ scope: "challenge" });
+      await http().post(CHALLENGE_URL).set(fromIp("203.0.113.2")).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200);
+    });
+  });
+
+  // ────────────────────────────────── Telegram Mini App + OIDC start ───────────────────────────
+  describe("Telegram Mini App and OIDC start (§7.2)", () => {
+    it("POST /auth/telegram/miniapp signs in with subject = the numeric id inside initData; a replay is 401", async () => {
+      const botToken = ctx.config.telegramBotToken;
+      const now = Math.floor(Date.now() / 1000);
+      const initData = signMiniAppInitData(
+        { query_id: "AAHdF6IQAAAAAN0XohDhrOrc", user: JSON.stringify({ id: 424242, first_name: "Mini", last_name: "App", username: "mini_app" }), auth_date: String(now) },
+        botToken,
+      );
+      const login = await http().post("/api/v1/auth/telegram/miniapp").set(CSRF).send({ initData }).expect(200);
+      const result = bodyOf<ApiLoginResult>(login);
+      expect(result).toMatchObject({ mode: "login", kind: "user", created: true });
+      expect(result.identity).toMatchObject({ provider: "telegram", subject: "424242", profile: { name: "Mini App", username: "mini_app" } });
+      expect(sessionCookieOf(login)).toBeDefined();
+      const replay = await http().post("/api/v1/auth/telegram/miniapp").set(CSRF).send({ initData }).expect(401);
+      expect(errorOf(replay).error).toBe("invalid_credential");
+      // The same Telegram user through the widget lands on the same account (§7.2 "one identity").
+      const widget = signTelegramWidget({ id: "424242", first_name: "Mini", auth_date: String(now) }, botToken);
+      expect(bodyOf<ApiLoginResult>(await http().post("/api/v1/auth/telegram/widget").set(CSRF).send(widget).expect(200)).user.id).toBe(result.user.id);
+    });
+
+    it("GET /auth/telegram/oidc/start → 302 to the authorization endpoint with PKCE + nonce + state, and the to_oidc cookie", async () => {
+      // The discovery document is served from the Redis cache the service consults first — no network in tests.
+      await ctx.redis.setJson("oidc:telegram:discovery", OIDC_DISCOVERY, 60_000);
+      const res = await http().get("/api/v1/auth/telegram/oidc/start?returnTo=/account").set("Origin", TEST_ORIGIN).set("Host", "app.test").expect(302);
+      const location = new URL(res.headers.location);
+      expect(`${location.origin}${location.pathname}`).toBe(OIDC_DISCOVERY.authorization_endpoint);
+      expect(location.searchParams.get("response_type")).toBe("code");
+      expect(location.searchParams.get("client_id")).toBe("e2e-oidc-client");
+      expect(location.searchParams.get("redirect_uri")).toBe("http://app.test/__backend/api/v1/auth/telegram/oidc/callback");
+      expect(location.searchParams.get("code_challenge_method")).toBe("S256");
+      expect(location.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(location.searchParams.get("nonce")).toMatch(/^[0-9a-f]{32}$/);
+      const state = location.searchParams.get("state") ?? "";
+      expect(state).toMatch(/^[A-Za-z0-9_-]{32}$/);
+      const cookie = setCookies(res).find((c) => c.startsWith("to_oidc="));
+      expect(cookie).toMatch(/;\s*HttpOnly(;|$)/i);
+      expect(cookie).toMatch(/;\s*SameSite=Lax(;|$)/i);
+      expect(await ctx.redis.getJson(`oidc:state:${state}`)).toMatchObject({ mode: "login", returnTo: "/account", host: "app.test", proto: "http" });
+      // A host outside FRONTEND_ORIGINS is refused before any state is stored.
+      const bad = await http().get("/api/v1/auth/telegram/oidc/start").set("Host", "evil.test").expect(400);
+      expect(errorOf(bad).error).toBe("validation_failed");
+      // An unknown / replayed state at the callback has nothing to redirect to: the JSON envelope, 401.
+      const cb = await http().get(`/api/v1/auth/telegram/oidc/callback?code=x&state=${"a".repeat(32)}`).expect(401);
+      expect(errorOf(cb).error).toBe("oidc_failed");
     });
   });
 });

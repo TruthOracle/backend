@@ -20,15 +20,14 @@ import type {
   ApiUser,
   ApiWallet,
   IdentityProvider,
-  KycProviderName,
   KycVerificationStatus,
   PayoutStatus,
 } from "../types";
 import { ApiError, errors } from "../util/errors";
-import { toIso } from "../util/time";
+import { isUuid } from "../util/strings";
 import { AuditService } from "./audit.service";
 import { IdentityService } from "./identity.service";
-import { KycService } from "./kyc.service";
+import { KycService, verificationToApi } from "./kyc.service";
 import { LedgerClientService } from "./ledger-client.service";
 import { PayoutService } from "./payout.service";
 import { SessionService } from "./session.service";
@@ -67,7 +66,6 @@ export interface AdminAuditFilter {
 const MAX_PAGE_LIMIT = 100;
 /** Queue listings are unpaged in the API; newest first, capped so a runaway queue cannot flood the UI. */
 const KYC_QUEUE_LIMIT = 200;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Operator API composition (docs/ARCHITECTURE.md §1.5, §11; docs/API.md "Admin"). Every
@@ -106,7 +104,7 @@ export class AdminService {
     const term = (q ?? "").trim();
 
     const qb = this.userRepo.createQueryBuilder("u");
-    if (UUID_RE.test(term)) {
+    if (isUuid(term)) {
       qb.where("u.id = :id", { id: term });
     } else if (term) {
       const like = `%${escapeLike(term)}%`;
@@ -148,13 +146,8 @@ export class AdminService {
       ]);
 
     // A non-primary party may own its own on-ledger UserWallet (§8.1); the primary's IS the in-app wallet.
-    const wallets = await Promise.all(
-      walletRows.map(async (w) =>
-        this.walletLinks.toApi(w, {
-          ownLedgerWallet: w.isPrimary ? null : await this.ledger.fetchUserWallet(w.partyId),
-        }),
-      ),
-    );
+    const own = await this.walletLinks.ownLedgerWallets(walletRows, user.partyId);
+    const wallets = walletRows.map((w) => this.walletLinks.toApi(w, { ownLedgerWallet: own.get(w.id) ?? null }));
 
     const providerOf = new Map<string, IdentityProvider>(identities.map((i) => [i.id, i.provider]));
     const sessions = await Promise.all(
@@ -306,6 +299,12 @@ export class AdminService {
     return { ok: true };
   }
 
+  /** `POST /admin/kyc/webhooks/:id/replay { reason }` — re-publish a stored event's trigger (RUNBOOK §4). */
+  async replayWebhook(eventId: string, reason: string, actor: AdminActor): Promise<{ ok: true; eventId: string }> {
+    const { eventId: id } = await this.kyc.replayWebhook(eventId, reason, actor);
+    return { ok: true, eventId: id };
+  }
+
   // ─────────────────────────────────────────── payouts ─────────────────────────────────────────
 
   /** `GET /admin/payouts?status=` — the durable `to_payouts` rows, with the live ledger view. */
@@ -402,20 +401,8 @@ export class AdminService {
   }
 }
 
-/** Wire shape of a verification (docs/API.md `KycVerification`); never includes applicant data. */
-export function verificationToApi(v: KycVerificationEntity): ApiKycVerification {
-  return {
-    id: v.id,
-    provider: v.provider as KycProviderName | "admin",
-    levelName: v.levelName,
-    attemptNo: v.attemptNo,
-    status: v.status,
-    rejectLabels: Array.isArray(v.rejectLabels) ? v.rejectLabels : [],
-    moderationComment: v.moderationComment,
-    reviewedAt: toIso(v.reviewedAt),
-    createdAt: v.createdAt.toISOString(),
-  };
-}
+/** Re-exported so the admin surface and its tests keep one verification mapper (owned by KycService). */
+export { verificationToApi };
 
 function normalisePage(page: number): number {
   return Number.isFinite(page) && page >= 1 ? Math.floor(page) : 1;
