@@ -87,10 +87,16 @@ export type Money = bigint;
 
 export type UserStatus = "active" | "suspended" | "closed";
 export type UserKycStatus = "none" | "pending" | "approved" | "rejected" | "blocked_duplicate";
+/**
+ * Sign-in providers. Only `google` and `telegram` open or resolve USER accounts (§6.1). A
+ * `canton_wallet` identity exists only for operators: `POST /auth/admin` (purpose
+ * `admin-sign-in`) creates it and AdminGuard checks it against ADMIN_OPERATORS (§6.8). A user's
+ * Cantor8 wallet is a `to_wallets` row linked to the account — never an identity (§8.1).
+ */
 export type IdentityProvider = "google" | "telegram" | "canton_wallet";
 export type IdentityStatus = "active" | "unlinked";
 export type SessionKind = "user" | "admin";
-export type ChallengePurpose = "sign-in" | "link-wallet" | "admin-sign-in";
+export type ChallengePurpose = "link-wallet" | "admin-sign-in";
 export type WalletKind = "cantor8" | "loop" | "other";
 export type WalletStatus = "active" | "revoked";
 export const WALLET_KIND_ALLOWLIST: readonly WalletKind[] = ["cantor8"];
@@ -310,7 +316,8 @@ export interface ApiIdentity {
   provider: IdentityProvider;
   subject: string;
   email: string | null;
-  profile: { name?: string; username?: string; picture?: string; hd?: string };
+  /** `publicKey` (base64 raw Ed25519) only on an operator's `canton_wallet` identity — the key AdminGuard re-checks against the pin (§6.8). */
+  profile: { name?: string; username?: string; picture?: string; hd?: string; publicKey?: string };
   status: IdentityStatus;
   verifiedAt: string;
   lastUsedAt: string | null;
@@ -396,7 +403,7 @@ export const PAYOUT_STATUSES = [
 ] as const;
 export type PayoutStatus = (typeof PAYOUT_STATUSES)[number];
 
-export const CHALLENGE_PURPOSES: readonly ChallengePurpose[] = ["sign-in", "link-wallet", "admin-sign-in"];
+export const CHALLENGE_PURPOSES: readonly ChallengePurpose[] = ["link-wallet", "admin-sign-in"];
 
 export interface ApiPayout {
   pendingPayoutCid: string;

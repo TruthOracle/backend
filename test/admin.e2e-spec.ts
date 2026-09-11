@@ -29,7 +29,8 @@ import type { ApiAuditEvent, ApiIdentity, ApiKycVerification, ApiLoginResult, Ap
 import type { ErrorBody } from "../src/util/errors";
 import { parseCC } from "../src/util/money";
 import { useTestApp } from "./helpers/app";
-import { bodyOf, issueSessionDirect, signInAsAdmin, signInWithWallet } from "./helpers/session";
+import { bodyOf, issueSessionDirect, linkWallet, signInAsAdmin } from "./helpers/session";
+import { nextTelegramUser, signInWithTelegram } from "./helpers/telegram";
 import { makeTestWallet } from "./helpers/wallet";
 
 const operator = makeTestWallet("operator");
@@ -52,7 +53,7 @@ describe("Admin API (e2e)", () => {
   /** Jar-less client: cookies are only ever what a test sets. */
   const http = (): request.Agent => request(ctx.app.getHttpServer() as Server);
 
-  /** The real flow: `POST /auth/wallet/challenge` (purpose admin-sign-in, party in ADMIN_OPERATORS) → sign → `POST /auth/wallet`. */
+  /** The real flow: `POST /auth/admin/challenge` (party in ADMIN_OPERATORS) → sign → `POST /auth/admin` (§7.4). */
   async function adminSignIn(): Promise<{ cookie: string; userId: string }> {
     const { cookie, user, result } = await signInAsAdmin(http(), operator);
     expect(result.kind).toBe("admin");
@@ -67,10 +68,11 @@ describe("Admin API (e2e)", () => {
   const verifications = () => ctx.dataSource.getRepository(KycVerificationEntity);
   const fp = (canonical: string): string => fingerprintOf(ctx.config.kycFingerprintPepper, canonical);
 
-  /** A fresh user account signed in through the real wallet flow (its wallet is the primary). */
+  /** A fresh user account opened by Telegram (§6.1) with `hint`'s wallet linked as its primary (§8.1); `identityId` is the Telegram identity. */
   async function newUser(hint: string): Promise<{ cookie: string; user: ApiUser; wallet: ReturnType<typeof makeTestWallet>; identityId: string }> {
     const wallet = makeTestWallet(hint);
-    const { cookie, user, result } = await signInWithWallet(http(), wallet);
+    const { cookie, user, result } = await signInWithTelegram(http(), nextTelegramUser(hint));
+    await linkWallet(http(), cookie, wallet);
     return { cookie, user, wallet, identityId: result.identity.id };
   }
 
@@ -200,9 +202,8 @@ describe("Admin API (e2e)", () => {
       const target = await issueSessionDirect(ctx, primary);
       const google = await identities.resolveForLogin({ provider: "google", subject: "g-detail", email: "d@example.com", profile: { name: "Dee" } }, { currentUser: target.user });
 
-      // A second, non-primary wallet that owns its own on-ledger UserWallet (§8.1).
+      // A second, non-primary wallet that owns its own on-ledger UserWallet (§8.1) — a row, never an identity.
       const secondary = makeTestWallet("second");
-      await identities.resolveForLogin({ provider: "canton_wallet", subject: secondary.partyId }, { currentUser: target.user });
       const wallets = ctx.dataSource.getRepository(WalletEntity);
       await wallets.save(
         wallets.create({ userId: target.user.id, chain: "canton", kind: "cantor8", partyId: secondary.partyId, publicKey: secondary.publicKeyBase64, label: "cold", isPrimary: false, status: "active", creditedCC: parseCC("1.5"), verifiedAt: new Date(), revokedAt: null }),
@@ -224,12 +225,11 @@ describe("Admin API (e2e)", () => {
       expect(detail.user).toMatchObject({ id: target.user.id, status: "active", kycStatus: "approved", partyId: primary.partyId });
       expect(detail.identities.map((i) => [i.provider, i.status, i.kycLocked])).toEqual(
         expect.arrayContaining([
-          ["canton_wallet", "active", false],
+          ["telegram", "active", false],
           ["google", "active", true],
-          ["canton_wallet", "active", false],
         ]),
       );
-      expect(detail.identities).toHaveLength(3);
+      expect(detail.identities).toHaveLength(2);
       expect(detail.wallets).toHaveLength(2);
       const [w1, w2] = detail.wallets;
       expect(w1).toMatchObject({ partyId: primary.partyId, isPrimary: true, ownLedgerWallet: null });
@@ -239,7 +239,7 @@ describe("Admin API (e2e)", () => {
       expect(detail.kyc).toMatchObject({ provider: "mock", status: "approved", attachedIdentityId: google.identity.id, requiredForWithdrawal: true });
       expect(detail.kyc.history).toHaveLength(1);
       expect(detail.sessions).toHaveLength(1);
-      expect(detail.sessions[0]).toMatchObject({ id: target.session.id, kind: "user", authMethod: "canton_wallet", identityId: target.identity.id, current: false });
+      expect(detail.sessions[0]).toMatchObject({ id: target.session.id, kind: "user", authMethod: "telegram", identityId: target.identity.id, current: false });
       expect(detail.payouts).toEqual([expect.objectContaining({ pendingPayoutCid: onLedger.contractId, status: "blocked_kyc", retryAfterKyc: true, onLedger: true, amountCC: "2.0000000000" })]);
       // Only live bindings are listed; a released one is history.
       expect(detail.persons).toEqual([{ fingerprint: fp("IND|PASSPORT|DETAIL1"), kind: "doc", boundAt: expect.any(String) as string }]);
@@ -273,7 +273,7 @@ describe("Admin API (e2e)", () => {
       expect(await auditRows("session.revoked_all")).toEqual([expect.objectContaining({ subjectId: target.user.id, metadata: { reason: "user.suspended", revoked: 1 } })]);
 
       // The user cannot sign in again until reinstated.
-      await expect(ctx.get(IdentityService).resolveForLogin({ provider: "canton_wallet", subject: target.identity.subject }, { currentUser: null })).rejects.toMatchObject({ code: "user_suspended" });
+      await expect(ctx.get(IdentityService).resolveForLogin({ provider: "telegram", subject: target.identity.subject }, { currentUser: null })).rejects.toMatchObject({ code: "user_suspended" });
 
       await post(`/users/${target.user.id}/reinstate`, admin.cookie).send({ reason: "dispute resolved" }).expect(200);
       expect((await userRow(target.user.id)).status).toBe("active");
@@ -346,10 +346,10 @@ describe("Admin API (e2e)", () => {
       expect(await auditRows("identity.reattached")).toHaveLength(2);
     });
 
-    it("keeps the IdentityService rules for operators too: primary wallet identity and unknown ids", async () => {
+    it("keeps the IdentityService rules for operators too: last identity and unknown ids", async () => {
       const target = await issueSessionDirect(ctx, makeTestWallet("rules"));
-      const primary = await post(`/users/${target.user.id}/identities/${target.identity.id}/unlink`, admin.cookie).send({ reason: "x" }).expect(409);
-      expect(bodyOf<ErrorBody>(primary).error).toBe("primary_wallet_in_use");
+      const last = await post(`/users/${target.user.id}/identities/${target.identity.id}/unlink`, admin.cookie).send({ reason: "x" }).expect(409);
+      expect(bodyOf<ErrorBody>(last).error).toBe("last_identity");
 
       const other = await issueSessionDirect(ctx, makeTestWallet("other"));
       const foreign = await post(`/users/${target.user.id}/identities/${other.identity.id}/unlink`, admin.cookie).send({ reason: "x" }).expect(404);

@@ -6,15 +6,17 @@ import { SessionService } from "../services/session.service";
 import { UserService } from "../services/user.service";
 import { SESSION_COOKIE, readCookie } from "../util/cookies";
 import { ApiError } from "../util/errors";
-import { IS_PUBLIC_KEY } from "./decorators";
+import { ALLOW_ADMIN_SESSION_KEY, IS_PUBLIC_KEY } from "./decorators";
 import { type AuthedRequest, clientIpOf, requestHostOf, requestProtoOf } from "./request";
 
 /**
- * Global guard (docs/ARCHITECTURE.md §6.6, INTERNALS `SessionGuard`). Resolves the session from
- * the `to_session` cookie or `Authorization: Bearer`, sets `req.session`, `req.user`,
+ * Global guard (docs/ARCHITECTURE.md §6.6, §6.8; INTERNALS `SessionGuard`). Resolves the session
+ * from the `to_session` cookie or `Authorization: Bearer`, sets `req.session`, `req.user`,
  * `req.authIdentityId`, `req.authKind`; @Public routes pass through unauthenticated but still get
  * `req.user` when a valid session is present ("link mode"). Suspended/closed → 403 user_suspended.
- * Also resolves `req.clientIp` / `req.requestHost` once per request (proxy contract §4.1).
+ * A `kind = admin` session is admitted only to @Public routes and to handlers or controllers
+ * marked @AllowAdminSession (default deny: account routes are user-only). Also resolves
+ * `req.clientIp` / `req.requestHost` once per request (proxy contract §4.1).
  */
 @Injectable()
 export class SessionGuard implements CanActivate {
@@ -49,6 +51,13 @@ export class SessionGuard implements CanActivate {
     const user = (await this.users.findByIdCached(verified.user.id)) ?? verified.user;
     if (user.status !== "active") {
       throw new ApiError(403, "user_suspended", "this account is suspended");
+    }
+
+    // §6.8: an admin session is an operator credential for /admin and the session's own
+    // housekeeping; every other account route refuses it unless the handler opted in.
+    if (verified.session.kind === "admin" && !isPublic) {
+      const allowed = this.reflector.getAllAndOverride<boolean>(ALLOW_ADMIN_SESSION_KEY, [context.getHandler(), context.getClass()]) === true;
+      if (!allowed) throw new ApiError(403, "forbidden", "admin sessions cannot use account routes");
     }
 
     req.session = verified.session;

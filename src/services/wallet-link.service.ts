@@ -3,7 +3,6 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { DataSource, In, Repository } from "typeorm";
 
 import { Config } from "../config";
-import { AuthIdentityEntity } from "../entities/auth-identity.entity";
 import { DepositCreditEntity } from "../entities/deposit-credit.entity";
 import { PayoutEntity } from "../entities/payout.entity";
 import { UserEntity } from "../entities/user.entity";
@@ -17,11 +16,9 @@ import {
   WALLET_KIND_ALLOWLIST,
   type WalletKind,
 } from "../types";
-import { partyHint } from "../util/canton-crypto";
 import { ApiError } from "../util/errors";
 import { formatCC } from "../util/money";
 import { AuditService } from "./audit.service";
-import { IdentityService } from "./identity.service";
 import { LedgerClientService } from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { RedisService } from "./redis.service";
@@ -38,7 +35,6 @@ export interface VerifiedWallet {
 
 export interface LinkResult {
   wallet: WalletEntity;
-  identity: AuthIdentityEntity;
 }
 
 /** Wire shape of an on-ledger UserWallet (docs/API.md `LedgerWallet`). */
@@ -76,14 +72,15 @@ export function walletToApi(
 /**
  * Wallet linking and the primary-wallet rules (docs/ARCHITECTURE.md §8.1–8.2).
  *
- * A party is bound to its first account forever: any `to_wallets` row (active or revoked) under
- * another user refuses the link (`409 wallet_already_linked`); a row under this user is
- * reactivated, never re-inserted, with `credited_cc` untouched. The `canton_wallet` identity is
- * created / reactivated through IdentityService so the §6 rules (one identity ↔ one account,
- * unlinked = revoked, KYC lock, last identity) apply on both the identity and the wallet route.
+ * A wallet is a signing key and funding rail linked to a signed-in account — never an identity
+ * (§6.1): linking writes a `to_wallets` row and nothing in `to_auth_identities`. A party is bound
+ * to its first account forever by that row alone: any row (active or revoked) under another user
+ * refuses the link (`409 wallet_already_linked`); a revoked row under this user is reactivated,
+ * never re-inserted, with `credited_cc` untouched. Unlinking revokes the row; the only refusal is
+ * `409 primary_wallet_in_use` while `users.party_id` points at it (§8.2).
  *
  * Linking never touches the ledger (greenfield, ARCHITECTURE §18): nothing on-ledger predates the
- * backend, so a new row starts at `credited_cc = 0` and sign-in works while the ledger is down.
+ * backend, so a new row starts at `credited_cc = 0` and linking works while the ledger is down.
  * The ledger client is used only by `setPrimary` and `ownLedgerWallets`.
  */
 @Injectable()
@@ -95,7 +92,6 @@ export class WalletLinkService {
     private readonly dataSource: DataSource,
     @InjectRepository(WalletEntity) private readonly wallets: Repository<WalletEntity>,
     private readonly users: UserService,
-    private readonly identities: IdentityService,
     private readonly ledger: LedgerClientService,
     private readonly redis: RedisService,
     private readonly audit: AuditService,
@@ -115,7 +111,7 @@ export class WalletLinkService {
     return this.wallets.find({ where: { userId }, order: { createdAt: "ASC" } });
   }
 
-  /** §8.1. `verified` comes from WalletChallengeService.verify (never from the client). No ledger I/O. */
+  /** §8.1. `verified` comes from WalletChallengeService.verify (never from the client). No ledger I/O, no identity. */
   async link(userId: string, verified: VerifiedWallet, opts: { label?: string | null; actor: Actor }): Promise<LinkResult> {
     const partyId = verified.partyId.trim();
     if (!WALLET_KIND_ALLOWLIST.includes(verified.kind)) {
@@ -125,6 +121,7 @@ export class WalletLinkService {
       throw new ApiError(400, "validation_failed", "the treasury party cannot be linked as a user wallet");
     }
 
+    // The party → first-account binding IS this row (active or revoked).
     const existing = await this.wallets.findOne({ where: { partyId } });
     if (existing && existing.userId !== userId) {
       throw new ApiError(409, "wallet_already_linked", "this wallet is linked to another account");
@@ -134,22 +131,6 @@ export class WalletLinkService {
     const user = await this.users.findById(userId);
     if (!user) throw new ApiError(404, "not_found", "user not found");
     if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
-
-    // Identity rules (§6) — link mode for the current user. A canton_wallet identity that
-    // belongs to another account (active or unlinked) surfaces as wallet_already_linked here.
-    let identity: AuthIdentityEntity;
-    try {
-      const resolution = await this.identities.resolveForLogin(
-        { provider: "canton_wallet", subject: partyId, profile: { name: partyHint(partyId) } },
-        { currentUser: user, ip: opts.actor.ip ?? null, sessionId: opts.actor.sessionId ?? null },
-      );
-      identity = resolution.identity;
-    } catch (err) {
-      if (ApiError.is(err) && (err.code === "identity_already_linked" || err.code === "identity_unlinked")) {
-        throw new ApiError(409, "wallet_already_linked", "this wallet is linked to another account");
-      }
-      throw err;
-    }
 
     const now = new Date();
     const label = opts.label === undefined ? undefined : clipLabel(opts.label);
@@ -161,7 +142,7 @@ export class WalletLinkService {
       if (!fresh) throw new ApiError(404, "not_found", "user not found");
       const currentPrimary = await repo.findOne({ where: { userId, isPrimary: true, status: "active" } });
 
-      // The first wallet becomes primary and sets users.party_id (§7.3); a party that IS
+      // The first wallet becomes primary and sets users.party_id (§8.1–8.2); a party that IS
       // users.party_id is the primary by definition (relink of the primary after an admin unlink).
       const makePrimary = fresh.partyId === partyId || (!fresh.partyId && !currentPrimary);
 
@@ -214,7 +195,7 @@ export class WalletLinkService {
             action: "wallet.linked",
             subjectType: "wallet",
             subjectId: row.id,
-            metadata: { userId, partyId, kind: verified.kind, isPrimary: makePrimary, identityId: identity.id },
+            metadata: { userId, partyId, kind: verified.kind, isPrimary: makePrimary },
             ip: actor.ip ?? null,
           },
           manager,
@@ -253,16 +234,15 @@ export class WalletLinkService {
       return row;
     });
 
-    void this.nats.publishSafe(NatsSubjects.walletLinked, { userId, walletId: wallet.id, identityId: identity.id, relinked: Boolean(existing) });
-    return { wallet, identity };
+    void this.nats.publishSafe(NatsSubjects.walletLinked, { userId, walletId: wallet.id, relinked: Boolean(existing) });
+    return { wallet };
   }
 
   /**
-   * §8.1 / §6.5: unlink IS IdentityService.unlink (last_identity, identity_locked_by_kyc,
-   * primary_wallet_in_use), which revokes the wallet row and writes the `wallet.unlinked` audit
-   * row and event in the same transaction — so this route and `DELETE /me/identities/:id` leave
-   * one identical trail. Only a row whose identity is already gone (seeded directly) is revoked
-   * here, with the same audit row and event.
+   * §8.1 / §8.2: unlink revokes the row (never deletes it — its attribution survives, §8.3). The
+   * only refusal is `409 primary_wallet_in_use` while `users.party_id` points at the wallet. No
+   * identity is involved: a linked wallet has none, so `DELETE /wallets/:id` leaves exactly one
+   * `wallet.unlinked` audit row and event and never touches a session.
    */
   async unlink(userId: string, walletId: string, actor: Actor): Promise<void> {
     const wallet = await this.wallets.findOne({ where: { id: walletId, userId } });
@@ -273,11 +253,6 @@ export class WalletLinkService {
       throw new ApiError(409, "primary_wallet_in_use", "the primary wallet owns the in-app balance and cannot be unlinked");
     }
 
-    const identity = await this.identities.findByProviderSubject("canton_wallet", wallet.partyId);
-    if (identity && identity.userId === userId && identity.status === "active") {
-      await this.identities.unlink(userId, identity.id, actor);
-      return;
-    }
     await this.dataSource.transaction(async (manager) => {
       await manager.getRepository(WalletEntity).update({ id: walletId, status: "active" }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
       await this.audit.record(
@@ -288,13 +263,13 @@ export class WalletLinkService {
           action: "wallet.unlinked",
           subjectType: "wallet",
           subjectId: wallet.id,
-          metadata: { userId, partyId: wallet.partyId, identityId: identity?.id ?? null },
+          metadata: { userId, partyId: wallet.partyId },
           ip: actor.ip ?? null,
         },
         manager,
       );
     });
-    void this.nats.publishSafe(NatsSubjects.walletUnlinked, { userId, walletId: wallet.id, identityId: identity?.id ?? null });
+    void this.nats.publishSafe(NatsSubjects.walletUnlinked, { userId, walletId: wallet.id });
   }
 
   /**

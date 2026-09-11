@@ -303,18 +303,25 @@ by services in the same transaction as the change.
 1. **Sign-in resolves an identity, then a user.** `(provider, subject)` is unique. Known
    active identity → its user. Unknown identity with no session → new user + identity.
    Unknown identity with a session (link mode) → attached to the current user.
+   **Only `google` and `telegram` open or resolve a USER account**: they are the sole callers
+   of `IdentityService.resolveForLogin` without a session. A `canton_wallet` identity belongs
+   to an operator and is created only by `POST /auth/admin` (§7.4); a user's Cantor8 wallet is
+   a `to_wallets` row linked to an existing account and is never an identity (§7.3, §8.1).
 2. **An identity attached to another user cannot be linked** → `409 identity_already_linked`.
    This applies to `unlinked` rows too: a party or subject is bound to its first account.
 3. **Unlink** requires another active identity (`409 last_identity`).
 4. **Identities are never deleted; unlink is revocation.** Sign-in with an `unlinked`
    identity fails closed: `403 identity_unlinked`, no session, audited. Re-attachment is only
    (a) a link-mode action by a session of the *original* `user_id`, or (b) an admin action.
-   Because the row persists, the same Google/Telegram/wallet can never create a second
-   account.
+   Because the row persists, the same Google or Telegram identity can never create a second
+   account. A wallet is bound to its first account by the same principle, enforced on
+   `to_wallets` instead (`409 wallet_already_linked`, §8.1).
 5. **KYC lock**: while `users.kyc_verification_id` points at an approved verification, the
-   identity referenced by that verification's `initiated_identity_id` cannot be unlinked —
-   neither through `DELETE /me/identities/:id` nor through `DELETE /wallets/:id` (both go
-   through one `IdentityService.unlink`) → `409 identity_locked_by_kyc`. Admins can.
+   identity referenced by that verification's `initiated_identity_id` cannot be unlinked
+   (`DELETE /me/identities/:id`) → `409 identity_locked_by_kyc`. Admins can. The locked
+   identity is always the Google or Telegram method that started the verification — KYC is
+   startable only from a `kind = user` session (§9.5) and wallets are not identities — so a
+   wallet can never be what a standing approval locks.
 6. **Sessions** are opaque 32-byte tokens; browsers get them in `to_session` (`HttpOnly;
    Secure; SameSite=Lax; Path=/`, host-only — `COOKIE_DOMAIN` stays empty for proxied
    traffic), native clients may present them as `Authorization: Bearer`. Only the sha256 is
@@ -331,12 +338,20 @@ by services in the same transaction as the change.
    `/webhooks/**` (signature-verified, no cookies) and requests authenticated by a bearer
    token (no cookie involved). The urlencoded body parser is disabled; JSON only.
 8. **Admin authority** (`AdminGuard`): the session must be `kind = admin`, which is issued only
-   by `POST /auth/wallet` with a `purpose = admin-sign-in` challenge signed by a
-   `canton_wallet` identity whose party is in `ADMIN_OPERATORS` (and matches the pinned key
-   when one is configured). Admin sessions are short-lived (§6.6) and never issued through
-   Google/Telegram. Removing a party from `ADMIN_OPERATORS` revokes its admin sessions on the
-   next request (list re-read; sessions revoked via the per-user index). `ADMIN_EMAILS`
-   is dropped from v1.
+   by `POST /auth/admin` with a `purpose = admin-sign-in` challenge signed by a party in
+   `ADMIN_OPERATORS` (§7.4). That sign-in records the verified key on the operator's
+   `canton_wallet` identity (`profile.publicKey`); when the operator is configured with a
+   pinned key, `AdminGuard` re-checks the recorded key against the pin on every request and a
+   pinned operator whose identity carries no key **fails closed**. Admin sessions are
+   short-lived (§6.6) and never issued through Google/Telegram. Removing a party from
+   `ADMIN_OPERATORS` revokes its admin sessions on the next request (list re-read; sessions
+   revoked via the per-user index). `ADMIN_EMAILS` is dropped from v1.
+9. **Session kind is a gate, not a label** (`SessionGuard`, default deny). A `kind = admin`
+   session reaches only `@Public` routes and handlers marked `@AllowAdminSession`
+   (`AdminController`, `POST /auth/logout`, and the session's own housekeeping under `/me`);
+   every other account route answers `403 forbidden` ("admin sessions cannot use account
+   routes"). Without this an operator's short-lived session would be a valid credential for
+   linking wallets, starting KYC or reconciling deposits on the operator's own account.
 
 ## 7. Sign-in methods
 
@@ -375,9 +390,15 @@ must match. Required when `GOOGLE_NONCE_REQUIRED=true` (default `true` outside `
   (`VITE_TELEGRAM_OIDC_ENABLED`); widget/mini-app work everywhere the domain is set.
 - A unit test asserts widget, mini-app and OIDC yield the same `subject` for one fixture user.
 
-### 7.3 Canton wallet (challenge / signature)
-1. `POST /auth/wallet/challenge { partyId, purpose }` (purpose ∈ `sign-in` |
-   `link-wallet` | `admin-sign-in`). `partyId` must match
+### 7.3 Cantor8 wallet (challenge / signature)
+A wallet proves control of a Canton party. It is **not** a sign-in method for users: the only
+two things a proof can do are link the wallet to an already signed-in account
+(`purpose = link-wallet`, §8.1) and sign an operator into the admin API
+(`purpose = admin-sign-in`, §7.4). Both use the identical crypto below.
+
+1. `POST /wallets/link-challenge { partyId }` (purpose `link-wallet`, session required) or
+   `POST /auth/admin/challenge { partyId }` (purpose `admin-sign-in`, refused when a session
+   is present). `partyId` must match
    `^[A-Za-z0-9_\-.]{1,255}::1220[0-9a-f]{64}$` (exactly one `::`). Link challenges require a
    session and record its `sessionId`. Response `{ challengeId, message, expiresAt }`. The
    message is regenerated server-side from the stored record and signed verbatim (UTF-8):
@@ -392,7 +413,11 @@ must match. Required when `GOOGLE_NONCE_REQUIRED=true` (default `true` outside `
    Expires: <ISO-8601>
    ```
 2. Wallet `signMessage(message, partyId)` (Cantor8 signs raw UTF-8 — confirmed 2026-09-01).
-3. `POST /auth/wallet { challengeId, partyId, publicKey, signature, kind }` (`kind` allowlist:
+   The browser must open that popup inside the click's own user activation: a browser grants
+   one popup per click, so the frontend prefetches the challenge and never awaits anything
+   between the click and the SDK call (`truthoracle-canton/frontend/wallets/cantor8/popupGesture.ts`).
+3. `POST /wallets/link` or `POST /auth/admin`, body `{ challengeId, partyId, publicKey,
+   signature, kind }` (`kind` allowlist:
    `cantor8`; informational). The challenge claim is consumed **before** verification (a bad
    signature burns it). Verification (`util/canton-crypto.ts`):
    - `publicKey` decodes to 32 bytes (hex / base64 / base64url; short prefixes tolerated);
@@ -403,30 +428,41 @@ must match. Required when `GOOGLE_NONCE_REQUIRED=true` (default `true` outside `
      operator party in `truthoracle-canton/.env`. Nothing is pinned or trusted from the
      client. Limitation (documented, error `wallet_key_mismatch` = "this wallet's signing key
      is not its namespace key"): parties whose signing key was rotated or that were allocated
-     under a participant namespace cannot sign in until a topology-based check exists;
+     under a participant namespace cannot be linked until a topology-based check exists;
    - Ed25519 verify over the raw UTF-8 message, falling back to the `sha256(utf8)` preimage
      (port of `verifyPartySignature.mjs`, same shape-only diagnostics);
    - operators listed in `ADMIN_OPERATORS` as `party=publicKey` are additionally checked
      against the pinned key.
-   - **Purpose isolation**: with a session present the endpoint accepts only
-     `purpose = link-wallet` challenges issued to that session; `sign-in` / `admin-sign-in`
-     challenges are rejected when a session cookie is present (and vice versa).
-   On success: identity `(canton_wallet, partyId)` + wallet row seeded per §8.1; the first
-   wallet becomes primary and sets `users.party_id`.
+   - **Purpose isolation** is now structural rather than conditional: each purpose has its own
+     route pair. A `link-wallet` challenge is bound to the session it was issued to and is
+     refused when presented by another session or none; an `admin-sign-in` challenge is
+     refused at issue time when a session cookie is present, and `POST /auth/admin` refuses a
+     present session **before** consuming the challenge, so an operator who is already signed
+     in does not burn one.
+   On success for `link-wallet`: a `to_wallets` row per §8.1 — **no identity is created**. The
+   first wallet becomes primary and sets `users.party_id`.
 
-### 7.4 Admin sign-in
-`purpose = admin-sign-in` → a `kind = admin` session (§6.8), only for parties in
-`ADMIN_OPERATORS`. The `/admin` UI in `truthoracle-canton` keeps its own `to_admin`
-flow until it is ported; the two do not interact (the proxy never forwards `to_admin`).
-`ADMIN_AUTH.md` and the `adminSession.mjs` header comment ("the key cannot be derived from
-the party id") are corrected in the same change (§18).
+### 7.4 Admin sign-in (operators only)
+`POST /auth/admin/challenge { partyId }` → `POST /auth/admin { challengeId, partyId,
+publicKey, signature, kind }` → a `kind = admin` session (§6.8), only for parties in
+`ADMIN_OPERATORS`. The operator list is consulted at **verify** time only, so an anonymous
+caller cannot enumerate operators from the challenge route. The sign-in creates (or reuses)
+the operator's `canton_wallet` identity and records the verified key in `profile.publicKey`
+for `AdminGuard`'s per-request pin check; it creates **no** `to_wallets` row, because an
+operator party is not a funding wallet. The `/admin` UI in `truthoracle-canton` keeps its own
+`to_admin` flow until it is ported; the two do not interact (the proxy never forwards
+`to_admin`).
 
 ## 8. Wallets and the in-app balance
 
 ### 8.1 Linking
 - `POST /wallets/link-challenge` + `POST /wallets/link` (same crypto as §7.3, purpose
-  `link-wallet`, session-bound). Also reachable through `POST /auth/wallet` in link mode.
-  Response: `{ wallet, identity }`.
+  `link-wallet`, session-bound) — the ONE link path. Response: `{ wallet }`.
+- **Linking creates no identity.** A wallet is a signing key and a funding rail, not a way in,
+  so the party → first-account binding lives entirely in `to_wallets` (unique `party_id`) and
+  the refusal is `409 wallet_already_linked`. Consequences: `GET /me.identities` lists only
+  what can actually sign the person in; unlinking a wallet can never hit `last_identity`; and
+  a standing KYC approval can never lock a wallet.
 - A party with **any** `to_wallets` row (active or revoked) under another user →
   `409 wallet_already_linked`. Re-linking a party that already has a row under this user
   reactivates that row (`status → active`, `credited_cc` untouched); it never inserts.
@@ -602,6 +638,9 @@ kyc gate: users.status = active AND to_kyc_persons binding for the user AND an a
   `canDeposit`.
 
 ### 9.5 Attachment to the login method
+`POST /kyc/sessions` requires a `kind = user` session (`403 forbidden` otherwise, enforced both
+by the §6.9 gate and by a guard in `KycService.startSession`), so the identity a verification
+attaches to is always a Google or Telegram method — never an operator's wallet identity.
 `initiated_identity_id = session.auth_identity_id` at `POST /kyc/sessions`; the session's
 kind/identity is recorded on the audit event; that identity is locked (§6.5) while the
 approval stands. `GET /kyc` reports which identity the verification is attached to.
@@ -652,16 +691,16 @@ purged after 30 days (`kyc-cleanup` in `session-cleanup.processor`).
 | POST | `/auth/google` | public / link | `{ credential, nonce? }` |
 | POST | `/auth/telegram/widget` · `/auth/telegram/miniapp` | public / link | |
 | GET | `/auth/telegram/oidc/start` · `/auth/telegram/oidc/callback` | public | §7.2 |
-| POST | `/auth/wallet/challenge` | public (link: session) | `{ partyId, purpose }` |
-| POST | `/auth/wallet` | public / link | `{ challengeId, partyId, publicKey, signature, kind }` |
-| POST | `/auth/logout` | session | revoke current session, clear cookie |
-| GET | `/me` | session | user, identities, wallets (+ ownLedgerWallet), kyc summary, capabilities |
+| POST | `/auth/admin/challenge` | public (refused with a session) | `{ partyId }` — operators only (§7.4) |
+| POST | `/auth/admin` | public | `{ challengeId, partyId, publicKey, signature, kind }` → `kind = admin` session |
+| POST | `/auth/logout` | session (admin too) | revoke current session, clear cookie |
+| GET | `/me` | session (admin too) | user, identities, wallets (+ ownLedgerWallet), kyc summary, capabilities |
 | PATCH | `/me` | session | `{ displayName?, avatarUrl? }` |
 | DELETE | `/me/identities/:id` | session | unlink (rules §6) |
 | POST | `/me/identities/:id/reattach` | session | link-mode re-attachment by the original user (§6.4) |
-| GET · DELETE | `/me/sessions` · `/me/sessions/:id` · POST `/me/sessions/revoke-others` | session | |
+| GET · DELETE | `/me/sessions` · `/me/sessions/:id` · POST `/me/sessions/revoke-others` | session (admin too) | |
 | GET | `/me/audit?page=` | session | own trail |
-| GET | `/wallets` · POST `/wallets/link-challenge` · POST `/wallets/link` | session | |
+| GET | `/wallets` · POST `/wallets/link-challenge` · POST `/wallets/link` | session | link answers `{ wallet }` (§8.1) |
 | DELETE | `/wallets/:id` · POST `/wallets/:id/primary` | session | |
 | GET | `/in-app-wallet` | session | primary UserWallet, attribution per wallet, ownLedgerWallet per wallet, payouts |
 | POST | `/in-app-wallet/deposits/reconcile` | session | §8.3 |
@@ -769,10 +808,27 @@ checks pg/redis/nats, structured audit trail.
 - Backend CI (`.github/workflows/ci.yml` in this repo): Node 24, `npm ci`, `typecheck`,
   `lint`, `test`, `test:e2e` (service containers), `build`.
 
-## 16. Frontend integration (in `../truthoracle-canton/frontend`, branch `feat/accounts-auth-kyc`)
+## 16. Frontend integration (in `../pm-frontend/frontend`, branch `feat/accounts-auth-kyc`)
 
 Prerequisite: remove the duplicate `WalletProvider` (`main.tsx` wraps App in one, `App.tsx`
 mounts a second; each spins up its own Cantor8 SDK instance). Keep one in `App.tsx`.
+
+**Account first, wallet second.** The header shows only "Sign in" while anonymous: connecting a
+wallet is not signing in, and nothing a wallet can do here works without an account (§18). After
+sign-in the wallet chip appears and leads through connect → link.
+
+**One popup per click** (`frontend/wallets/cantor8/popupGesture.ts`). A browser grants one
+`window.open` per user activation and the Cantor8 popup self-closes after every approval, so
+connect and sign can never share a click; each popup-opening SDK call must also be the first
+statement the click awaits, which is why the link challenge and the operator nonce are
+prefetched and reused on a fixed local cadence (never on arithmetic over a server timestamp —
+the browser clock may be wrong). SDK 0.5.0 mis-reports a blocked popup as
+`TypeError: Cannot read properties of undefined (reading 'promise')` and leaves its transport
+wedged; the wallet context translates that into one sentence and calls `disconnect()` to reset
+it. The deposit and withdraw paths start their pre-reads without awaiting them so the popup
+stays inside the gesture; the cancel-payout path deliberately does await its safety re-reads
+(correctness first) and accepts that WebKit may block that popup, which surfaces as a
+recoverable message.
 
 New files:
 - `lib/backend.ts` — fetch wrapper: base `BACKEND_BASE_URL` (`VITE_BACKEND_PROXY_URL`, default
@@ -780,16 +836,20 @@ New files:
   `BackendError { code, status }`; a `503 backend_unconfigured` resolves to `available: false`.
 - `auth/AuthContext.tsx` + `useAuth()` — mounted `<WalletProvider><Router><AuthProvider>` so it
   can use the wallet context and router. Renders children immediately; state
-  `unavailable | anonymous | authenticated`; any error → `anonymous`; loads `/me` only after
-  `/auth/session` says authenticated; deduped in-flight probe (pattern of `lib/adminSession.ts`).
-  Owns the single "connected wallet is not linked" prompt (one effect keyed on
-  `account.address`).
+  `unavailable | unreachable | anonymous | authenticated`; any error → `anonymous`; loads `/me`
+  only after `/auth/session` says authenticated; deduped in-flight probe (pattern of
+  `lib/adminSession.ts`). Owns the prefetched link challenge (armed while a connected wallet is
+  unlinked, consumed by `linkConnectedWallet`, re-armed only after a FAILED attempt) and
+  disconnects the wallet on sign-out so a shared browser does not carry one person's party into
+  the next account.
 - `auth/google.ts`, `auth/telegram.ts`, `auth/wallet.ts` — promise-cached script loaders
   (StrictMode-safe: GIS button rendered into a ref container cleared on cleanup; Telegram
   widget registers `window.onTelegramAuth` before appending the script and removes script +
   iframe on cleanup; widget hidden when `VITE_TELEGRAM_BOT_USERNAME` is empty).
-- `components/auth/LoginDialog.tsx` — Google, Telegram (widget; OIDC button when
-  `VITE_TELEGRAM_OIDC_ENABLED`), Canton wallet (only when `WALLET_TYPE === "cantor8"`).
+- `components/auth/LoginDialog.tsx` — Google and Telegram only (widget; OIDC button when
+  `VITE_TELEGRAM_OIDC_ENABLED`). No wallet section: a wallet cannot sign anyone in. With
+  neither provider configured the dialog says so plainly, because nobody can then sign in,
+  deposit or trade.
 - `components/auth/AccountMenu.tsx` — header avatar/name, link to `/account`, sign-out **button**.
 - `components/Account/AccountPage.tsx` (route `/account`, gated AdminGate-style: sign-in prompt,
   no redirect) — profile; sign-in methods (link/unlink/reattach); wallets (link via signature,
@@ -852,9 +912,16 @@ frontend are designed greenfield:
   party never holds an in-app balance without an account — the one exception is an in-app
   payout (`bond` / `model-prize`) settled to a party that traded with its own key, which the
   backend also performs and which never touches `depositedCC`.
-- Deposits and withdrawals **require a signed-in account**. Trading stays wallet-signed and
-  works without an account (reads + user-signed Daml choices), but any choice that debits or
-  credits a `UserWallet` needs one to exist, i.e. an account that deposited.
+- Deposits and withdrawals **require a signed-in account**, and so, in practice, does trading.
+  Every trade is still signed by the user's own wallet (reads and Daml choices are never
+  server-signed), but every market choice debits or credits a `UserWallet`, and a `UserWallet`
+  exists only after an account deposited. So a visitor with a wallet and no account can read
+  markets and their own on-ledger positions, and nothing more. A deployment without an accounts
+  backend is therefore read-only — the UI says so rather than offering controls that cannot work.
+- **A wallet is not an identity.** Google and Telegram open accounts; the Cantor8 wallet is
+  connected and linked afterwards (§7.3, §8.1). This keeps one person to one account bindable
+  by KYC, removes the "connected but not signed in" state, and removes the two-popups-per-click
+  flow the browser forbids.
 - Consequently there is no seed from the ledger at link time, no silent repair of a ledger
   surplus (drift in either direction is refused), no Daml feature flag for `depositRefs`
   (mandatory on truthoracle-v14), no boot-time precondition in front of
@@ -888,6 +955,9 @@ frontend are designed greenfield:
 | CSRF | cookie-bearing non-GET only | all non-GET, JSON-only, missing Origin rejected, bearer/webhook exempt |
 | Admin | `role` on user via any identity, 7-day cookie | session kind from wallet-signed admin challenge, 1 h, no `ADMIN_EMAILS` |
 | Wallet link purpose | any challenge in link mode | purpose isolation, session-bound link challenges |
+| Wallet as a sign-in method (2026-09-11) | `purpose = sign-in` issued a user session and seeded a `canton_wallet` identity | deleted. Google and Telegram are the only user sign-ins (§6.1); the wallet is linked to an account and creates no identity (§8.1). Kalshi and Polymarket US both have zero wallet sign-in; Polymarket global's wallet login works only because the wallet *is* the funded account, which is not true here (§18) |
+| Operator sign-in route (2026-09-11) | `POST /auth/wallet` with `purpose = admin-sign-in` | `POST /auth/admin/challenge` + `POST /auth/admin`; the pinned key is re-checked against the key recorded on the operator identity, failing closed when absent (§6.8, §7.4) |
+| Session kind (2026-09-11) | only `AdminGuard` read it | `SessionGuard` default-denies admin sessions on account routes; `@AllowAdminSession` opts a handler in (§6.9) |
 | Rate limits / IP | undefined behind proxy | proxy secret + `x-real-ip`; subject dimension; explicit limits |
 | Proxy | one sentence | full contract (§4.1) |
 | Sessions | hash cache only | per-user index, status read per request |

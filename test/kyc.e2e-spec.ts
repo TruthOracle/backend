@@ -2,7 +2,8 @@
  * KYC end to end (docs/API.md "KYC" / "Webhooks" / "Me"; ARCHITECTURE §6.5, §9, §12). Real
  * Postgres + Redis, the real KycService, mock provider, Sumsub adapter, KycController /
  * KycMockController / WebhooksController / MeController and KycWebhookProcessor; users sign in
- * through the real `/auth/wallet` flow; NATS and the ledger are the helper fakes.
+ * through the real Telegram widget route and link their wallet over `/wallets/link`; NATS and
+ * the ledger are the helper fakes.
  *
  * Three apps, booted one after another: the default env (mock provider, enforcement off), the
  * mock provider with KYC_ENFORCE_WITHDRAWALS=true, and KYC_PROVIDER=sumsub (mock route absent,
@@ -22,7 +23,6 @@ import { KycPersonEntity } from "../src/entities/kyc-person.entity";
 import { KycVerificationEntity } from "../src/entities/kyc-verification.entity";
 import { KycWebhookEventEntity } from "../src/entities/kyc-webhook-event.entity";
 import { UserEntity } from "../src/entities/user.entity";
-import { WalletEntity } from "../src/entities/wallet.entity";
 import { KycWebhookProcessor, kycWebhookNakDelayMs } from "../src/processors/kyc-webhook.processor";
 import { IdentityService } from "../src/services/identity.service";
 import { KycProviderSumsubService, redactSumsubPayload } from "../src/services/kyc-provider-sumsub.service";
@@ -31,7 +31,8 @@ import { type ApiKycSummary, type ApiKycVerification, type ApiMe, KYC_PROVIDER, 
 import type { ErrorBody } from "../src/util/errors";
 import { type TestApp, testEnv, useTestApp } from "./helpers/app";
 import { FakeKycProvider, subjectMatches } from "./helpers/fakes";
-import { bodyOf, signInWithWallet } from "./helpers/session";
+import { bodyOf, linkWallet, signInAsAdmin } from "./helpers/session";
+import { nextTelegramUser, signInWithTelegram, type TelegramTestUser } from "./helpers/telegram";
 import { makeTestWallet } from "./helpers/wallet";
 
 // ─────────────────────────────────────────── fixtures ────────────────────────────────────────────
@@ -117,30 +118,33 @@ function refused(r: Reply<unknown>, status: number, code: string): ErrorBody {
 
 interface Account {
   wallet: ReturnType<typeof makeTestWallet>;
+  telegram: TelegramTestUser;
   user: { id: string };
   cookie: string;
-  /** The `canton_wallet` identity that authenticated the session (= `session.auth_identity_id`). */
+  /** The Telegram identity that authenticated the session (= `session.auth_identity_id`). */
   identityId: string;
 }
 
-/** A fresh account: the wallet's identity is its only sign-in method and its primary wallet. */
+/** A fresh account opened by Telegram (§6.1) — its only sign-in method — with `hint`'s wallet linked as its primary (§8.1). */
 async function newUser(ctx: TestApp, hint: string): Promise<Account> {
   const wallet = makeTestWallet(hint);
-  const { user, cookie, result } = await signInWithWallet(http(ctx), wallet);
-  return { wallet, user, cookie, identityId: result.identity.id };
+  const telegram = nextTelegramUser(hint);
+  const { user, cookie, result } = await signInWithTelegram(http(ctx), telegram);
+  await linkWallet(http(ctx), cookie, wallet);
+  return { wallet, telegram, user, cookie, identityId: result.identity.id };
 }
 
-/** Links a second wallet in link mode (`link-wallet` challenge issued to the session) — a second, non-primary identity. */
-async function linkWallet(ctx: TestApp, cookie: string, hint: string): Promise<{ wallet: ReturnType<typeof makeTestWallet>; identityId: string }> {
-  const wallet = makeTestWallet(hint);
-  const { result } = await signInWithWallet(http(ctx), wallet, "link-wallet", { cookie });
+/** Attaches a second Telegram identity in link mode (the widget route with the session cookie). */
+async function linkTelegram(ctx: TestApp, cookie: string, hint: string): Promise<{ telegram: TelegramTestUser; identityId: string }> {
+  const telegram = nextTelegramUser(hint);
+  const { result } = await signInWithTelegram(http(ctx), telegram, { cookie });
   expect(result.mode).toBe("link");
-  return { wallet, identityId: result.identity.id };
+  return { telegram, identityId: result.identity.id };
 }
 
-/** A second session for the same account, authenticated by an already-linked wallet (`session.auth_identity_id` = that identity). */
-async function signInAgain(ctx: TestApp, wallet: ReturnType<typeof makeTestWallet>): Promise<{ cookie: string; identityId: string }> {
-  const { cookie, result } = await signInWithWallet(http(ctx), wallet);
+/** A second session for the same account, authenticated by an already-linked Telegram identity (`session.auth_identity_id` = that identity). */
+async function signInAgain(ctx: TestApp, telegram: TelegramTestUser): Promise<{ cookie: string; identityId: string }> {
+  const { cookie, result } = await signInWithTelegram(http(ctx), telegram);
   expect(result).toMatchObject({ mode: "login", created: false });
   return { cookie, identityId: result.identity.id };
 }
@@ -465,12 +469,12 @@ describe("KYC (e2e)", () => {
       expect((await ctx.dataSource.getRepository(KycVerificationEntity).findOneByOrFail({ id: v })).status).toBe("initiated");
     });
 
-    it("identity lock: the identity that started the approval cannot be unlinked (409 identity_locked_by_kyc); GET /me marks it kycLocked (§6.5, §9.5)", async () => {
-      // Wallet A is the primary; wallet B is linked, then used for a second session so the
-      // verification is attached to B — an identity only the KYC lock protects.
+    it("identity lock: the identity that started the approval cannot be unlinked (409 identity_locked_by_kyc); GET /me marks it kycLocked; the wallet is not involved (§6.5, §9.5)", async () => {
+      // Telegram A opened the account; Telegram B is linked, then used for a second session so
+      // the verification is attached to B — an identity only the KYC lock protects.
       const a = await newUser(ctx, "lock-a");
-      const linked = await linkWallet(ctx, a.cookie, "lock-b");
-      const b = await signInAgain(ctx, linked.wallet);
+      const linked = await linkTelegram(ctx, a.cookie, "lock-b");
+      const b = await signInAgain(ctx, linked.telegram);
       expect(b.identityId).toBe(linked.identityId);
 
       const verificationId = await approve(ctx, b.cookie);
@@ -482,17 +486,17 @@ describe("KYC (e2e)", () => {
 
       const view = await me(ctx, a.cookie);
       expect(view.identities.map((i) => [i.id, i.kycLocked]).sort()).toEqual([[a.identityId, false], [b.identityId, true]].sort());
-      // DELETE /wallets/:id goes through the same IdentityService.unlink (§6.5).
-      const walletB = view.wallets.find((w) => w.partyId === linked.wallet.partyId);
-      expect(walletB?.isPrimary).toBe(false);
-      const viaWallet = await http(ctx).delete(`/api/v1/wallets/${walletB?.id}`).set("Cookie", a.cookie).set(ctx.csrf).expect(409);
-      expect(bodyOf<ErrorBody>(viaWallet).error).toBe("identity_locked_by_kyc");
+      // The linked wallet is a funding rail, not an identity (§8.1): the lock never applies to it, only §8.2 does.
+      const walletA = view.wallets.find((w) => w.partyId === a.wallet.partyId);
+      expect(walletA?.isPrimary).toBe(true);
+      const viaWallet = await http(ctx).delete(`/api/v1/wallets/${walletA?.id}`).set("Cookie", a.cookie).set(ctx.csrf).expect(409);
+      expect(bodyOf<ErrorBody>(viaWallet).error).toBe("primary_wallet_in_use");
     });
 
     it("identity lock at the seam: KycService.lockedIdentityId names the initiating identity; IdentityService.unlink refuses users and lets admins through (§6.5)", async () => {
       const a = await newUser(ctx, "seam-a");
-      const linked = await linkWallet(ctx, a.cookie, "seam-b");
-      const b = await signInAgain(ctx, linked.wallet);
+      const linked = await linkTelegram(ctx, a.cookie, "seam-b");
+      const b = await signInAgain(ctx, linked.telegram);
       const kyc = ctx.get(KycService);
       const identities = ctx.get(IdentityService);
       expect(await kyc.lockedIdentityId(a.user.id)).toBeNull();
@@ -502,26 +506,25 @@ describe("KYC (e2e)", () => {
       await expect(identities.unlink(a.user.id, b.identityId, { type: "user", userId: a.user.id })).rejects.toMatchObject({ status: 409, code: "identity_locked_by_kyc" });
       expect(identities.toApi(await identityRow(ctx, b.identityId), await kyc.lockedIdentityId(a.user.id)).kycLocked).toBe(true);
 
-      // Admins can (§6.5); the wallet row is revoked with the identity.
+      // Admins can (§6.5).
       await identities.unlink(a.user.id, b.identityId, { type: "admin", userId: null });
       expect((await identityRow(ctx, b.identityId)).status).toBe("unlinked");
-      expect((await ctx.dataSource.getRepository(WalletEntity).findOneByOrFail({ partyId: linked.wallet.partyId })).status).toBe("revoked");
       // The approval stands; the lock still points at the (now unlinked) identity.
       expect(await kyc.lockedIdentityId(a.user.id)).toBe(b.identityId);
       expect((await userRow(ctx, a.user.id)).kycStatus).toBe("approved");
     });
 
-    // ARCHITECTURE §6.5: the initiating identity "cannot be unlinked ... → 409 identity_locked_by_kyc"
-    // through BOTH routes. When that identity is ALSO the primary wallet (every wallet-only account)
-    // IdentityService.unlink evaluates the §6.5 lock before the §8.2 primary-wallet rule, so the
-    // user sees the refusal an operator can actually lift; admins skip the lock and get
-    // primary_wallet_in_use.
-    it("identity lock precedence: unlinking the initiating identity that is also the primary wallet answers identity_locked_by_kyc (§6.5 vs §8.2)", async () => {
+    // ARCHITECTURE §6.5 before §6.3: the initiating identity of a one-identity account is refused
+    // as identity_locked_by_kyc (the refusal an operator can lift), not as last_identity.
+    it("identity lock precedence: the sole identity that started the approval answers identity_locked_by_kyc, not last_identity (§6.5 vs §6.3)", async () => {
       const u = await newUser(ctx, "prec");
-      await linkWallet(ctx, u.cookie, "prec-2");
       await approve(ctx, u.cookie);
       const res = await http(ctx).delete(`/api/v1/me/identities/${u.identityId}`).set("Cookie", u.cookie).set(ctx.csrf).expect(409);
       expect(bodyOf<ErrorBody>(res).error).toBe("identity_locked_by_kyc");
+      // Without the lock the same row is the last identity.
+      const plain = await newUser(ctx, "prec-plain");
+      const last = await http(ctx).delete(`/api/v1/me/identities/${plain.identityId}`).set("Cookie", plain.cookie).set(ctx.csrf).expect(409);
+      expect(bodyOf<ErrorBody>(last).error).toBe("last_identity");
     });
   });
 
@@ -755,7 +758,7 @@ describe("KYC (e2e)", () => {
       expect(republished[0].msgId).toMatch(new RegExp(`^${row.eventKey}:sweep:\\d+$`));
 
       // Operator replay: audited, attempts reset, distinct msgId; a processed row is refused, an unknown id is 404.
-      const admin = await signInWithWallet(http(ctx), operator, "admin-sign-in");
+      const admin = await signInAsAdmin(http(ctx), operator);
       await events.update({ id: row.id }, { attempts: 20 });
       const bad = await http(ctx).post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`).set("Cookie", admin.cookie).set(ctx.csrf).send({}).expect(400);
       expect(bodyOf<ErrorBody>(bad).error).toBe("validation_failed");

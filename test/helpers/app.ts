@@ -26,6 +26,8 @@ export const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://localhost:6
 /** An allowed browser origin for CSRF-passing requests (FRONTEND_ORIGINS in the test env). */
 export const TEST_ORIGIN = "http://app.test";
 export const TEST_TREASURY = "treasury::1220" + "f".repeat(64);
+/** The bot token the test env configures; test/helpers/telegram.ts signs Login Widget payloads with it. */
+export const TEST_TELEGRAM_BOT_TOKEN = "123456789:AAFakeBotTokenForE2E";
 
 export function testEnv(overrides: Record<string, string> = {}): Record<string, string> {
   return {
@@ -41,7 +43,7 @@ export function testEnv(overrides: Record<string, string> = {}): Record<string, 
     FRONTEND_ORIGINS: TEST_ORIGIN,
     COOKIE_SECURE: "false",
     GOOGLE_NONCE_REQUIRED: "false",
-    TELEGRAM_BOT_TOKEN: "123456789:AAFakeBotTokenForE2E",
+    TELEGRAM_BOT_TOKEN: TEST_TELEGRAM_BOT_TOKEN,
     TELEGRAM_BOT_USERNAME: "truthoracle_test_bot",
     TREASURY_PARTY_ID: TEST_TREASURY,
     TRUTHORACLE_PACKAGE_ID: "fakepkg",

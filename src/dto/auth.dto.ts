@@ -7,7 +7,7 @@
 import { Transform } from "class-transformer";
 import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from "class-validator";
 
-import { CHALLENGE_PURPOSES, type ChallengePurpose, WALLET_KIND_ALLOWLIST, type WalletKind } from "../types";
+import { WALLET_KIND_ALLOWLIST, type WalletKind } from "../types";
 import { PARTY_ID_RE } from "../util/canton-crypto";
 import { numberToString } from "./common.dto";
 
@@ -15,9 +15,9 @@ export type LoginClient = "web" | "native";
 export const LOGIN_CLIENTS: readonly LoginClient[] = ["web", "native"];
 
 /**
- * The one wallet proof `WalletChallengeService.verify` consumes — `POST /auth/wallet`,
- * `POST /wallets/link` and the wallet half of `POST /me/identities/:id/reattach` all validate it
- * the same way. Key and signature encodings are decoded by util/canton-crypto (hex / base64 /
+ * The one wallet proof `WalletChallengeService.verify` consumes — `POST /wallets/link`
+ * (purpose `link-wallet`) and `POST /auth/admin` (purpose `admin-sign-in`) validate it the same
+ * way. Key and signature encodings are decoded by util/canton-crypto (hex / base64 /
  * base64url), so only presence and sane bounds are checked here.
  */
 export class WalletProofDto {
@@ -108,18 +108,15 @@ export class TelegramMiniAppDto extends ClientDto {
   initData!: string;
 }
 
-export class WalletChallengeDto {
+/** `POST /auth/admin/challenge { partyId }` — the purpose is always `admin-sign-in` (§7.4). */
+export class AdminChallengeDto {
   @IsString()
   @Matches(PARTY_ID_RE, { message: "partyId must be a Canton party id (<hint>::1220<64 hex>)" })
   partyId!: string;
-
-  @IsIn(CHALLENGE_PURPOSES)
-  purpose!: ChallengePurpose;
 }
 
-export class WalletLoginDto extends WalletProofDto {
-  /** `native` returns the session token in the body instead of a cookie (API.md "Auth"). */
-  @IsOptional()
-  @IsIn(LOGIN_CLIENTS)
-  client?: LoginClient;
-}
+/**
+ * `POST /auth/admin` — the wallet proof and nothing else: admin sessions are cookie-borne (the
+ * operator UI is a browser), so there is no `client`.
+ */
+export class AdminLoginDto extends WalletProofDto {}

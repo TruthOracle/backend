@@ -22,6 +22,11 @@ configured.
 | `to_settings.app_network is "X" but APP_NETWORK=Y` | the database was created for another network | point `DATABASE_URL` at the right database. Never edit `to_settings.app_network` to "fix" this: the Redis prefix, NATS stream, fingerprints and ledger credentials all differ per network |
 | `KYC_FINGERPRINT_PEPPER does not match to_settings.kyc_pepper_hash` | pepper changed without acknowledgement | §2 |
 
+A **warning** (not a refusal) is logged once at boot when neither `GOOGLE_CLIENT_IDS` nor
+`TELEGRAM_BOT_TOKEN` is configured: `no sign-in provider is configured … nobody can create an
+account`. The process still starts — local development routinely runs without either — but with
+no sign-in method there is no account, and therefore no deposit and no trading (ARCHITECTURE §18).
+
 ## 2. KYC pepper rotation
 
 `to_kyc_persons.fingerprint` values are `HMAC-SHA256(KYC_FINGERPRINT_PEPPER, canonical key)`.
@@ -138,8 +143,9 @@ curl -s localhost:8091/health                  # 200 { status: "ok", env, networ
 curl -s localhost:8091/health/ready            # 200 { checks: { postgres, redis, nats } } — 503 names the failing one
 curl -s localhost:8091/api/v1/me               # 401 { error: "unauthenticated" }
 curl -s -X POST -H 'Origin: http://localhost:8091' -H 'Content-Type: application/json' \
-  -d '{"partyId":"<party>","purpose":"sign-in"}' localhost:8091/api/v1/auth/wallet/challenge   # 200 { challengeId, message, expiresAt }
-curl -s -X POST -H 'Content-Type: application/json' -d '{}' localhost:8091/api/v1/auth/wallet/challenge   # 403 csrf_rejected (no Origin)
+  -d '{"partyId":"<operator party>"}' localhost:8091/api/v1/auth/admin/challenge   # 200 { challengeId, message, expiresAt }
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' localhost:8091/api/v1/auth/admin/challenge   # 403 csrf_rejected (no Origin)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8091/api/v1/auth/wallet   # 404 — wallet sign-in no longer exists
 curl -s localhost:8091/api/v1/nope             # 404 { error: "not_found" } — never Express's HTML page
 ```
 
@@ -161,11 +167,12 @@ answers, in order (`R` = `http://127.0.0.1:5199/__backend`):
 | Step | Expect |
 |---|---|
 | `GET R/health`, `GET R/health/ready` | 200, `checks` all `ok` |
-| `POST R/api/v1/auth/wallet/challenge { partyId, purpose: "sign-in" }` | 200; message has `Domain: 127.0.0.1:5199` (the app host, not the backend's) |
-| `POST R/api/v1/auth/wallet { challengeId, partyId, publicKey, signature, kind }` | 200 `mode: login, created: true, kind: user`; `Set-Cookie: to_session=…; Path=/; HttpOnly; SameSite=Lax` relayed (no `Domain=`; `Secure` outside dev) |
+| Sign in with Google or Telegram in the browser (the only user sign-ins, §6.1) | 200 `mode: login, created: true, kind: user`; `Set-Cookie: to_session=…; Path=/; HttpOnly; SameSite=Lax` relayed (no `Domain=`; `Secure` outside dev) |
+| `POST R/api/v1/wallets/link-challenge { partyId }` | 200; message starts `TruthOracle link-wallet` and has `Domain: 127.0.0.1:5199` (the app host, not the backend's) |
+| `POST R/api/v1/wallets/link { challengeId, partyId, publicKey, signature, kind }` | 200 `{ wallet }` — the first wallet is primary and sets `users.party_id`; no identity is created |
 | `GET R/api/v1/auth/session` · `GET R/api/v1/me` | `authenticated: true`; one primary wallet, `kyc.status: none` |
 | `GET R/api/v1/kyc` → `POST R/api/v1/kyc/sessions` → `POST R/api/v1/kyc/mock/submit` (approved, one PASSPORT) → `GET R/api/v1/kyc` | `none` → `{ provider: mock, verificationId }` → `approved` → `approved`, `attachedIdentityId` set |
-| `POST R/api/v1/wallets/link-challenge` + `POST R/api/v1/wallets/link` (second key) → `GET R/api/v1/me` | 200 `isPrimary: false`; two wallets, two identities, the KYC-initiating one `kycLocked: true` |
+| `POST R/api/v1/wallets/link-challenge` + `POST R/api/v1/wallets/link` (second key) → `GET R/api/v1/me` | 200 `isPrimary: false`; two wallets, still ONE identity (the sign-in method), which is `kycLocked: true` |
 | `POST R/api/v1/in-app-wallet/deposits/reconcile` | 200 when the treasury is reachable; `502 upstream_failed` ("wallet history read failed") when it is not — never a 500 |
 | `GET R/api/v1/me/sessions` → `POST R/api/v1/auth/logout` → `GET R/api/v1/me` | one session `current: true` → `{ ok: true }` with the cleared cookie relayed → 401 |
 | `POST` without `Origin` | `403 csrf_rejected` |
@@ -184,7 +191,7 @@ process. What each route does when `fetch` fails or Keycloak refuses the client 
 
 | Route | Behaviour |
 |---|---|
-| `POST /auth/wallet`, `POST /wallets/link` (first-time or relink), Google/Telegram sign-ins | unaffected — linking never reads the ledger (ARCHITECTURE §8.1); a first-time wallet sign-in succeeds while the ledger is down |
+| `POST /wallets/link` (first-time or relink), Google/Telegram sign-ins, `POST /auth/admin` | unaffected — linking never reads the ledger (ARCHITECTURE §8.1), so a first-time link succeeds while the ledger is down |
 | `GET /me`, `GET /wallets`, `GET /in-app-wallet` | 200 with `ownLedgerWallet: null` / `ledger: null` (degraded reads are logged, not surfaced) |
 | `POST /in-app-wallet/deposits/reconcile` | `502 upstream_failed`; nothing is written (the history walk precedes the write-ahead row) |
 | `POST /in-app-wallet/payouts/:cid/settle`, admin settle, processor scan | `502 upstream_failed` (user/admin) or a logged warning (scan); a row that already recorded a submission stays `settling` — fail closed, never re-transferred (ARCHITECTURE §9.4) |
@@ -203,11 +210,14 @@ queue.
 
 ## 11. Unlink refusals, in order
 
-`DELETE /me/identities/:id`, `DELETE /wallets/:id` and the admin unlink all go through
-`IdentityService.unlink`, which refuses in this order: `409 identity_locked_by_kyc` (users
-only — the identity that started the standing KYC approval, ARCHITECTURE §6.5; operators skip
-this), then `409 primary_wallet_in_use` (every actor — the wallet `users.party_id` points at,
-§8.2; make another wallet primary first, possible only while no on-ledger `UserWallet` or queued
-payout exists), then `409 last_identity` (§6.3). A wallet-only account with an approved KYC
-therefore sees `identity_locked_by_kyc` on its single wallet; an operator sees
-`primary_wallet_in_use`.
+Identities and wallets are unlinked by different routes with different rules, because a wallet
+is not a sign-in method (ARCHITECTURE §8.1).
+
+- `DELETE /me/identities/:id` and the admin unlink go through `IdentityService.unlink`, which
+  refuses `409 identity_locked_by_kyc` first (users only — the identity that started the standing
+  KYC approval, §6.5; operators skip this), then `409 last_identity` (§6.3). An account whose
+  only sign-in method started an approved verification therefore sees `identity_locked_by_kyc`.
+- `DELETE /wallets/:id` refuses only `409 primary_wallet_in_use` (the wallet `users.party_id`
+  points at, §8.2; make another wallet primary first, possible only while no on-ledger
+  `UserWallet` or queued payout exists). Unlinking any other wallet always succeeds: it revokes
+  the row, keeps its attribution, and never touches how the person signs in.

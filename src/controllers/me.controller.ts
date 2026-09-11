@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, P
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 import type { Response } from "express";
 
+import { AllowAdminSession } from "../auth/decorators";
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
 import { Config } from "../config";
 import { DEFAULT_PAGE_LIMIT, PageQueryDto } from "../dto/common.dto";
@@ -17,7 +18,6 @@ import { RateLimitService } from "../services/rate-limit.service";
 import { SessionService } from "../services/session.service";
 import { TelegramAuthService } from "../services/telegram-auth.service";
 import { UserService } from "../services/user.service";
-import { WalletChallengeService } from "../services/wallet-challenge.service";
 import { WalletLinkService } from "../services/wallet-link.service";
 import type {
   ApiAuditEvent,
@@ -30,13 +30,13 @@ import type {
   IdentityClaim,
   IdentityProvider,
 } from "../types";
-import { partyHint } from "../util/canton-crypto";
 import { ApiError } from "../util/errors";
 
 /**
  * Account routes (docs/API.md "Me"; ARCHITECTURE §6, §8.1, §9.4). Every route is session-only
  * (the global SessionGuard); the rules live in the owning services — this controller composes
- * them and shapes the wire objects.
+ * them and shapes the wire objects. An admin session may only read itself and manage its own
+ * sessions here (@AllowAdminSession, §6.8); identities, profile and audit stay user-only.
  */
 @ApiTags("me")
 @ApiCookieAuth("to_session")
@@ -53,11 +53,11 @@ export class MeController {
     private readonly audit: AuditService,
     private readonly googleAuth: GoogleAuthService,
     private readonly telegram: TelegramAuthService,
-    private readonly challenges: WalletChallengeService,
     private readonly rateLimit: RateLimitService,
   ) {}
 
   /** `{ user, identities, wallets (+ ownLedgerWallet), kyc, capabilities }` in one read. */
+  @AllowAdminSession()
   @Get()
   async me(@Req() req: AuthedRequest): Promise<ApiMe> {
     const { user, session } = principalOf(req);
@@ -106,7 +106,7 @@ export class MeController {
 
   // ── identities ─────────────────────────────────────────────────────────────
 
-  /** §6.3–6.5 via IdentityService.unlink: 409 last_identity | identity_locked_by_kyc | primary_wallet_in_use. */
+  /** §6.3–6.5 via IdentityService.unlink: 409 identity_locked_by_kyc | last_identity. */
   @Delete("identities/:id")
   @HttpCode(200)
   async unlinkIdentity(@Param("id", ParseUUIDPipe) id: string, @Req() req: AuthedRequest): Promise<{ ok: true }> {
@@ -117,8 +117,9 @@ export class MeController {
 
   /**
    * §6.4 (a): only the original owner, with a fresh proof for that provider — the body is the
-   * matching login route's body (Google credential, Telegram widget/initData, or a `link-wallet`
-   * challenge signed by the wallet). The proof is verified BEFORE the row is touched.
+   * matching login route's body (Google credential or Telegram widget/initData). The proof is
+   * verified BEFORE the row is touched. A `canton_wallet` identity (operators only) is never
+   * re-attached here.
    */
   @Post("identities/:id/reattach")
   @HttpCode(200)
@@ -127,11 +128,11 @@ export class MeController {
     @Body() body: ReattachIdentityDto,
     @Req() req: AuthedRequest,
   ): Promise<{ identity: ApiIdentity }> {
-    const { user, session } = principalOf(req);
+    const { user } = principalOf(req);
     const identity = await this.identities.findById(id);
     if (!identity || identity.userId !== user.id) throw new ApiError(404, "not_found", "identity not found");
     await this.rateLimit.enforce("link", { userId: user.id });
-    const claim = await this.proofFor(identity, body, session);
+    const claim = await this.proofFor(identity, body);
     const reattached = await this.identities.reattach(user.id, id, claim, actorOf(req));
     const locked = await this.kyc.lockedIdentityId(user.id);
     return { identity: this.identities.toApi(reattached, locked) };
@@ -139,6 +140,7 @@ export class MeController {
 
   // ── sessions ───────────────────────────────────────────────────────────────
 
+  @AllowAdminSession()
   @Get("sessions")
   async listSessions(@Req() req: AuthedRequest): Promise<{ sessions: ApiSession[] }> {
     const { user, session } = principalOf(req);
@@ -158,6 +160,7 @@ export class MeController {
   }
 
   /** Revoking the current session also clears the cookie so the browser drops it at once. */
+  @AllowAdminSession()
   @Delete("sessions/:id")
   @HttpCode(200)
   async revokeSession(
@@ -173,6 +176,7 @@ export class MeController {
     return { ok: true };
   }
 
+  @AllowAdminSession()
   @Post("sessions/revoke-others")
   @HttpCode(200)
   async revokeOthers(@Req() req: AuthedRequest): Promise<{ revoked: number }> {
@@ -224,7 +228,7 @@ export class MeController {
     };
   }
 
-  private async proofFor(identity: AuthIdentityEntity, body: ReattachIdentityDto, session: SessionEntity): Promise<IdentityClaim> {
+  private async proofFor(identity: AuthIdentityEntity, body: ReattachIdentityDto): Promise<IdentityClaim> {
     switch (identity.provider) {
       case "google": {
         if (!body.credential) throw new ApiError(400, "validation_failed", "credential is required to re-attach a Google identity");
@@ -238,21 +242,9 @@ export class MeController {
         }
         throw new ApiError(400, "validation_failed", "a Telegram widget payload or initData is required to re-attach a Telegram identity");
       }
-      case "canton_wallet": {
-        if (!body.challengeId || !body.partyId || !body.publicKey || !body.signature) {
-          throw new ApiError(400, "validation_failed", "challengeId, partyId, publicKey and signature are required to re-attach a wallet identity");
-        }
-        // The session-bound `link-wallet` challenge (§7.3 purpose isolation); the claim is consumed before verification.
-        const verified = await this.challenges.verify({
-          challengeId: body.challengeId,
-          partyId: body.partyId,
-          publicKey: body.publicKey,
-          signature: body.signature,
-          expectedPurpose: "link-wallet",
-          sessionId: session.id,
-        });
-        return { provider: "canton_wallet", subject: verified.partyId, profile: { name: partyHint(verified.partyId) } };
-      }
+      case "canton_wallet":
+        // Only operators hold one (§6.8); it is a credential for POST /auth/admin, not an account method.
+        throw new ApiError(400, "validation_failed", "wallet identities are not re-attached here");
       default:
         throw new ApiError(400, "validation_failed", "unsupported identity provider");
     }

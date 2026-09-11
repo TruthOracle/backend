@@ -5,23 +5,15 @@ import { DataSource, type EntityManager, Repository } from "typeorm";
 
 import { AuthIdentityEntity } from "../entities/auth-identity.entity";
 import { UserEntity } from "../entities/user.entity";
-import { WalletEntity } from "../entities/wallet.entity";
-import {
-  type Actor,
-  type ApiIdentity,
-  type IdentityClaim,
-  type IdentityProvider,
-  KYC_LOCK_LOOKUP,
-  type KycLockLookup,
-  NatsSubjects,
-} from "../types";
+import { type Actor, type ApiIdentity, type IdentityClaim, KYC_LOCK_LOOKUP, type KycLockLookup, NatsSubjects } from "../types";
 import { ApiError } from "../util/errors";
 import { AuditService } from "./audit.service";
 import { NatsService } from "./nats.service";
 import { SessionService } from "./session.service";
 import { UserService } from "./user.service";
 
-const PROFILE_KEYS = ["name", "username", "picture", "hd"] as const;
+/** `publicKey` is written only by `POST /auth/admin` (the operator's verified key, re-checked by AdminGuard against the pin). */
+const PROFILE_KEYS = ["name", "username", "picture", "hd", "publicKey"] as const;
 
 export interface LoginContext {
   currentUser: UserEntity | null;
@@ -66,10 +58,6 @@ export class IdentityService {
     const lookup = this.kycLock();
     if (!lookup) return null;
     return lookup.lockedIdentityId(userId);
-  }
-
-  async findByProviderSubject(provider: IdentityProvider, subject: string): Promise<AuthIdentityEntity | null> {
-    return this.identities.findOne({ where: { provider, subject } });
   }
 
   async findById(id: string): Promise<AuthIdentityEntity | null> {
@@ -209,24 +197,18 @@ export class IdentityService {
   }
 
   /**
-   * Unlink = revoke (§6.3–6.5, §8.2). Refused — in this order — for the identity locked by a
-   * standing KYC approval (`identity_locked_by_kyc`, admins excepted), for the wallet identity
-   * that owns the in-app balance (`primary_wallet_in_use`, every actor) and for the last active
-   * identity (`last_identity`). A `canton_wallet` identity's wallet row is revoked in the same
-   * transaction, with its own `wallet.unlinked` audit row and event, so `DELETE /me/identities/:id`
-   * and `DELETE /wallets/:id` leave an identical trail.
+   * Unlink = revoke (§6.3–6.5). Refused — in this order — for the identity locked by a standing
+   * KYC approval (`identity_locked_by_kyc`, admins excepted) and for the last active identity
+   * (`last_identity`). Wallet rows are never involved: a linked wallet has no identity (§8.1) and
+   * an operator's `canton_wallet` identity has no wallet row.
    */
   async unlink(userId: string, identityId: string, actor: Actor): Promise<void> {
-    let revokedWalletId: string | null = null;
     await this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(AuthIdentityEntity);
       const identity = await repo.findOne({ where: { id: identityId, userId } });
       if (!identity || identity.status !== "active") throw new ApiError(404, "not_found", "identity not found");
 
-      // Refusal precedence: §6.5 KYC lock (users only; the spec names this code for BOTH
-      // DELETE /me/identities/:id and DELETE /wallets/:id when the initiating identity is
-      // targeted) → §8.2 primary wallet (every actor, admins included: the primary owns the
-      // in-app balance) → §6.3 last identity.
+      // Refusal precedence: §6.5 KYC lock (users only) → §6.3 last identity.
       if (actor.type !== "admin") {
         const locked = await this.lockedIdentityId(userId);
         if (locked && locked === identity.id) {
@@ -234,37 +216,8 @@ export class IdentityService {
         }
       }
 
-      if (identity.provider === "canton_wallet") {
-        const user = await manager.getRepository(UserEntity).findOne({ where: { id: userId } });
-        if (user?.partyId && user.partyId === identity.subject) {
-          throw new ApiError(409, "primary_wallet_in_use", "the primary wallet owns the in-app balance and cannot be unlinked");
-        }
-      }
-
       const others = await repo.count({ where: { userId, status: "active" } });
       if (others <= 1) throw new ApiError(409, "last_identity", "an account must keep at least one sign-in method");
-
-      if (identity.provider === "canton_wallet") {
-        const wallets = manager.getRepository(WalletEntity);
-        const walletRow = await wallets.findOne({ where: { userId, partyId: identity.subject, status: "active" } });
-        if (walletRow) {
-          await wallets.update({ id: walletRow.id }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
-          revokedWalletId = walletRow.id;
-          await this.audit.record(
-            {
-              actorType: actor.type,
-              actorUserId: actor.userId ?? null,
-              actorSessionId: actor.sessionId ?? null,
-              action: "wallet.unlinked",
-              subjectType: "wallet",
-              subjectId: walletRow.id,
-              metadata: { userId, partyId: walletRow.partyId, identityId: identity.id },
-              ip: actor.ip ?? null,
-            },
-            manager,
-          );
-        }
-      }
 
       identity.status = "unlinked";
       identity.unlinkedAt = new Date();
@@ -286,7 +239,6 @@ export class IdentityService {
     // Sessions that were authenticated by this identity die with it.
     await this.sessions.revokeByIdentity(identityId);
     void this.nats.publishSafe(NatsSubjects.identityUnlinked, { userId, identityId });
-    if (revokedWalletId) void this.nats.publishSafe(NatsSubjects.walletUnlinked, { userId, walletId: revokedWalletId, identityId });
   }
 
   /**
@@ -337,12 +289,6 @@ export class IdentityService {
     identity.profile = { ...identity.profile, ...profile };
     if (email) identity.email = email;
     await repo.save(identity);
-    if (identity.provider === "canton_wallet") {
-      // The wallet row follows the identity back (credited_cc untouched — §8.1).
-      await manager
-        .getRepository(WalletEntity)
-        .update({ userId: identity.userId, partyId: identity.subject, status: "revoked" }, { status: "active", revokedAt: null });
-    }
     await this.audit.record(
       {
         actorType: actor.type,

@@ -72,7 +72,8 @@ src/migrations/<ts>-Init.ts   the ONE migration: creates everything (CREATE EXTE
 src/auth/session.guard.ts   SessionGuard (global): resolves the session from the to_session cookie or Authorization: Bearer;
                             sets req.session (SessionEntity), req.user (UserEntity), req.authIdentityId; routes marked @Public() pass
                             through unauthenticated (req.user may still be set when a valid session is present — "link mode");
-                            suspended/closed users → 403 user_suspended
+                            suspended/closed users → 403 user_suspended; a kind="admin" session reaches only @Public routes and
+                            handlers/controllers marked @AllowAdminSession — everything else → 403 forbidden (§6.9, default deny)
 src/auth/admin.guard.ts     AdminGuard: session.kind === "admin" AND the session's identity party ∈ config.adminOperators (re-read
                             per request; pinned key check when configured) else 403 forbidden
 src/auth/csrf.guard.ts      CsrfGuard (global, ARCHITECTURE §6.7): non-GET → Origin/Referer allowed AND (json content-type OR
@@ -178,17 +179,21 @@ reattach(userId, identityId, claim: IdentityClaim, actor): Promise<AuthIdentityE
 listForUser(userId): Promise<AuthIdentityEntity[]>; toApi(identity, kycLockedIdentityId?: string|null): ApiIdentity
 findByProviderSubject(provider, subject): Promise<AuthIdentityEntity | null>
 
-// WalletChallengeService  (ARCHITECTURE §7.3)
-issue(input: { partyId; purpose: 'sign-in'|'link-wallet'|'admin-sign-in'; sessionId?: string|null; host: string }): Promise<{ challengeId; message; expiresAt }>
+// WalletChallengeService  (ARCHITECTURE §7.3) — a wallet proof links a wallet or signs an OPERATOR in; it never signs a user in
+issue(input: { partyId; purpose: 'link-wallet'|'admin-sign-in'; sessionId?: string|null; host: string }): Promise<{ challengeId; message; expiresAt }>
+   // link-wallet requires a sessionId (401 unauthenticated); admin-sign-in refuses one (409 challenge_purpose_mismatch)
 verify(input: { challengeId; partyId; publicKey; signature; expectedPurpose: ChallengePurpose | ChallengePurpose[]; sessionId?: string|null }):
    Promise<{ partyId; publicKeyBase64: string; purpose; form: string }>   // consumes the claim BEFORE verifying; throws 401 challenge_rejected / challenge_purpose_mismatch / wallet_key_mismatch / signature_invalid
 
 // --- feature seams (implemented by the packages named) ---
 // LoginService (P1)
 completeLogin(res, claim, ctx: { req; kind: 'user'|'admin'; client: 'web'|'native' }): Promise<LoginResult>   // resolveForLogin → SessionService.issue → cookie/bearer → audit + NATS
+   // seeds no wallet row for anyone; kind="admin" demands a canton_wallet claim whose party is an operator, and a
+   // canton_wallet claim with kind!=="admin" is refused outright (403) — wallets do not sign users in (§6.1, §7.4)
 
 // WalletLinkService (P2)
-link(userId, verified: { partyId; publicKeyBase64; kind }, opts: { label?; actor }): Promise<{ wallet: WalletEntity; identity: AuthIdentityEntity }>   // no ledger I/O (§8.1)
+link(userId, verified: { partyId; publicKeyBase64; kind }, opts: { label?; actor }): Promise<{ wallet: WalletEntity }>   // no ledger I/O and no identity (§8.1);
+   // the party → first-account binding is the unique to_wallets.party_id alone → 409 wallet_already_linked
 findByParty(partyId): Promise<WalletEntity | null>            // active OR revoked
 listForUser(userId): Promise<WalletEntity[]>; unlink(userId, walletId, actor): Promise<void>; setPrimary(userId, walletId, actor): Promise<WalletEntity>
 toApi(wallet, extras?: { ownLedgerWallet?: LedgerWallet|null; receivedCC?: bigint }): ApiWallet

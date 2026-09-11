@@ -4,14 +4,13 @@ import type { Response } from "express";
 import type { AuthedRequest } from "../auth/request";
 import { Config } from "../config";
 import type { UserEntity } from "../entities/user.entity";
-import { type ApiLoginResult, type IdentityClaim, NatsSubjects, type SessionKind, type WalletKind } from "../types";
+import { type ApiLoginResult, type IdentityClaim, NatsSubjects, type SessionKind } from "../types";
 import { ApiError } from "../util/errors";
 import { AuditService } from "./audit.service";
 import { IdentityService } from "./identity.service";
 import { NatsService } from "./nats.service";
 import { SessionService } from "./session.service";
 import { UserService } from "./user.service";
-import { WalletLinkService } from "./wallet-link.service";
 
 export interface LoginContext {
   req: AuthedRequest;
@@ -19,18 +18,15 @@ export interface LoginContext {
   client: "web" | "native";
   /** Overrides `req.user` (OIDC login mode ignores a session that appeared meanwhile). */
   currentUser?: UserEntity | null;
-  /**
-   * For `canton_wallet` claims: the verified key + kind, so the wallet row is created/seeded
-   * (WalletLinkService.link — the one place the seed rule lives) BEFORE a session is issued.
-   */
-  wallet?: { publicKeyBase64: string; kind: WalletKind };
 }
 
 /**
  * The last mile of every sign-in method (docs/ARCHITECTURE.md §6, §7.4; INTERNALS "LoginService"):
- * IdentityService.resolveForLogin → (wallet row) → SessionService.issue → Set-Cookie or bearer
- * token → audit (`auth.login` / `auth.admin_login`) → NATS. With a session present the identity
- * is attached to the current account instead (`mode: "link"`, no new session).
+ * IdentityService.resolveForLogin → SessionService.issue → Set-Cookie or bearer token → audit
+ * (`auth.login` / `auth.admin_login`) → NATS. With a session present the identity is attached to
+ * the current account instead (`mode: "link"`, no new session). A wallet never passes through
+ * here as a user's credential: a `canton_wallet` claim is accepted only for an operator's admin
+ * session (§6.8); users link their wallet through WalletLinkService after signing in (§8.1).
  */
 @Injectable()
 export class LoginService {
@@ -41,7 +37,6 @@ export class LoginService {
     private readonly users: UserService,
     private readonly audit: AuditService,
     private readonly nats: NatsService,
-    private readonly walletLink: WalletLinkService,
   ) {}
 
   async completeLogin(res: Response, claim: IdentityClaim, ctx: LoginContext): Promise<ApiLoginResult> {
@@ -58,6 +53,11 @@ export class LoginService {
         throw new ApiError(403, "forbidden", "admin sessions are issued only to operator wallets");
       }
     }
+    // §6.1: a wallet is a signing key linked to an account, never a user identity. No route reaches
+    // this branch; it pins the rule so no future caller can turn a wallet proof into a user session.
+    if (claim.provider === "canton_wallet" && ctx.kind !== "admin") {
+      throw new ApiError(403, "forbidden", "wallets do not sign users in");
+    }
 
     const resolution = await this.identities.resolveForLogin(claim, {
       currentUser,
@@ -65,22 +65,8 @@ export class LoginService {
       userAgent,
       sessionId: currentSession?.id ?? null,
     });
-    let { user, identity } = resolution;
+    const { user, identity } = resolution;
     const actorType = ctx.kind === "admin" ? "admin" : "user";
-
-    // §7.3 "On success: identity + wallet row seeded per §8.1" — before any session exists, so a
-    // failed seed never leaves a cookie behind.
-    if (ctx.wallet && claim.provider === "canton_wallet") {
-      const linked = await this.walletLink.link(
-        user.id,
-        { partyId: claim.subject, publicKeyBase64: ctx.wallet.publicKeyBase64, kind: ctx.wallet.kind },
-        { actor: { type: actorType, userId: user.id, sessionId: currentSession?.id ?? null, ip } },
-      );
-      identity = linked.identity;
-      // The first link sets users.party_id.
-      user = (await this.users.findById(user.id)) ?? user;
-    }
-
     const locked = await this.identities.lockedIdentityId(user.id);
 
     if (resolution.mode === "link") {

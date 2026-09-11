@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, Param, ParseUUIDPipe, Post, Query, Req
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { AdminGuard } from "../auth/admin.guard";
+import { AllowAdminSession } from "../auth/decorators";
 import { type AuthedRequest, actorOf } from "../auth/request";
 import {
   AdminAuditQueryDto,
@@ -44,13 +45,15 @@ export function adminActorOf(req: AuthedRequest): AdminActor {
 
 /**
  * Operator API (docs/API.md "Admin"; ARCHITECTURE §11). Every route sits behind AdminGuard —
- * a wallet-signed `kind = admin` session whose party is still in ADMIN_OPERATORS (§6.8).
- * Every mutation requires a `reason` and is audited with actorType `admin`.
+ * a wallet-signed `kind = admin` session whose party is still in ADMIN_OPERATORS (§6.8); the
+ * class-level @AllowAdminSession lets SessionGuard admit that kind here at all. Every mutation
+ * requires a `reason` and is audited with actorType `admin`.
  */
 @ApiTags("admin")
 @ApiCookieAuth("to_session")
 @ApiBearerAuth()
 @Controller("admin")
+@AllowAdminSession()
 @UseGuards(AdminGuard)
 export class AdminController {
   constructor(private readonly admin: AdminService) {}

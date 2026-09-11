@@ -77,9 +77,9 @@ interface Payout {
 - `POST /auth/telegram/miniapp` `{ initData, client? }` → `200 LoginResult`
 - `GET /auth/telegram/oidc/start?mode=login|link&returnTo=/path` → `302` to Telegram (sets `to_oidc`)
 - `GET /auth/telegram/oidc/callback?code&state` → `302` to `<app origin><returnTo>?auth=ok` or `?auth=error&code=<error code>`
-- `POST /auth/wallet/challenge` `{ partyId, purpose: "sign-in" | "link-wallet" | "admin-sign-in" }` → `200 { challengeId, message, expiresAt }`
-- `POST /auth/wallet` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", client? }` → `200 LoginResult`
-- `POST /auth/logout` → `200 { ok: true }` (clears cookie, revokes the session)
+- `POST /auth/admin/challenge` `{ partyId }` → `200 { challengeId, message, expiresAt }` (purpose `admin-sign-in`; `409 challenge_purpose_mismatch` when a session cookie is present)
+- `POST /auth/admin` `{ challengeId, partyId, publicKey, signature, kind: "cantor8" }` → `200 LoginResult` with `kind: "admin"` | `403 forbidden` (not an operator, or a session is present)
+- `POST /auth/logout` → `200 { ok: true }` (clears cookie, revokes the session; accepts an admin session)
 
 ```ts
 interface LoginResult {
@@ -90,17 +90,25 @@ interface LoginResult {
   token?: string;                            // only for client = "native"
 }
 ```
-With a session cookie present, the three login routes act in **link mode** (they attach the
-identity to the current account and return `mode: "link"`); `/auth/wallet` in link mode
-requires a `link-wallet` challenge issued to that session. Signing in with an unlinked
-identity returns `403 identity_unlinked`; linking an identity owned by another account
-returns `409 identity_already_linked`; a wallet owned by another account `409 wallet_already_linked`.
+Google and Telegram are the only ways a USER account is created or opened. With a session
+cookie present those routes act in **link mode** (they attach the identity to the current
+account and return `mode: "link"`). A Cantor8 wallet never signs a user in: it is linked to a
+signed-in account under "Wallets" below. `POST /auth/admin` is operator-only, issues a
+`kind = "admin"` session and never runs in link mode.
+
+Signing in with an unlinked identity returns `403 identity_unlinked`; linking an identity owned
+by another account returns `409 identity_already_linked`; a wallet owned by another account
+`409 wallet_already_linked`.
+
+**Session kind.** A `kind = "admin"` session is accepted only on `/admin/**`, `POST /auth/logout`,
+`GET /me` and the `/me/sessions` routes. Every other account route answers `403 forbidden`
+("admin sessions cannot use account routes").
 
 ## Me
 - `GET /me` → `200 { user: User, identities: Identity[], wallets: Wallet[], kyc: KycSummary, capabilities: Capabilities }`
 - `PATCH /me` `{ displayName?, avatarUrl? }` → `200 { user }`
 - `DELETE /me/identities/:id` → `200 { ok: true }` | `409 last_identity` | `409 identity_locked_by_kyc`
-- `POST /me/identities/:id/reattach` → `200 { identity }` (only the original owner; requires a fresh proof for that provider: body is the same as the matching login route)
+- `POST /me/identities/:id/reattach` → `200 { identity }` (only the original owner; requires a fresh proof for that provider — a Google credential or a Telegram payload; an unlinked WALLET is restored by linking it again, not here)
 - `GET /me/sessions` → `200 { sessions: Session[] }`
 - `DELETE /me/sessions/:id` → `200 { ok: true }`
 - `POST /me/sessions/revoke-others` → `200 { revoked: number }`
@@ -109,8 +117,8 @@ returns `409 identity_already_linked`; a wallet owned by another account `409 wa
 ## Wallets
 - `GET /wallets` → `200 { wallets: Wallet[] }`
 - `POST /wallets/link-challenge` `{ partyId }` → `200 { challengeId, message, expiresAt }`
-- `POST /wallets/link` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", label? }` → `200 { wallet: Wallet, identity: Identity }` (never reads the ledger; works while it is down)
-- `DELETE /wallets/:id` → `200 { ok: true }` | `409 primary_wallet_in_use` | `409 last_identity` | `409 identity_locked_by_kyc`
+- `POST /wallets/link` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", label? }` → `200 { wallet: Wallet }` (never reads the ledger; works while it is down; creates no identity)
+- `DELETE /wallets/:id` → `200 { ok: true }` | `409 primary_wallet_in_use`
 - `POST /wallets/:id/primary` → `200 { wallet }` | `409 primary_wallet_in_use`
 
 ## In-app wallet

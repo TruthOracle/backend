@@ -105,16 +105,21 @@ e2e spec (`test/{session,app,auth,wallets,payouts,kyc,admin}.e2e-spec.ts`).
 **Greenfield (ARCHITECTURE §18, decided 2026-09-10):** no backward compatibility with the earlier
 account-less app. The primary wallet's on-ledger `UserWallet` is created only by this backend;
 deposits and withdrawals require a signed-in account; linking never reads the ledger (a first-time
-wallet sign-in succeeds while the ledger is down); deposit confirmation keys on
+link succeeds while the ledger is down); deposit confirmation keys on
 `UserWallet.depositRefs`; attribution drift in either direction is a hard
 `409 deposit_attribution_drift`; one `Init` migration creates the final schema; package
 truthoracle-v14.
+
+**Accounts and wallets (decided 2026-09-11, ARCHITECTURE §6.1 / §7.3 / §8.1):** Google and Telegram
+are the only user sign-in methods. A Cantor8 wallet is linked to an already signed-in account and
+creates no identity, so one person maps to one account that KYC can bind; operators sign into the
+admin API with their wallet on `POST /auth/admin`. Admin sessions are refused on account routes.
 
 Verified on 2026-09-10: `npm run typecheck`, `npm run lint`, `npm run build` exit 0;
 `npm test` 21 suites / 150 tests; `npm run test:e2e` 7 suites / 161 tests against real
 Postgres + Redis. A live boot against Postgres + Redis + a JetStream `nats-server`, driven
 **through the `truthoracle-canton` vite relay** (`/__backend/api/v1`), passes the sequence in
-`docs/RUNBOOK.md` §8 — health, wallet sign-in with the relayed `to_session` cookie, mock KYC
-approval, linking a second wallet, deposit reconcile answering `502 upstream_failed` against an
+`docs/RUNBOOK.md` §8 — health, social sign-in with the relayed `to_session` cookie, mock KYC
+approval, linking wallets, deposit reconcile answering `502 upstream_failed` against an
 unreachable treasury, sessions, logout, CSRF/404 envelopes — and the boot refusals in §1 exit 1
 within a second.
