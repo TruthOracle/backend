@@ -9,3 +9,9 @@ export { PayoutsController } from "./payouts.controller";
 export { KycController } from "./kyc.controller";
 export { WebhooksController } from "./webhooks.controller";
 export { AdminController } from "./admin.controller";
+// ledger index reads (docs/INDEXER.md §7)
+export { MarketsController } from "./markets.controller";
+export { LedgerController } from "./ledger.controller";
+export { PortfolioController } from "./portfolio.controller";
+export { LedgerWalletController } from "./ledger-wallet.controller";
+export { AdminLedgerController } from "./admin-ledger.controller";

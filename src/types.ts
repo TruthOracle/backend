@@ -248,6 +248,22 @@ export const NatsSubjects = {
   /** `truthoracle.kyc.webhook.<provider>`, payload `{ eventId }` only. */
   kycWebhook: (provider: KycProviderName): `truthoracle.kyc.webhook.${KycProviderName}` =>
     `truthoracle.kyc.webhook.${provider}`,
+  // ── ledger indexer (docs/INDEXER.md) — payloads carry offsets, contract / event ids and party ids only ──
+  /** One committed ledger transaction was indexed: `{ updateId, offset, events }`. */
+  ledgerTx: "truthoracle.ledger.tx",
+  /** A market's current state changed: `{ marketId, offset, cause }`. */
+  marketUpdated: "truthoracle.market.updated",
+  /** `truthoracle.market.event.<kind>` (buy, sell, swap, …): `{ marketId, eventId, actor, offset }`. */
+  marketEvent: (kind: string): `truthoracle.market.event.${string}` =>
+    `truthoracle.market.event.${kind}`,
+  /** A UserWallet moved: `{ owner, kind, eventId, offset }`. */
+  walletEntry: "truthoracle.wallet.entry",
+  /** A PendingPayout was created or settled on-ledger: `{ contractId, change, offset }`. */
+  ledgerPayoutChanged: "truthoracle.payout.ledger_changed",
+  /** A Canton Coin transfer involving the treasury landed: `{ updateId, direction, counterparty, offset }`. */
+  transferSeen: "truthoracle.transfer.seen",
+  /** The indexer resynced from an ACS snapshot and lost the updates in between: `{ fromOffset, toOffset, reason }`. */
+  indexerGap: "truthoracle.indexer.gap",
 } as const;
 export type NatsSubject = `truthoracle.${string}`;
 
@@ -291,7 +307,8 @@ export type AuditAction =
   | "kyc.admin_override"
   | "kyc.person_transferred"
   | "kyc.webhook_received"
-  | "kyc.webhook_replayed";
+  | "kyc.webhook_replayed"
+  | "ledger.resync";
 
 // ---------------------------------------------------------------------------------------------
 // Wire shapes (docs/API.md) — money is a 10-dp string, timestamps ISO-8601
@@ -489,6 +506,343 @@ export interface InAppWalletOverview {
   };
   pending: { submitted: number };
   payouts: ApiPayout[];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ledger index — wire shapes (docs/API.md "Markets", "Portfolio", "Ledger"; docs/INDEXER.md)
+// Daml `Decimal`s (prices, shares, CC) are 10-dp strings like Money; Daml `Int` epoch seconds are
+// ISO-8601 strings; durations stay integer seconds; parties are Canton party ids.
+// ---------------------------------------------------------------------------------------------
+
+/** Daml `Decimal` on the wire — same 10-dp string as Money. */
+export type ApiDecimal = string;
+
+export type MarketStatus = "Trading" | "Proposed" | "Resolved" | "Voided";
+export type MarketOutcome = "Yes" | "No" | "VoidOutcome";
+export type TradeSide = "Yes" | "No";
+/** Where a market is in its life, derived from status + clock (mirrors the frontend's `getMarketPhase`). */
+export type MarketPhase = "liquidity" | "trading" | "expired" | "proposed" | "resolved" | "voided";
+
+/** Every kind of on-ledger market activity the indexer derives (one per PredictionMarket / MarketCounter choice). */
+export const MARKET_EVENT_KINDS = [
+  "market_created",
+  "buy",
+  "sell",
+  "swap",
+  "split",
+  "merge",
+  "provide_liquidity",
+  "withdraw_liquidity",
+  "resolve_t0",
+  "resolve",
+  "propose",
+  "challenge",
+  "finalize",
+  "void",
+  "redeem",
+  "commit_forecast",
+  "score_and_distribute",
+  "archive",
+] as const;
+export type MarketEventKind = (typeof MARKET_EVENT_KINDS)[number];
+/** The kinds that move shares — `GET /markets/:id/trades` and `GET /me/trades` filter on these. */
+export const TRADE_KINDS: readonly MarketEventKind[] = ["buy", "sell", "swap", "split", "merge"];
+
+export const WALLET_ENTRY_KINDS = ["deposit", "credit", "debit", "withdraw"] as const;
+export type WalletEntryKind = (typeof WALLET_ENTRY_KINDS)[number];
+
+export type LedgerPayoutSettledKind = "mark_paid" | "settle_to_wallet" | "cancelled" | "archived";
+
+export interface ApiResolutionPolicy {
+  operatorResolution: boolean;
+  sources: string[];
+  sourceKeys: { sourceUri: string; publicKey: string }[];
+  reporters: string[];
+  quorum: number;
+  challengeSecs: number;
+  bondCC: ApiDecimal;
+}
+
+export interface ApiProposal {
+  proposer: string;
+  proposedOutcome: MarketOutcome;
+  proposedAt: string;
+  bondCC: ApiDecimal;
+  challenger: string | null;
+  challengerOutcome: MarketOutcome | null;
+  /** `proposedAt + policy.challengeSecs` */
+  challengeEndsAt: string;
+}
+
+export interface ApiMarket {
+  marketId: number;
+  contractId: string;
+  admin: string;
+  question: string;
+  imageUrl: string;
+  description: string;
+  resolutionDescription: string;
+  category: string;
+  createdAt: string;
+  expiresAt: string;
+  /** `createdAt + liquidityPeriodSecs` — trading opens here. */
+  tradingStartsAt: string;
+  gracePeriodSecs: number;
+  isDynamic: boolean;
+  liquidityPeriodSecs: number;
+  reserveYes: ApiDecimal;
+  reserveNo: ApiDecimal;
+  liquidityL: ApiDecimal;
+  lpTokenSupply: ApiDecimal;
+  currentPrice: ApiDecimal;
+  feeBps: number;
+  prizeFeeShareBps: number;
+  accumulatedFeesCC: ApiDecimal;
+  prizePoolCC: ApiDecimal;
+  totalVolumeCC: ApiDecimal;
+  status: MarketStatus;
+  outcome: MarketOutcome | null;
+  resolvedAt: string | null;
+  proposal: ApiProposal | null;
+  policy: ApiResolutionPolicy;
+  auditObservers: string[];
+  phase: MarketPhase;
+  /** `ArchiveMarket` (or a plain Archive) consumed the market without a successor version. */
+  archived: boolean;
+  tradeCount: number;
+  lastTradeAt: string | null;
+  /** Offset of the ledger transaction that produced this version. */
+  updatedOffset: number;
+  createdOffset: number;
+  synchronizerId: string | null;
+  /** Only on `GET /markets/:id` — the disclosed-contract blob a user-signed trade needs. */
+  createdEventBlob?: string | null;
+}
+
+/** The market fields a portfolio row is enriched with. */
+export interface ApiMarketSummary {
+  marketId: number;
+  contractId: string;
+  question: string;
+  imageUrl: string;
+  category: string;
+  status: MarketStatus;
+  outcome: MarketOutcome | null;
+  currentPrice: ApiDecimal;
+  expiresAt: string;
+  resolvedAt: string | null;
+  phase: MarketPhase;
+  archived: boolean;
+}
+
+export interface ApiMarketEvent {
+  id: string;
+  eventId: string;
+  marketId: number;
+  kind: MarketEventKind;
+  actor: string;
+  side: TradeSide | null;
+  /** buy: collateral in · sell / swap: gross CC value · split / merge: CC minted / burned · provide: value increase · redeem: payout · propose / challenge: bond */
+  amountCC: ApiDecimal | null;
+  /** buy: collateral after fees · sell: proceeds credited · provide: CC debited · withdraw_liquidity: CC credited */
+  netCC: ApiDecimal | null;
+  /** buy: shares received · sell / swap: shares given · split / merge: pairs · redeem: shares burned · withdraw_liquidity (early static exit): YES shares out */
+  shares: ApiDecimal | null;
+  /** swap: shares received · withdraw_liquidity (early static exit): NO shares out */
+  sharesOut: ApiDecimal | null;
+  feeCC: ApiDecimal | null;
+  priceBefore: ApiDecimal | null;
+  priceAfter: ApiDecimal | null;
+  lpTokens: ApiDecimal | null;
+  outcome: MarketOutcome | null;
+  details: Record<string, unknown>;
+  offset: number;
+  updateId: string;
+  commandId: string | null;
+  effectiveAt: string;
+}
+
+export interface ApiPricePoint {
+  t: string;
+  price: ApiDecimal;
+  /** Cumulative `totalVolumeCC` of the market at that point. */
+  volumeCC: ApiDecimal;
+  offset: number;
+}
+
+export interface ApiPosition {
+  contractId: string;
+  holder: string;
+  marketId: number;
+  yesShares: ApiDecimal;
+  noShares: ApiDecimal;
+  costBasisCC: ApiDecimal;
+  active: boolean;
+  createdAt: string;
+  createdOffset: number;
+  archivedAt: string | null;
+  market: ApiMarketSummary | null;
+  /** Mark-to-market while Trading (`yes·p + no·(1−p)`), the redeemable amount once settled, null when the market is unknown. */
+  valueCC: ApiDecimal | null;
+  /** Resolved: winning shares · Voided: `min(costBasis, max(yes, no))` · otherwise null. */
+  redeemableCC: ApiDecimal | null;
+}
+
+export interface ApiLiquidityPosition {
+  contractId: string;
+  provider: string;
+  marketId: number;
+  lpTokens: ApiDecimal;
+  depositedCC: ApiDecimal;
+  active: boolean;
+  createdAt: string;
+  createdOffset: number;
+  archivedAt: string | null;
+  market: ApiMarketSummary | null;
+  /** `lpTokens / market.lpTokenSupply`, 10-dp fraction; null without a market. */
+  poolShare: ApiDecimal | null;
+}
+
+export interface ApiWalletEntry {
+  id: string;
+  eventId: string;
+  owner: string;
+  kind: WalletEntryKind;
+  amountCC: ApiDecimal;
+  /** Credit / Debit `reason` (buy, sell, split, merge, liquidity, liquidity-provide, bond, resolve, void-refund, cancel:…, a payout reason); `withdraw`; null for deposits. */
+  reason: string | null;
+  /** Deposit only: the transfer reference credited. */
+  txRef: string | null;
+  balanceAfter: ApiDecimal | null;
+  marketId: number | null;
+  /** The market / payout choice this entry was part of (Buy, Sell, SettleToWallet, …); null for a standalone Deposit / Withdraw. */
+  rootChoice: string | null;
+  walletContractId: string;
+  offset: number;
+  updateId: string;
+  effectiveAt: string;
+}
+
+export interface ApiIndexedWallet {
+  contractId: string;
+  owner: string;
+  balanceCC: ApiDecimal;
+  depositedCC: ApiDecimal;
+  withdrawnCC: ApiDecimal;
+  depositRefs: string[];
+  updatedOffset: number;
+  updatedAt: string;
+}
+
+export interface ApiLedgerPayout {
+  contractId: string;
+  user: string;
+  marketId: number;
+  amountCC: ApiDecimal;
+  reason: string;
+  createdAt: string;
+  createdOffset: number;
+  active: boolean;
+  settledKind: LedgerPayoutSettledKind | null;
+  settledAt: string | null;
+  settledOffset: number | null;
+  txHash: string | null;
+  /** CancelPayout only: the amount was re-credited to the in-app wallet. */
+  refunded: boolean | null;
+}
+
+export interface ApiLedgerTransfer {
+  updateId: string;
+  offset: number;
+  direction: "in" | "out";
+  counterparty: string;
+  amountCC: ApiDecimal;
+  choice: string;
+  recordTime: string;
+}
+
+export interface ApiAttestation {
+  contractId: string;
+  attester: string;
+  marketId: number;
+  sourceUri: string;
+  fetchedAt: string;
+  outcome: MarketOutcome;
+  payloadHash: string;
+  hasSourceSignature: boolean;
+  responseExcerpt: string | null;
+  active: boolean;
+  createdOffset: number;
+}
+
+export interface ApiModelForecast {
+  contractId: string;
+  author: string;
+  marketId: number;
+  modelId: string;
+  probabilityYes: ApiDecimal;
+  committedAt: string;
+  marketPriceAtCommit: ApiDecimal;
+  active: boolean;
+  createdOffset: number;
+}
+
+export interface ApiPredictionModel {
+  contractId: string;
+  author: string;
+  modelId: string;
+  name: string;
+  description: string;
+  payoutParty: string;
+  active: boolean;
+  createdOffset: number;
+}
+
+export interface ApiIndexerGap {
+  fromOffset: number;
+  toOffset: number;
+  reason: string;
+  at: string;
+}
+
+export interface ApiLedgerStatus {
+  enabled: boolean;
+  /** This process currently holds the indexer lock and is streaming. */
+  running: boolean;
+  bootstrapped: boolean;
+  bootstrappedAt: string | null;
+  bootstrapOffset: number | null;
+  /** Last offset applied to the index (every update ≤ this is reflected in the read API). */
+  offset: number;
+  ledgerEnd: number | null;
+  /** `ledgerEnd − offset` (offsets, not seconds); 0 when caught up. */
+  lag: number | null;
+  prunedOffset: number | null;
+  lastUpdateId: string | null;
+  lastRecordTime: string | null;
+  lastError: string | null;
+  lastErrorAt: string | null;
+  gaps: ApiIndexerGap[];
+  updatedAt: string | null;
+}
+
+export interface ApiStats {
+  markets: { total: number; trading: number; proposed: number; resolved: number; voided: number };
+  totalVolumeCC: ApiDecimal;
+  volume24hCC: ApiDecimal;
+  trades: number;
+  trades24h: number;
+  traders: number;
+  indexedOffset: number;
+}
+
+export interface ApiLeaderboardEntry {
+  party: string;
+  volumeCC: ApiDecimal;
+  trades: number;
+  markets: number;
+  /** CC credited back (sell, merge, resolve, void-refund, liquidity) minus CC debited (buy, split, liquidity-provide) over the window. */
+  realizedPnlCC: ApiDecimal;
 }
 
 // ---------------------------------------------------------------------------------------------

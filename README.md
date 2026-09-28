@@ -1,14 +1,15 @@
 # truthoracle-backend
 
-Accounts, sessions, wallet linking, KYC and money rails for TruthOracle on Canton. NestJS 12 /
+Accounts, sessions, wallet linking, KYC, money rails and the **ledger index** (markets, trades,
+positions, wallet statements, payouts, transfers — docs/INDEXER.md) for TruthOracle on Canton. NestJS 12 /
 TypeScript 6 / TypeORM 1 / Postgres / Redis / NATS JetStream. A sibling of `truthoracle-canton`
 (frontend + Vercel functions), `truthoracle-contracts` (Daml) and `enterprise-wallet`; laid out
 like `risk-monitor-backend`.
 
 The behavioural contract is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (v2), the HTTP
 shapes are [`docs/API.md`](docs/API.md), the internal file/class/method seams are
-[`docs/INTERNALS.md`](docs/INTERNALS.md) and operator procedures live in
-[`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+[`docs/INTERNALS.md`](docs/INTERNALS.md), the ledger indexer is [`docs/INDEXER.md`](docs/INDEXER.md)
+and operator procedures live in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 ## Quick start
 
@@ -43,9 +44,10 @@ src/
 ├── auth/                  # SessionGuard, AdminGuard, CsrfGuard, decorators, proxy-contract request helpers
 ├── controllers/           # one per resource; index.ts exports controller classes only
 ├── services/              # index.ts exports service classes only
-├── processors/            # scheduled / NATS-driven loops
-├── entities/              # 11 `to_*` tables (ARCHITECTURE §5); index.ts exports postgresEntities
-├── migrations/            # checked-in migrations; synchronize is hard-coded false
+├── processors/            # scheduled / NATS-driven loops (incl. the ledger indexer loop)
+├── indexer/               # ledger event normalisation, tree building, the projection, Splice transfer extraction (pure)
+├── entities/              # 11 account `to_*` tables (ARCHITECTURE §5) + 14 ledger-index tables (INDEXER.md §3)
+├── migrations/            # checked-in migrations (Init, LedgerIndex); synchronize is hard-coded false
 ├── dto/                   # class-validator request DTOs
 └── util/                  # money (bigint fixed point), canton-crypto, telegram, cookies, errors, …
 test/
@@ -76,9 +78,10 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (against a migrated database it must print "No changes in database schema") |
 | `npm run migration:run` · `migration:revert` | apply / roll back |
 
-There is exactly one migration (`src/migrations/<ts>-Init.ts`, the final schema): this version is
-greenfield (ARCHITECTURE §18) — a database created by an earlier layout is dropped and recreated,
-never upgraded.
+Two migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
+an earlier layout is dropped and recreated, never upgraded) and `LedgerIndex` (the fourteen
+ledger-index tables, additive). Regenerating against a migrated database proposes only the
+cosmetic `'{}'` vs `'{}'::jsonb` default rewrites, which are not drift.
 
 Jest runs in CommonJS with `test/esm-to-cjs.transformer.cjs` converting the ESM-only packages
 (`@nestjs/*`, `jose`) — it passes on Node 22 and 24+.
@@ -94,6 +97,16 @@ credentials; `BACKEND_PROXY_SECRET` is what lets the Vercel proxy's `x-real-ip` 
 (`TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a`,
 `TRUTHORACLE_PACKAGE_NAME=truthoracle-v14`); `UserWallet.depositRefs` is mandatory there and is
 what the deposit confirm pass keys on.
+
+## Ledger index
+
+`LedgerIndexerProcessor` streams the treasury party's transactions from the Canton JSON Ledger
+API v2 (`/v2/updates`, LEDGER_EFFECTS shape — created **and exercised** events) into Postgres,
+one ledger transaction per database transaction, cursor included; on a pruned participant it
+starts from an ACS snapshot at the prune point. `GET /markets`, `/markets/:id/{trades,activity,
+price-history,forecasts,attestations}`, `/me/{positions,liquidity,trades,activity}`,
+`/in-app-wallet/{ledger,history,transfers}`, `/stats`, `/leaderboard`, `/ledger/{status,wait}`
+and `/admin/ledger/*` read it. Design, tables, derivations and operations: `docs/INDEXER.md`.
 
 ## Status
 
@@ -114,6 +127,10 @@ truthoracle-v14.
 are the only user sign-in methods. A Cantor8 wallet is linked to an already signed-in account and
 creates no identity, so one person maps to one account that KYC can bind; operators sign into the
 admin API with their wallet on `POST /auth/admin`. Admin sessions are refused on account routes.
+
+**Ledger index (2026-09-28, docs/INDEXER.md):** indexer + read API landed; `test/ledger.e2e-spec.ts`
+covers replay, bootstrap from an ACS snapshot, resync with a recorded gap, the derivations and every
+new route. Not yet exercised against a live participant (RUNBOOK §12).
 
 Verified on 2026-09-10: `npm run typecheck`, `npm run lint`, `npm run build` exit 0;
 `npm test` 21 suites / 150 tests; `npm run test:e2e` 7 suites / 161 tests against real

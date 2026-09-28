@@ -3,6 +3,7 @@
  * registered with `overrideProvider(<RealService>).useValue(<fake>)`, so they mirror the public
  * surface other services call — not the private HTTP plumbing.
  */
+import type { ActiveContractEntry, LedgerTransaction } from "../../src/indexer/events";
 import type { ConsumedMessage, ConsumeHandler } from "../../src/services/nats.service";
 import { totalReceivedFrom } from "../../src/services/enterprise-wallet.service";
 import type {
@@ -507,5 +508,93 @@ export class FakeKycProvider implements KycProvider {
     this.sessions.length = 0;
     this.nextEvent = null;
     this.configured = true;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ledger stream (the indexer's source)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * In-memory stand-in for LedgerStreamService: `transactions` is the party's stream (push with
+ * `push()`), `acs` the snapshot `fetchActiveContracts` serves (or `acsAt(offset)` when set),
+ * `pruned` the participant's prune point — a read that starts below it throws the same
+ * PARTICIPANT_PRUNED_DATA_ACCESSED error the real participant answers with. `calls` records
+ * every read so specs can assert paging and bootstrap behaviour.
+ */
+export class FakeLedgerStream {
+  configured = true;
+  pruned = 0;
+  /** When set, overrides the ledger end derived from `transactions`. */
+  end: number | null = null;
+  readonly transactions: LedgerTransaction[] = [];
+  acs: ActiveContractEntry[] = [];
+  acsAt: ((offset: number) => ActiveContractEntry[]) | null = null;
+  readonly calls: string[] = [];
+  /** When set, the next `fetchUpdates` throws it (then cleared). */
+  failNext: Error | null = null;
+  readonly party: string;
+
+  constructor(party: string) {
+    this.party = party;
+  }
+
+  isConfigured(): boolean {
+    return this.configured;
+  }
+
+  get updatesEndpoint(): "updates" | "trees" {
+    return "updates";
+  }
+
+  push(...txs: LedgerTransaction[]): void {
+    this.transactions.push(...txs);
+    this.transactions.sort((a, b) => a.offset - b.offset);
+  }
+
+  async ledgerEnd(): Promise<number> {
+    this.calls.push("ledgerEnd");
+    if (this.end !== null) return this.end;
+    return this.transactions.length > 0 ? this.transactions[this.transactions.length - 1].offset : 0;
+  }
+
+  async prunedOffset(): Promise<number> {
+    this.calls.push("prunedOffset");
+    return this.pruned;
+  }
+
+  async fetchUpdates(args: {
+    beginExclusive: number;
+    endInclusive: number;
+    limit: number;
+  }): Promise<LedgerTransaction[]> {
+    this.calls.push(`fetchUpdates:${args.beginExclusive}:${args.endInclusive}:${args.limit}`);
+    if (this.failNext) {
+      const err = this.failNext;
+      this.failNext = null;
+      throw err;
+    }
+    if (args.beginExclusive < this.pruned) {
+      throw new Error("PARTICIPANT_PRUNED_DATA_ACCESSED: range starts before the prune point");
+    }
+    return this.transactions
+      .filter((t) => t.offset > args.beginExclusive && t.offset <= args.endInclusive)
+      .slice(0, args.limit);
+  }
+
+  async fetchActiveContracts(activeAtOffset: number): Promise<ActiveContractEntry[]> {
+    this.calls.push(`fetchActiveContracts:${activeAtOffset}`);
+    return this.acsAt ? this.acsAt(activeAtOffset) : this.acs;
+  }
+
+  reset(): void {
+    this.configured = true;
+    this.pruned = 0;
+    this.end = null;
+    this.transactions.length = 0;
+    this.acs = [];
+    this.acsAt = null;
+    this.calls.length = 0;
+    this.failNext = null;
   }
 }

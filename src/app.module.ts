@@ -19,6 +19,7 @@ import { KycProviderSumsubService } from "./services/kyc-provider-sumsub.service
 import { KycService } from "./services/kyc.service";
 import { KYC_LOCK_LOOKUP, KYC_PROVIDER, type KycProvider } from "./types";
 import { AllExceptionsFilter } from "./util/errors";
+import { LedgerOffsetInterceptor } from "./util/ledger-offset.interceptor";
 
 /** Provides the validated Config globally so controllers/services/processors can inject it. */
 function getConfigModule(config: Config): DynamicModule {
@@ -45,6 +46,8 @@ export class AppModule {
       ...Object.values(services).filter(isClass),
       ...Object.values(processors).filter(isClass),
       AdminGuard,
+      // `x-ledger-offset` on index-backed reads (@UseInterceptors on those controllers).
+      LedgerOffsetInterceptor,
       // Appends the JSON 404 catch-all after every route (Express 5 would otherwise serve HTML).
       NotFoundFallback,
       {

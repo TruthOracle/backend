@@ -23,3 +23,8 @@ export { KycService } from "./kyc.service";
 export { KycProviderMockService } from "./kyc-provider-mock.service";
 export { KycProviderSumsubService } from "./kyc-provider-sumsub.service";
 export { AdminService } from "./admin.service";
+// ledger indexer + index-backed reads (docs/INDEXER.md)
+export { LedgerStreamService } from "./ledger-stream.service";
+export { IndexerService } from "./indexer.service";
+export { MarketsService } from "./markets.service";
+export { PortfolioService } from "./portfolio.service";

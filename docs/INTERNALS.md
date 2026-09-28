@@ -15,6 +15,7 @@ internal surface that other packages call.
 | **P3 — payouts** | service `payout`; controller `payouts`; processor `payout-settlement`; `src/dto/payouts.dto.ts`; specs + `test/payouts.e2e-spec.ts` |
 | **P4 — KYC** | services `kyc`, `kyc-provider-mock`, `kyc-provider-sumsub`; controllers `kyc`, `kyc-mock` (not in the barrel), `webhooks`; processor `kyc-webhook`; `src/dto/kyc.dto.ts`; `docs/KYC.md`; specs + `test/kyc.e2e-spec.ts` |
 | **P5 — admin** | service `admin`; controller `admin`; `src/dto/admin.dto.ts`; specs + `test/admin.e2e-spec.ts` |
+| **P6 — ledger index** (docs/INDEXER.md) | `src/indexer/*` (pure: `events`, `splice`, `projection`), `src/util/ledger-values.ts`, `src/util/ledger-offset.interceptor.ts`; services `ledger-stream`, `indexer`, `markets`, `portfolio`; processor `ledger-indexer`; controllers `markets`, `ledger`, `portfolio`, `ledger-wallet`, `admin-ledger`; `src/dto/ledger.dto.ts`; 14 entities + migration `LedgerIndex`; `test/helpers/ledger-fixtures.ts`, `FakeLedgerStream`; specs + `test/ledger.e2e-spec.ts` |
 
 Nobody edits another package's files. Barrels are written once by F and not touched again
 (F lists every class below; a package that needs an extra injectable keeps it private to its
@@ -215,6 +216,32 @@ lockedIdentityId(userId): Promise<string | null>   // used by IdentityService vi
 
 // AdminService (P5) — composes the above; no other package depends on it
 ```
+
+## Ledger index seams (P6)
+
+```ts
+// LedgerStreamService (reads as config.indexerParty; nothing cached)
+ledgerEnd(): Promise<number>; prunedOffset(): Promise<number>
+fetchUpdates({ beginExclusive, endInclusive, limit }): Promise<LedgerTransaction[]>   // throws with PARTICIPANT_PRUNED_DATA_ACCESSED in the message when pruned
+fetchActiveContracts(activeAtOffset): Promise<ActiveContractEntry[]>                   // throws when the page fills INDEXER_ACS_LIMIT
+
+// IndexerService
+runOnce(): Promise<{ applied; seen; caughtUp; bootstrapped; resynced }>   // bootstrap if needed, one page, each tx atomically with the cursor
+applyTransaction(tx): Promise<boolean>                                     // false = replay; publishes the NATS fan-out after commit
+resync(fromOffset, reason) · resyncNow(reason) · status(): Promise<ApiLedgerStatus> · currentOffset() · waitForOffset(offset, timeoutMs)
+
+// LedgerProjection (src/indexer/projection.ts, pure over an EntityManager)
+applyTransaction(manager, tx): Promise<{ applied; summary }>; applyActiveContracts(manager, entries, atOffset, "bootstrap" | "resync")
+
+// MarketsService — list/get/activity/trades/priceHistory/forecasts/attestations/holders/liquidityProviders/stats/leaderboard + toApi/toSummary/toApiEvent/toApiPosition/positionValue
+// PortfolioService — partiesOf(user) (primary + active linked wallets), positions/liquidity/trades/activity/walletHistory/indexedWallet/transfers/ledgerPayouts
+```
+
+Fixtures: `test/helpers/ledger-fixtures.ts` builds internally consistent transactions from the Daml
+choices (`createMarket`, `createWallet`, `deposit`, `withdraw`, `markPaid`, `buy`, `sell`,
+`resolveT0`, `redeem`, `spliceTransferIn/Out`, `acsEntry`); `FakeLedgerStream` (`test/helpers/fakes.ts`)
+replaces the participant (`push()`, `pruned`, `acs`, `failNext`, `calls`). `INDEXER_ENABLED=false`
+under test — specs call `IndexerService.runOnce()` themselves.
 
 ## Test helpers (F)
 

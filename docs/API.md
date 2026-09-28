@@ -156,3 +156,84 @@ credits a `UserWallet` presupposes one exists — i.e. an account that deposited
 interface AuditEvent { id: string; actorType: "user" | "admin" | "system"; actorUserId: string | null; action: string;
   subjectType: string; subjectId: string; metadata: Record<string, unknown>; createdAt: string }
 ```
+
+## Ledger index (docs/INDEXER.md)
+
+Read-only routes over the backend's index of the treasury's ledger view. Daml `Decimal`s
+(prices, shares, CC) are 10-dp strings like Money; Daml `Int` epoch seconds are ISO-8601; durations
+are integer seconds; parties are Canton party ids. Every response below carries
+`x-ledger-offset: <last applied offset>`.
+
+```ts
+type Decimal = string;                     // "0.5500000000"
+type MarketStatus = "Trading" | "Proposed" | "Resolved" | "Voided";
+type Outcome = "Yes" | "No" | "VoidOutcome";
+type Phase = "liquidity" | "trading" | "expired" | "proposed" | "resolved" | "voided";
+type MarketEventKind = "market_created" | "buy" | "sell" | "swap" | "split" | "merge" | "provide_liquidity" | "withdraw_liquidity" |
+  "resolve_t0" | "resolve" | "propose" | "challenge" | "finalize" | "void" | "redeem" | "commit_forecast" | "score_and_distribute" | "archive";
+
+interface Market {
+  marketId: number; contractId: string; admin: string; question; imageUrl; description; resolutionDescription; category: string;
+  createdAt; expiresAt; tradingStartsAt: string; gracePeriodSecs; liquidityPeriodSecs: number; isDynamic: boolean;
+  reserveYes; reserveNo; liquidityL; lpTokenSupply; currentPrice: Decimal; feeBps; prizeFeeShareBps: number;
+  accumulatedFeesCC; prizePoolCC; totalVolumeCC: Decimal; status: MarketStatus; outcome: Outcome | null; resolvedAt: string | null;
+  proposal: { proposer; proposedOutcome: Outcome; proposedAt; bondCC; challenger: string | null; challengerOutcome: Outcome | null; challengeEndsAt } | null;
+  policy: { operatorResolution: boolean; sources: string[]; sourceKeys: { sourceUri; publicKey }[]; reporters: string[]; quorum; challengeSecs: number; bondCC: Decimal };
+  auditObservers: string[]; phase: Phase; archived: boolean; tradeCount: number; lastTradeAt: string | null;
+  updatedOffset; createdOffset: number; synchronizerId: string | null;
+  createdEventBlob?: string | null;        // GET /markets/:id only — the disclosed contract a user-signed trade needs
+}
+interface MarketSummary { marketId; contractId; question; imageUrl; category; status; outcome; currentPrice; expiresAt; resolvedAt; phase; archived }
+interface MarketEvent {
+  id: string; eventId: string; marketId: number; kind: MarketEventKind; actor: string; side: "Yes" | "No" | null;
+  amountCC; netCC; shares; sharesOut; feeCC; priceBefore; priceAfter; lpTokens: Decimal | null; outcome: Outcome | null;
+  details: Record<string, unknown>; offset: number; updateId: string; commandId: string | null; effectiveAt: string;
+}
+interface PricePoint { t: string; price: Decimal; volumeCC: Decimal; offset: number }
+interface Position { contractId; holder; marketId; yesShares; noShares; costBasisCC; active; createdAt; createdOffset; archivedAt;
+  market: MarketSummary | null; valueCC: Decimal | null; redeemableCC: Decimal | null }
+interface LiquidityPosition { contractId; provider; marketId; lpTokens; depositedCC; active; createdAt; createdOffset; archivedAt; market; poolShare: Decimal | null }
+interface WalletEntry { id; eventId; owner; kind: "deposit" | "credit" | "debit" | "withdraw"; amountCC; reason: string | null; txRef: string | null;
+  balanceAfter: Decimal | null; marketId: number | null; rootChoice: string | null; walletContractId; offset; updateId; effectiveAt }
+interface IndexedWallet { contractId; owner; balanceCC; depositedCC; withdrawnCC; depositRefs: string[]; updatedOffset; updatedAt }
+interface LedgerPayout { contractId; user; marketId; amountCC; reason; createdAt; createdOffset; active;
+  settledKind: "mark_paid" | "settle_to_wallet" | "cancelled" | "archived" | null; settledAt; settledOffset; txHash: string | null; refunded: boolean | null }
+interface LedgerTransfer { updateId; offset; direction: "in" | "out"; counterparty; amountCC; choice; recordTime }
+interface Attestation { contractId; attester; marketId; sourceUri; fetchedAt; outcome; payloadHash; hasSourceSignature; responseExcerpt; active; createdOffset }
+interface ModelForecast { contractId; author; marketId; modelId; probabilityYes; committedAt; marketPriceAtCommit; active; createdOffset }
+interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt; bootstrapOffset; offset: number; ledgerEnd; lag; prunedOffset: number | null;
+  lastUpdateId; lastRecordTime; lastError; lastErrorAt: string | null; gaps: { fromOffset; toOffset; reason; at }[]; updatedAt }
+```
+
+### Markets (public)
+- `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked)
+- `GET /markets/categories` → `{ category, markets }[]`
+- `GET /markets/:marketId` → `{ market: Market }` (with `createdEventBlob`) | `404 not_found`
+- `GET /markets/:marketId/activity?kind=&page=&limit=` → `{ items: MarketEvent[], … }` newest first
+- `GET /markets/:marketId/trades?kind=&page=&limit=` → the `buy sell swap split merge` subset
+- `GET /markets/:marketId/price-history?from=&to=&resolution=raw|1m|5m|15m|1h|4h|1d&limit=` → `{ marketId, resolution, points: PricePoint[] }` oldest first (one point per market version, or the last per bucket; the latest `limit` win)
+- `GET /markets/:marketId/forecasts` → `{ forecasts: ModelForecast[] }` · `GET /markets/:marketId/attestations` → `{ attestations: Attestation[] }`
+
+### Ledger (public)
+- `GET /ledger/status` → `LedgerStatus`
+- `GET /ledger/wait?offset=&timeoutMs=` → `200 { reached: boolean, offset, requested }` — resolves once the index reaches `offset` or after `timeoutMs` (default 10 s, max 30 s)
+- `GET /stats` → `{ markets: { total, trading, proposed, resolved, voided }, totalVolumeCC, volume24hCC, trades, trades24h, traders, indexedOffset }`
+- `GET /leaderboard?window=24h|7d|30d|all&limit=` → `{ window, entries: { party, volumeCC, trades, markets, realizedPnlCC }[] }`
+
+### Portfolio (session; user sessions only)
+The account's parties = the primary party + every active linked wallet.
+- `GET /me/positions?status=open|all` → `{ parties, positions: Position[] }` (`valueCC` = mark-to-market while Trading, the redeemable amount once settled)
+- `GET /me/liquidity?status=open|all` → `{ parties, positions: LiquidityPosition[] }`
+- `GET /me/trades?marketId=&kind=&page=&limit=` · `GET /me/activity?…` → `{ items: MarketEvent[], … }`
+
+### In-app wallet ledger (session)
+- `GET /in-app-wallet/ledger` → `{ partyId, wallet: IndexedWallet | null, payouts: LedgerPayout[] }`
+- `GET /in-app-wallet/history?kind=&page=&limit=` → `{ items: WalletEntry[], … }` — the statement of the primary party's UserWallet
+- `GET /in-app-wallet/transfers?direction=&page=&limit=` → `{ items: LedgerTransfer[], … }` — Canton Coin between the treasury and the account's wallets
+
+### Admin — ledger (admin session)
+- `GET /admin/ledger/status` → `LedgerStatus`
+- `POST /admin/ledger/resync` `{ reason }` → `{ status }` (re-snapshot the ACS at the ledger end; audited `ledger.resync`)
+- `GET /admin/ledger/events?updateId=&contractId=&marketId=&entity=&choice=&fromOffset=&page=` → raw created / exercised events (`{ id, eventId, offset, nodeId, updateId, kind, template, contractId, choice, consuming, actingParties, payload, result, parentNodeId, effectiveAt, commandId }`)
+- `GET /admin/ledger/wallets?owner=` · `GET /admin/ledger/payouts?active=&user=` · `GET /admin/ledger/transfers?direction=&counterparty=`
+- `GET /admin/ledger/markets/:marketId/positions` · `/liquidity` → holders / providers, largest first

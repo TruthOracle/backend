@@ -221,3 +221,37 @@ is not a sign-in method (ARCHITECTURE §8.1).
   points at, §8.2; make another wallet primary first, possible only while no on-ledger
   `UserWallet` or queued payout exists). Unlinking any other wallet always succeeds: it revokes
   the row, keeps its attribution, and never touches how the person signs in.
+
+## 12. Ledger indexer (docs/INDEXER.md)
+
+**First run on a participant.** Watch the log of the replica that logs `holding the indexer lock`:
+`bootstrap: replaying the full ledger history from offset 0` (never-pruned) or `bootstrap: ACS
+snapshot at offset N` (pruned), then `applied K transaction(s)` lines until `GET /ledger/status`
+reports `lag: 0`. Compare `to_markets` with `npm run contracts:active PredictionMarket` in
+`truthoracle-contracts` — the contract ids and `currentPrice` must match exactly. The JSON shapes
+were taken from the Canton 3.4 OpenAPI spec and the production tree reader, not from a recorded
+response: an unexpected shape shows up as markets with zero fields or missing trades, never as a
+crash (`src/util/ledger-values.ts` fails soft) — `GET /admin/ledger/events?updateId=` shows the
+raw payloads to compare against.
+
+**`lastError` set / `lag` growing.** The processor retries with backoff (1 s … 60 s) and reports
+the first and every tenth failure to Sentry. `ledger updates failed (401)`: the ledger Keycloak
+client (RUNBOOK §1). `filled INDEXER_ACS_LIMIT`: raise the limit and the participant's
+`http-list-max-elements-limit`. `/v2/updates answered 404`: the participant predates the
+endpoint; `INDEXER_UPDATES_ENDPOINT=auto` already fell back to `/v2/updates/trees`.
+
+**A gap appeared** (`gaps` in `GET /ledger/status`, `truthoracle.indexer.gap`, Sentry warning):
+the index was down longer than the participant's retention and resynced from the ACS. State is
+correct; activity inside the range is missing for good. Note the range in the incident log; if
+the outage was a deploy, size the retention or the deploy window accordingly.
+
+**Rebuild.** `INDEXER_ENABLED=false` on every replica, then
+`TRUNCATE to_indexer_state, to_ledger_events, to_markets, to_market_snapshots, to_market_events,
+to_positions, to_liquidity_positions, to_ledger_wallets, to_wallet_entries, to_ledger_payouts,
+to_attestations, to_model_forecasts, to_prediction_models, to_ledger_transfers`, then
+`INDEXER_ENABLED=true`. Required after switching participants (offsets are participant-local) or
+after a projection fix. The account tables are never touched.
+
+**Operator resync.** `POST /admin/ledger/resync { reason }` re-snapshots the ACS at the ledger end
+and reconciles activeness (audited as `ledger.resync`). Use it after a manual ledger repair; it is
+not a rebuild.
