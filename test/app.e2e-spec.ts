@@ -22,7 +22,8 @@ import type {
 } from "../src/types";
 import type { ErrorBody } from "../src/util/errors";
 import { TEST_ORIGIN, createTestApp, useTestApp } from "./helpers/app";
-import { bodyOf, linkWallet, signInWithWallet } from "./helpers/session";
+import { bodyOf, linkWallet } from "./helpers/session";
+import { nextTelegramUser, signInWithTelegram } from "./helpers/telegram";
 import { makeTestWallet } from "./helpers/wallet";
 
 /** Boots the real AppModule against Postgres + Redis (NATS, ledger and wallet faked). */
@@ -74,8 +75,10 @@ describe("App (e2e)", () => {
    */
   describe("route wiring (integrator smoke)", () => {
     it("me / wallets / in-app-wallet / kyc / kyc-mock answer their documented shapes", async () => {
+      // An account is opened by Telegram (§6.1); its first linked wallet becomes the primary (§8.1).
       const primary = makeTestWallet("wire-primary");
-      const { cookie, user } = await signInWithWallet(ctx.agent, primary);
+      const { cookie, user } = await signInWithTelegram(ctx.agent, nextTelegramUser("Wire"));
+      await linkWallet(ctx.agent, cookie, primary);
       const h = { Cookie: cookie, ...ctx.csrf };
 
       // ── me ──
@@ -95,7 +98,7 @@ describe("App (e2e)", () => {
 
       const sessions = bodyOf<{ sessions: ApiSession[] }>(await ctx.agent.get("/api/v1/me/sessions").set("Cookie", cookie).expect(200));
       expect(sessions.sessions).toHaveLength(1);
-      expect(sessions.sessions[0]).toMatchObject({ kind: "user", authMethod: "canton_wallet", current: true });
+      expect(sessions.sessions[0]).toMatchObject({ kind: "user", authMethod: "telegram", current: true });
       await ctx.agent.delete(`/api/v1/me/sessions/${randomUUID()}`).set(h).expect(404);
 
       const audit = bodyOf<ApiPage<ApiAuditEvent>>(await ctx.agent.get("/api/v1/me/audit").set("Cookie", cookie).expect(200));
@@ -106,8 +109,7 @@ describe("App (e2e)", () => {
       const secondary = makeTestWallet("wire-secondary");
       const linked = await linkWallet(ctx.agent, cookie, secondary, { label: "cold" });
       expect(linked.wallet).toMatchObject({ partyId: secondary.partyId, isPrimary: false, label: "cold", status: "active" });
-      expect(linked.identity).toMatchObject({ provider: "canton_wallet", subject: secondary.partyId, status: "active", kycLocked: false });
-      expect(Object.keys(linked).sort()).toEqual(["identity", "wallet"]);
+      expect(Object.keys(linked)).toEqual(["wallet"]);
       const wallets = bodyOf<{ wallets: ApiWallet[] }>(await ctx.agent.get("/api/v1/wallets").set("Cookie", cookie).expect(200));
       expect(wallets.wallets.map((w) => [w.partyId, w.isPrimary])).toEqual([
         [primary.partyId, true],
@@ -119,14 +121,9 @@ describe("App (e2e)", () => {
       await ctx.agent.delete(`/api/v1/wallets/${secondaryRow.id}`).set(h).expect(200);
       await ctx.agent.delete(`/api/v1/wallets/${secondaryRow.id}`).set(h).expect(404);
       await ctx.agent.delete("/api/v1/wallets/not-a-uuid").set(h).expect(400);
-      // The second identity went with its wallet; the primary is now the last one AND the primary.
+      // Wallets are not identities (§8.1): the unlink revoked the row and left the one Telegram identity alone.
       const afterUnlink = bodyOf<ApiMe>(await ctx.agent.get("/api/v1/me").set("Cookie", cookie).expect(200));
-      expect(afterUnlink.identities.map((i) => [i.subject, i.status])).toEqual(
-        expect.arrayContaining([
-          [primary.partyId, "active"],
-          [secondary.partyId, "unlinked"],
-        ]),
-      );
+      expect(afterUnlink.identities.map((i) => [i.provider, i.status])).toEqual([["telegram", "active"]]);
       expect(afterUnlink.wallets.find((w) => w.partyId === secondary.partyId)).toMatchObject({ status: "revoked", isPrimary: false });
 
       // ── in-app wallet ──
@@ -156,12 +153,12 @@ describe("App (e2e)", () => {
       );
       expect(submitted).toMatchObject({ userKycStatus: "approved", verification: { id: started.verificationId, status: "approved", provider: "mock" } });
 
-      // §6.5 / §9.5: the approval is attached to the session's identity, which is now locked.
+      // §6.5 / §9.5: the approval is attached to the session's (Telegram) identity, which is now locked.
       const approved = bodyOf<ApiMe>(await ctx.agent.get("/api/v1/me").set("Cookie", cookie).expect(200));
-      const primaryIdentity = approved.identities.find((i) => i.subject === primary.partyId);
+      const telegramIdentity = approved.identities.find((i) => i.provider === "telegram");
       expect(approved.user.kycStatus).toBe("approved");
-      expect(approved.kyc).toMatchObject({ status: "approved", attachedIdentityId: primaryIdentity?.id });
-      expect(primaryIdentity?.kycLocked).toBe(true);
+      expect(approved.kyc).toMatchObject({ status: "approved", attachedIdentityId: telegramIdentity?.id });
+      expect(telegramIdentity?.kycLocked).toBe(true);
       expect(approved.capabilities.canWithdraw).toBe(true);
       expect(ctx.nats.publishedOn("truthoracle.kyc.status_changed")).toHaveLength(1);
     });
@@ -182,7 +179,8 @@ describe("App (e2e)", () => {
       try {
         const primary = makeTestWallet("drain");
         const server = own.app.getHttpServer() as Server;
-        const { cookie } = await signInWithWallet(request(server), primary);
+        const { cookie } = await signInWithTelegram(request(server), nextTelegramUser("Drain"));
+        await linkWallet(request(server), cookie, primary);
         own.wallet.seedInbound(primary.partyId, "1");
         // Slow the history walk so the request is still running when close() starts.
         const original = own.wallet.transferHistory.bind(own.wallet);

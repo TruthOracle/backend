@@ -1,10 +1,11 @@
 /**
  * Proves the foundation directly: SessionService, IdentityService rules (§6),
- * WalletChallengeService (§7.3), the global guards (§6.6–6.8) and the error envelope (§11).
+ * WalletChallengeService (§7.3–7.4), the global guards (§6.6–6.8) and the error envelope (§11).
  * A 200 from a session-only route after a guard is the proof the guard passed; the routes used
  * as probes (`GET /me`, `POST /me/sessions/revoke-others`, `GET /admin/users`) are idempotent.
  */
 import { createHash, createHmac } from "node:crypto";
+import type request from "supertest";
 
 import { AuditEventEntity } from "../src/entities/audit-event.entity";
 import { AuthIdentityEntity } from "../src/entities/auth-identity.entity";
@@ -14,11 +15,12 @@ import { IdentityService } from "../src/services/identity.service";
 import { SessionService } from "../src/services/session.service";
 import { UserService } from "../src/services/user.service";
 import { WalletChallengeService } from "../src/services/wallet-challenge.service";
-import { KYC_LOCK_LOOKUP, type ApiChallenge, type ApiMe } from "../src/types";
+import { KYC_LOCK_LOOKUP, type ApiChallenge, type ApiMe, type ChallengePurpose } from "../src/types";
+import { SESSION_COOKIE } from "../src/util/cookies";
 import { ApiError, type ErrorBody } from "../src/util/errors";
 import { TEST_ORIGIN, useTestApp } from "./helpers/app";
 import { bodyOf, issueSessionDirect } from "./helpers/session";
-import { makeTestWallet } from "./helpers/wallet";
+import { makeTestWallet, type TestWallet } from "./helpers/wallet";
 
 const operator = makeTestWallet("operator");
 const pinnedOperator = makeTestWallet("pinned");
@@ -227,145 +229,100 @@ describe("foundation (e2e)", () => {
       await identities().unlink(a.user.id, tg.identity.id, { type: "admin", userId: null });
     });
 
-    it("the primary wallet identity cannot be unlinked; a secondary wallet's row is revoked with it", async () => {
-      const primary = makeTestWallet("prim");
-      const secondary = makeTestWallet("sec");
-      const { user } = await issueSessionDirect(ctx, primary);
-      const link = await identities().resolveForLogin({ provider: "canton_wallet", subject: secondary.partyId }, { currentUser: user });
-      await ctx.dataSource.query(
-        `INSERT INTO to_wallets (user_id, kind, party_id, public_key, is_primary, status, verified_at) VALUES ($1, 'cantor8', $2, $3, false, 'active', now())`,
-        [user.id, secondary.partyId, secondary.publicKeyBase64],
-      );
-      const primaryIdentity = await identities().findByProviderSubject("canton_wallet", primary.partyId);
-      await expectApiError(identities().unlink(user.id, primaryIdentity!.id, { type: "user", userId: user.id }), 409, "primary_wallet_in_use");
-
-      await identities().unlink(user.id, link.identity.id, { type: "user", userId: user.id });
-      const wallet = await ctx.dataSource.query<{ status: string; revoked_at: Date | null }[]>(`SELECT status, revoked_at FROM to_wallets WHERE party_id = $1`, [secondary.partyId]);
-      expect(wallet[0].status).toBe("revoked");
-      expect(wallet[0].revoked_at).not.toBeNull();
-    });
-
     it("suspended users cannot sign in (403 user_suspended) and lose their sessions", async () => {
       const w = makeTestWallet("susp");
-      const { user, token } = await issueSessionDirect(ctx, w);
+      const { user, identity, token } = await issueSessionDirect(ctx, w);
       await ctx.get(UserService).suspend(user.id, "abuse", { type: "admin" });
-      await expectApiError(identities().resolveForLogin({ provider: "canton_wallet", subject: w.partyId }, { currentUser: null }), 403, "user_suspended");
+      await expectApiError(identities().resolveForLogin({ provider: "telegram", subject: identity.subject }, { currentUser: null }), 403, "user_suspended");
       expect(await ctx.get(SessionService).verify(token)).toBeNull();
       await ctx.get(UserService).reinstate(user.id, "resolved", { type: "admin" });
-      expect((await identities().resolveForLogin({ provider: "canton_wallet", subject: w.partyId }, { currentUser: null })).user.status).toBe("active");
+      expect((await identities().resolveForLogin({ provider: "telegram", subject: identity.subject }, { currentUser: null })).user.status).toBe("active");
     });
   });
 
   // ───────────────────────────────────────────── wallet challenge ─────────────────────────────
-  describe("WalletChallengeService (§7.3)", () => {
+  describe("WalletChallengeService (§7.3, §7.4)", () => {
     const challenges = (): WalletChallengeService => ctx.get(WalletChallengeService);
+    /** A `link-wallet` challenge for session `s1` (the purpose every user wallet signature carries). */
+    const linkChallenge = (w: TestWallet, sessionId = "s1") => challenges().issue({ partyId: w.partyId, purpose: "link-wallet", sessionId, host: "app.test" });
+    const verify = (w: TestWallet, c: ApiChallenge, opts: { expectedPurpose: ChallengePurpose; sessionId?: string | null; publicKey?: string; signature?: string; partyId?: string }) =>
+      challenges().verify({
+        challengeId: c.challengeId,
+        partyId: opts.partyId ?? w.partyId,
+        publicKey: opts.publicKey ?? w.publicKeyBase64,
+        signature: opts.signature ?? w.sign(c.message),
+        expectedPurpose: opts.expectedPurpose,
+        sessionId: opts.sessionId,
+      });
 
-    it("verifies a good signature and consumes the challenge (replay → challenge_rejected)", async () => {
+    it("verifies a good link-wallet signature and consumes the challenge (replay → challenge_rejected)", async () => {
       const w = makeTestWallet("good");
-      const c = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
+      const c = await linkChallenge(w);
       expect(c.message).toBe(
-        `TruthOracle sign-in\nDomain: app.test\nURI: https://app.test\nNetwork: devnet\nParty: ${w.partyId}\n` +
+        `TruthOracle link-wallet\nDomain: app.test\nURI: https://app.test\nNetwork: devnet\nParty: ${w.partyId}\n` +
           c.message.split("\n").slice(5, 7).join("\n") +
           `\nExpires: ${c.expiresAt}`,
       );
-      const verified = await challenges().verify({ challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyHex, signature: w.sign(c.message), expectedPurpose: "sign-in" });
-      expect(verified).toEqual({ partyId: w.partyId, publicKeyBase64: w.publicKeyBase64, purpose: "sign-in", form: "utf8" });
-      await expectApiError(
-        challenges().verify({ challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyHex, signature: w.sign(c.message), expectedPurpose: "sign-in" }),
-        401,
-        "challenge_rejected",
-      );
+      const verified = await verify(w, c, { expectedPurpose: "link-wallet", sessionId: "s1", publicKey: w.publicKeyHex });
+      expect(verified).toEqual({ partyId: w.partyId, publicKeyBase64: w.publicKeyBase64, purpose: "link-wallet", form: "utf8" });
+      await expectApiError(verify(w, c, { expectedPurpose: "link-wallet", sessionId: "s1", publicKey: w.publicKeyHex }), 401, "challenge_rejected");
     });
 
     it("rejects a key that is not the party's namespace key (wallet_key_mismatch) and burns the challenge", async () => {
       const w = makeTestWallet("owner");
       const other = makeTestWallet("other");
-      const c = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c.challengeId, partyId: w.partyId, publicKey: other.publicKeyBase64, signature: other.sign(c.message), expectedPurpose: "sign-in" }),
-        401,
-        "wallet_key_mismatch",
-      );
-      await expectApiError(
-        challenges().verify({ challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c.message), expectedPurpose: "sign-in" }),
-        401,
-        "challenge_rejected",
-      );
+      const c = await linkChallenge(w);
+      await expectApiError(verify(w, c, { expectedPurpose: "link-wallet", sessionId: "s1", publicKey: other.publicKeyBase64, signature: other.sign(c.message) }), 401, "wallet_key_mismatch");
+      await expectApiError(verify(w, c, { expectedPurpose: "link-wallet", sessionId: "s1" }), 401, "challenge_rejected");
     });
 
     it("rejects a bad signature, a party swap and a purpose mismatch", async () => {
       const w = makeTestWallet("sig");
-      const c1 = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c1.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c1.message + "x"), expectedPurpose: "sign-in" }),
-        401,
-        "signature_invalid",
-      );
-      const c2 = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c2.challengeId, partyId: makeTestWallet("z").partyId, publicKey: w.publicKeyBase64, signature: w.sign(c2.message), expectedPurpose: "sign-in" }),
-        401,
-        "challenge_rejected",
-      );
-      const c3 = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c3.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c3.message), expectedPurpose: "link-wallet", sessionId: "s1" }),
-        401,
-        "challenge_purpose_mismatch",
-      );
-      await expectApiError(challenges().verify({ challengeId: "not-a-uuid", partyId: w.partyId, publicKey: w.publicKeyBase64, signature: "x", expectedPurpose: "sign-in" }), 401, "challenge_rejected");
+      const c1 = await linkChallenge(w);
+      await expectApiError(verify(w, c1, { expectedPurpose: "link-wallet", sessionId: "s1", signature: w.sign(c1.message + "x") }), 401, "signature_invalid");
+      const c2 = await linkChallenge(w);
+      await expectApiError(verify(w, c2, { expectedPurpose: "link-wallet", sessionId: "s1", partyId: makeTestWallet("z").partyId }), 401, "challenge_rejected");
+      // A link-wallet challenge is not an admin-sign-in, whoever presents it.
+      const c3 = await linkChallenge(w);
+      await expectApiError(verify(w, c3, { expectedPurpose: "admin-sign-in" }), 401, "challenge_purpose_mismatch");
+      await expectApiError(challenges().verify({ challengeId: "not-a-uuid", partyId: w.partyId, publicKey: w.publicKeyBase64, signature: "x", expectedPurpose: "link-wallet", sessionId: "s1" }), 401, "challenge_rejected");
     });
 
-    it("binds link-wallet challenges to the issuing session and isolates sign-in from sessions", async () => {
+    it("binds link-wallet challenges to the issuing session and keeps admin-sign-in out of sessions", async () => {
       const w = makeTestWallet("link");
       await expectApiError(challenges().issue({ partyId: w.partyId, purpose: "link-wallet", host: "app.test" }), 401, "unauthenticated");
-      await expectApiError(challenges().issue({ partyId: w.partyId, purpose: "sign-in", sessionId: "s1", host: "app.test" }), 409, "challenge_purpose_mismatch");
+      const issued = await expectApiError(challenges().issue({ partyId: operator.partyId, purpose: "admin-sign-in", sessionId: "s1", host: "app.test" }), 409, "challenge_purpose_mismatch");
+      expect(issued.message).toBe("admin-sign-in challenges cannot be issued to an existing session");
 
-      const c = await challenges().issue({ partyId: w.partyId, purpose: "link-wallet", sessionId: "s1", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c.message), expectedPurpose: "link-wallet", sessionId: "s2" }),
-        401,
-        "challenge_purpose_mismatch",
-      );
-      const c2 = await challenges().issue({ partyId: w.partyId, purpose: "link-wallet", sessionId: "s1", host: "app.test" });
-      const ok = await challenges().verify({ challengeId: c2.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c2.message), expectedPurpose: ["sign-in", "link-wallet"], sessionId: "s1" });
-      expect(ok.purpose).toBe("link-wallet");
+      // Issued to s1: another session or no session at all is refused; s1 passes.
+      await expectApiError(verify(w, await linkChallenge(w), { expectedPurpose: "link-wallet", sessionId: "s2" }), 401, "challenge_purpose_mismatch");
+      await expectApiError(verify(w, await linkChallenge(w), { expectedPurpose: "link-wallet", sessionId: null }), 401, "challenge_purpose_mismatch");
+      expect((await verify(w, await linkChallenge(w), { expectedPurpose: "link-wallet", sessionId: "s1" })).purpose).toBe("link-wallet");
 
-      const c3 = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c3.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c3.message), expectedPurpose: ["sign-in", "link-wallet"], sessionId: "s1" }),
-        401,
-        "challenge_purpose_mismatch",
-      );
+      // An admin-sign-in challenge is refused as soon as any session is presented (never link mode).
+      const admin = (): Promise<ApiChallenge> => challenges().issue({ partyId: operator.partyId, purpose: "admin-sign-in", host: "app.test" });
+      await expectApiError(verify(operator, await admin(), { expectedPurpose: "admin-sign-in", sessionId: "s1" }), 401, "challenge_purpose_mismatch");
+      expect((await verify(operator, await admin(), { expectedPurpose: "admin-sign-in", sessionId: null })).purpose).toBe("admin-sign-in");
     });
 
     it("admin-sign-in requires an operator party (checked at verify time, never at issue time) and honours the pinned key", async () => {
       // Issuing never reveals operator membership (an anonymous 403-vs-200 oracle over ADMIN_OPERATORS): the refusal comes after the signature proved key control.
       const nobody = makeTestWallet("nobody");
       const cn = await challenges().issue({ partyId: nobody.partyId, purpose: "admin-sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: cn.challengeId, partyId: nobody.partyId, publicKey: nobody.publicKeyBase64, signature: nobody.sign(cn.message), expectedPurpose: "admin-sign-in" }),
-        403,
-        "forbidden",
-      );
+      await expectApiError(verify(nobody, cn, { expectedPurpose: "admin-sign-in" }), 403, "forbidden");
 
       const c = await challenges().issue({ partyId: operator.partyId, purpose: "admin-sign-in", host: "app.test" });
-      const ok = await challenges().verify({ challengeId: c.challengeId, partyId: operator.partyId, publicKey: operator.publicKeyBase64, signature: operator.sign(c.message), expectedPurpose: "admin-sign-in" });
-      expect(ok.purpose).toBe("admin-sign-in");
+      expect((await verify(operator, c, { expectedPurpose: "admin-sign-in" })).purpose).toBe("admin-sign-in");
 
       // pinnedOperator's namespace key is its own, but the operator list pins a different key.
       const c2 = await challenges().issue({ partyId: pinnedOperator.partyId, purpose: "admin-sign-in", host: "app.test" });
-      await expectApiError(
-        challenges().verify({ challengeId: c2.challengeId, partyId: pinnedOperator.partyId, publicKey: pinnedOperator.publicKeyBase64, signature: pinnedOperator.sign(c2.message), expectedPurpose: "admin-sign-in" }),
-        401,
-        "wallet_key_mismatch",
-      );
+      await expectApiError(verify(pinnedOperator, c2, { expectedPurpose: "admin-sign-in" }), 401, "wallet_key_mismatch");
     });
 
-    it("consumes a challenge atomically: two concurrent presentations of one signature yield exactly one session claim", async () => {
+    it("consumes a challenge atomically: two concurrent presentations of one signature yield exactly one claim", async () => {
       const w = makeTestWallet("race");
-      const c = await challenges().issue({ partyId: w.partyId, purpose: "sign-in", host: "app.test" });
-      const proof = { challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c.message), expectedPurpose: "sign-in" as const };
+      const c = await linkChallenge(w);
+      const proof = { challengeId: c.challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(c.message), expectedPurpose: "link-wallet" as const, sessionId: "s1" };
       const results = await Promise.allSettled([challenges().verify(proof), challenges().verify(proof), challenges().verify(proof)]);
       expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
       for (const r of results) {
@@ -374,12 +331,14 @@ describe("foundation (e2e)", () => {
     });
 
     it("rejects malformed party ids at issue time", async () => {
-      await expectApiError(challenges().issue({ partyId: "a::b::1220" + "0".repeat(64), purpose: "sign-in", host: "app.test" }), 400, "validation_failed");
+      await expectApiError(challenges().issue({ partyId: "a::b::1220" + "0".repeat(64), purpose: "link-wallet", sessionId: "s1", host: "app.test" }), 400, "validation_failed");
     });
   });
 
   // ───────────────────────────────────────────── HTTP guards + envelope ───────────────────────
   describe("guards and error envelope (HTTP)", () => {
+    const cookieOfToken = (token: string): string => `${SESSION_COOKIE}=${encodeURIComponent(token)}`;
+
     it("GET /me without a session → 401 envelope; with a cookie session → passes the guard (200)", async () => {
       const res = await ctx.agent.get("/api/v1/me").expect(401);
       expect(res.body).toEqual({ error: "unauthenticated", message: "authentication required" });
@@ -411,7 +370,7 @@ describe("foundation (e2e)", () => {
       const badType = await ctx.agent.post(probe).set("Cookie", cookie).set("Origin", TEST_ORIGIN).set("Content-Type", "text/plain").send("x").expect(403);
       expect(bodyOf<ErrorBody>(badType).message).toMatch(/application\/json/);
       // Public non-GET routes are CSRF-checked too.
-      await ctx.agent.post("/api/v1/auth/wallet/challenge").send({ partyId: makeTestWallet("x").partyId, purpose: "sign-in" }).expect(403);
+      await ctx.agent.post("/api/v1/auth/admin/challenge").send({ partyId: makeTestWallet("x").partyId }).expect(403);
     });
 
     it("bearer sessions skip CSRF; webhooks skip CSRF", async () => {
@@ -435,7 +394,7 @@ describe("foundation (e2e)", () => {
       await ctx.agent.get("/api/v1/auth/session").set("Cookie", cookie).expect(403);
     });
 
-    it("AdminGuard: user sessions → 403; operator admin sessions pass; removal revokes", async () => {
+    it("AdminGuard: user sessions → 403; operator admin sessions pass; a user-kind session on the operator's identity is still 403; removal revokes", async () => {
       const { cookie } = await issueSessionDirect(ctx, makeTestWallet("plain"));
       const res = await ctx.agent.get("/api/v1/admin/users").set("Cookie", cookie).expect(403);
       expect(res.body).toMatchObject({ error: "forbidden" });
@@ -443,9 +402,9 @@ describe("foundation (e2e)", () => {
       const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
       await ctx.agent.get("/api/v1/admin/users").set("Cookie", admin.cookie).expect(200);
 
-      // A user-kind session for an operator party is still not admin.
-      const userKind = await issueSessionDirect(ctx, operator, { kind: "user" });
-      await ctx.agent.get("/api/v1/admin/users").set("Cookie", userKind.cookie).expect(403);
+      // The kind is the authority, not the identity: a user-kind session authenticated by the very same operator identity is not admin.
+      const userKind = await ctx.get(SessionService).issue({ userId: admin.user.id, authIdentityId: admin.identity.id, kind: "user" });
+      await ctx.agent.get("/api/v1/admin/users").set("Cookie", cookieOfToken(userKind.token)).expect(403);
 
       const pinned = ctx.config.adminOperators.get(operator.partyId);
       ctx.config.adminOperators.delete(operator.partyId);
@@ -458,26 +417,71 @@ describe("foundation (e2e)", () => {
       }
     });
 
+    it("AdminGuard re-checks a pinned operator key against the key stored on the identity and fails closed (§6.8)", async () => {
+      const identities = ctx.dataSource.getRepository(AuthIdentityEntity);
+      // pinnedOperator signed with its own key but ADMIN_OPERATORS pins someone else's: the stored key differs → revoked.
+      const mismatched = await issueSessionDirect(ctx, pinnedOperator, { kind: "admin" });
+      const res = await ctx.agent.get("/api/v1/admin/users").set("Cookie", mismatched.cookie).expect(403);
+      expect(res.body).toMatchObject({ error: "forbidden", message: expect.stringMatching(/pinned key/) as string });
+      await ctx.agent.get("/api/v1/me").set("Cookie", mismatched.cookie).expect(401);
+
+      // A pin is configured but the identity carries no key at all → fail closed.
+      const bare = await issueSessionDirect(ctx, pinnedOperator, { kind: "admin" });
+      await identities.update({ id: bare.identity.id }, { profile: { name: "pinned" } });
+      await ctx.agent.get("/api/v1/admin/users").set("Cookie", bare.cookie).expect(403);
+      await ctx.agent.get("/api/v1/me").set("Cookie", bare.cookie).expect(401);
+
+      // The stored key equal to the pin passes.
+      const good = await issueSessionDirect(ctx, pinnedOperator, { kind: "admin" });
+      await identities.update({ id: good.identity.id }, { profile: { name: "pinned", publicKey: pinnedKeyOwner.publicKeyBase64 } });
+      await ctx.agent.get("/api/v1/admin/users").set("Cookie", good.cookie).expect(200);
+    });
+
+    it("SessionGuard refuses admin sessions on account routes (default deny) and admits them where a handler opted in (§6.8)", async () => {
+      const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
+      const w = makeTestWallet("gate");
+      const refused = (res: request.Response): void => {
+        expect(res.status).toBe(403);
+        expect(res.body).toEqual({ error: "forbidden", message: "admin sessions cannot use account routes" });
+      };
+      refused(await ctx.agent.post("/api/v1/wallets/link-challenge").set(ctx.csrf).set("Cookie", admin.cookie).send({ partyId: w.partyId }));
+      refused(await ctx.agent.post("/api/v1/kyc/sessions").set(ctx.csrf).set("Cookie", admin.cookie).send({}));
+      refused(await ctx.agent.post("/api/v1/in-app-wallet/deposits/reconcile").set(ctx.csrf).set("Cookie", admin.cookie).send({}));
+      refused(await ctx.agent.delete(`/api/v1/me/identities/${admin.identity.id}`).set(ctx.csrf).set("Cookie", admin.cookie));
+      refused(await ctx.agent.patch("/api/v1/me").set(ctx.csrf).set("Cookie", admin.cookie).send({ displayName: "x" }));
+      refused(await ctx.agent.get("/api/v1/wallets").set("Cookie", admin.cookie));
+      expect((await identities().findOne({ where: { id: admin.identity.id } }))?.status).toBe("active");
+
+      // Opted in: the session reads itself, manages its own sessions and logs out.
+      expect(bodyOf<ApiMe>(await ctx.agent.get("/api/v1/me").set("Cookie", admin.cookie).expect(200)).capabilities.isAdmin).toBe(true);
+      await ctx.agent.get("/api/v1/me/sessions").set("Cookie", admin.cookie).expect(200);
+      expect((await ctx.agent.post("/api/v1/me/sessions/revoke-others").set(ctx.csrf).set("Cookie", admin.cookie).send({}).expect(200)).body).toEqual({ revoked: 0 });
+      await ctx.agent.post("/api/v1/auth/logout").set(ctx.csrf).set("Cookie", admin.cookie).send({}).expect(200);
+      await ctx.agent.get("/api/v1/me").set("Cookie", admin.cookie).expect(401);
+    });
+    const identities = () => ctx.dataSource.getRepository(AuthIdentityEntity);
+
     it("ValidationPipe and body-parser failures render 400 validation_failed", async () => {
-      const bad = await ctx.agent.post("/api/v1/auth/wallet/challenge").set(ctx.csrf).send({ partyId: "nope", purpose: "sign-in", extra: 1 }).expect(400);
+      const bad = await ctx.agent.post("/api/v1/auth/admin/challenge").set(ctx.csrf).send({ partyId: "nope", extra: 1 }).expect(400);
       const badBody = bodyOf<ErrorBody>(bad);
       expect(badBody.error).toBe("validation_failed");
       expect(badBody.details?.issues).toEqual(expect.arrayContaining([expect.stringMatching(/partyId/), expect.stringMatching(/extra/)]));
-      const notJson = await ctx.agent.post("/api/v1/auth/wallet/challenge").set(ctx.csrf).send("{not json").expect(400);
+      const notJson = await ctx.agent.post("/api/v1/auth/admin/challenge").set(ctx.csrf).send("{not json").expect(400);
       expect(notJson.body).toEqual({ error: "validation_failed", message: "request body is not valid JSON" });
     });
 
-    it("POST /auth/wallet/challenge is live: issues a message and rate-limits per party", async () => {
+    it("POST /auth/admin/challenge is live: issues a message and rate-limits per party", async () => {
       const w = makeTestWallet("rl");
       for (let i = 0; i < 10; i += 1) {
-        const res = await ctx.agent.post("/api/v1/auth/wallet/challenge").set(ctx.csrf).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200);
+        const res = await ctx.agent.post("/api/v1/auth/admin/challenge").set(ctx.csrf).send({ partyId: w.partyId }).expect(200);
         const body = res.body as ApiChallenge;
+        expect(body.message).toContain("TruthOracle admin-sign-in");
         expect(body.message).toContain(`Party: ${w.partyId}`);
         expect(body.message).toContain("Network: devnet");
         expect(body.message).toMatch(/Domain: 127\.0\.0\.1:\d+/);
         expect(Date.parse(body.expiresAt)).toBeGreaterThan(Date.now());
       }
-      const limited = await ctx.agent.post("/api/v1/auth/wallet/challenge").set(ctx.csrf).send({ partyId: w.partyId, purpose: "sign-in" }).expect(429);
+      const limited = await ctx.agent.post("/api/v1/auth/admin/challenge").set(ctx.csrf).send({ partyId: w.partyId }).expect(429);
       expect(limited.body).toMatchObject({ error: "rate_limited", details: { scope: "challenge" } });
       expect(Number(limited.headers["retry-after"])).toBeGreaterThanOrEqual(1);
     });
@@ -486,11 +490,11 @@ describe("foundation (e2e)", () => {
       // Without the secret configured, x-forwarded-host is ignored.
       const w = makeTestWallet("proxy");
       const res = await ctx.agent
-        .post("/api/v1/auth/wallet/challenge")
+        .post("/api/v1/auth/admin/challenge")
         .set(ctx.csrf)
         .set("x-forwarded-host", "spoofed.test")
         .set("x-truthoracle-proxy", "whatever")
-        .send({ partyId: w.partyId, purpose: "sign-in" })
+        .send({ partyId: w.partyId })
         .expect(200);
       expect((res.body as ApiChallenge).message).not.toContain("spoofed.test");
     });

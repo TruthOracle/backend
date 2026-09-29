@@ -29,12 +29,24 @@ export class AppService implements OnModuleInit, BeforeApplicationShutdown {
    * fresh database or a new migration would otherwise all run it and crash-loop on "relation
    * already exists"), then the `to_settings` checks (ARCHITECTURE §9.6, §12): the database must
    * belong to this network, and the KYC pepper must be the one the stored fingerprints were built
-   * with unless a rotation is explicitly acknowledged. Both refuse to boot by throwing.
+   * with unless a rotation is explicitly acknowledged. Both refuse to boot by throwing. A missing
+   * sign-in provider only warns (RUNBOOK §1).
    */
   async onModuleInit(): Promise<void> {
     if (this.config.dbMigrateOnBoot) await this.migrate();
     await this.checkAppNetwork();
     await this.checkPepper();
+    this.warnWithoutSignInProvider();
+  }
+
+  /**
+   * Accounts are opened only by Google or Telegram (ARCHITECTURE §6.1); with neither configured the
+   * deployment can serve operators but no user can ever exist. A warning, not a refusal: local
+   * development boots without them.
+   */
+  private warnWithoutSignInProvider(): void {
+    if (this.config.googleClientIds.length > 0 || this.config.telegramBotToken) return;
+    this.logger.warn("no sign-in provider is configured (GOOGLE_CLIENT_IDS / TELEGRAM_BOT_TOKEN): nobody can create an account, so nobody can deposit or trade");
   }
 
   /** The load balancer must stop routing here while the HTTP server drains (§14). */

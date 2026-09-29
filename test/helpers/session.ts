@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type request from "supertest";
 
 import { AuthIdentityEntity } from "../../src/entities/auth-identity.entity";
@@ -6,7 +7,7 @@ import { UserEntity } from "../../src/entities/user.entity";
 import { WalletEntity } from "../../src/entities/wallet.entity";
 import { IdentityService } from "../../src/services/identity.service";
 import { SessionService } from "../../src/services/session.service";
-import type { ApiChallenge, ApiIdentity, ApiLoginResult, ApiUser, ApiWallet, ChallengePurpose, SessionKind } from "../../src/types";
+import type { ApiChallenge, ApiLoginResult, ApiUser, ApiWallet, IdentityClaim, SessionKind } from "../../src/types";
 import { SESSION_COOKIE } from "../../src/util/cookies";
 import type { TestApp } from "./app";
 import { TEST_ORIGIN } from "./app";
@@ -26,35 +27,39 @@ export function cookieFromResponse(res: request.Response): string {
 }
 
 /**
- * Runs the real HTTP challenge → sign → login flow (`POST /auth/wallet/challenge`,
- * `POST /auth/wallet`). Pass `purpose = "admin-sign-in"` (or use `signInAsAdmin`) for an operator
- * party listed in ADMIN_OPERATORS; `opts.cookie` runs the flow in link mode for that session.
+ * Operator sign-in over HTTP (`POST /auth/admin/challenge` → sign → `POST /auth/admin`,
+ * ARCHITECTURE §7.4): a `kind = "admin"` session for a party listed in ADMIN_OPERATORS (§6.8).
+ * Throws with the body when the sign-in is refused.
  */
-export async function signInWithWallet(
-  agent: request.Agent,
-  wallet: TestWallet,
-  purpose: ChallengePurpose = "sign-in",
-  opts: { client?: "web" | "native"; cookie?: string } = {},
-): Promise<{ user: ApiUser; cookie: string; token?: string; result: ApiLoginResult }> {
+export async function signInAsAdmin(agent: request.Agent, operator: TestWallet): Promise<{ user: ApiUser; cookie: string; result: ApiLoginResult }> {
   const headers: Record<string, string> = { Origin: TEST_ORIGIN, "Content-Type": "application/json" };
-  if (opts.cookie) headers.Cookie = opts.cookie;
-  const challenge = await agent.post("/api/v1/auth/wallet/challenge").set(headers).send({ partyId: wallet.partyId, purpose }).expect(200);
+  const challenge = await agent.post("/api/v1/auth/admin/challenge").set(headers).send({ partyId: operator.partyId }).expect(200);
   const { challengeId, message } = challenge.body as ApiChallenge;
   const login = await agent
-    .post("/api/v1/auth/wallet")
+    .post("/api/v1/auth/admin")
     .set(headers)
-    .send({ challengeId, partyId: wallet.partyId, publicKey: wallet.publicKeyBase64, signature: wallet.sign(message), kind: "cantor8", client: opts.client ?? "web" });
+    .send({ challengeId, partyId: operator.partyId, publicKey: operator.publicKeyBase64, signature: operator.sign(message), kind: "cantor8" });
   if (login.status !== 200) {
-    throw new Error(`POST /auth/wallet → ${login.status} ${JSON.stringify(login.body)}`);
+    throw new Error(`POST /auth/admin → ${login.status} ${JSON.stringify(login.body)}`);
   }
   const result = login.body as ApiLoginResult;
-  return { user: result.user, cookie: opts.cookie ?? cookieFromResponse(login), token: result.token, result };
+  return { user: result.user, cookie: cookieFromResponse(login), result };
+}
+
+/** A stable numeric Telegram subject for a test wallet, so a directly issued fixture is reproducible per key. */
+export function telegramSubjectFor(wallet: TestWallet): string {
+  return BigInt(`0x${createHash("sha256").update(wallet.partyId, "utf8").digest("hex").slice(0, 12)}`).toString();
 }
 
 /**
- * Creates a user + `canton_wallet` identity (+ wallet row, primary) and issues a session
- * directly through the services — no HTTP, so feature packages can test their routes before
- * or independently of P1's login controller.
+ * Issues a session directly through the services — no HTTP, so feature packages can test their
+ * routes independently of the login controller. Mirrors what the routes would have produced
+ * (ARCHITECTURE §6.1, §6.8):
+ *  - `kind: "user"` (default): a `telegram` identity whose subject derives from `wallet`, plus —
+ *    unless `withWalletRow === false` — the wallet row inserted directly (primary when it is the
+ *    first), so callers can rely on `user.partyId`;
+ *  - `kind: "admin"`: an operator's `canton_wallet` identity carrying its verified key in
+ *    `profile.publicKey` (what `POST /auth/admin` records) and NO wallet row.
  */
 export async function issueSessionDirect(
   ctx: TestApp,
@@ -63,11 +68,14 @@ export async function issueSessionDirect(
 ): Promise<{ user: UserEntity; identity: AuthIdentityEntity; session: SessionEntity; token: string; cookie: string; bearer: string }> {
   const identities = ctx.get(IdentityService);
   const sessions = ctx.get(SessionService);
-  const { user, identity } = await identities.resolveForLogin(
-    { provider: "canton_wallet", subject: wallet.partyId, profile: { name: wallet.partyId.split("::")[0] } },
-    { currentUser: null, ip: opts.ip ?? "127.0.0.1" },
-  );
-  if (opts.withWalletRow !== false) {
+  const kind = opts.kind ?? "user";
+  const hint = wallet.partyId.split("::")[0];
+  const claim: IdentityClaim =
+    kind === "admin"
+      ? { provider: "canton_wallet", subject: wallet.partyId, profile: { name: hint, publicKey: wallet.publicKeyBase64 } }
+      : { provider: "telegram", subject: telegramSubjectFor(wallet), profile: { name: hint } };
+  const { user, identity } = await identities.resolveForLogin(claim, { currentUser: null, ip: opts.ip ?? "127.0.0.1" });
+  if (kind === "user" && opts.withWalletRow !== false) {
     const wallets = ctx.dataSource.getRepository(WalletEntity);
     const existing = await wallets.findOne({ where: { partyId: wallet.partyId } });
     if (!existing) {
@@ -90,30 +98,17 @@ export async function issueSessionDirect(
       if (isPrimary) await ctx.dataSource.getRepository(UserEntity).update({ id: user.id }, { partyId: wallet.partyId });
     }
   }
-  const { token, session } = await sessions.issue({ userId: user.id, authIdentityId: identity.id, kind: opts.kind ?? "user", ip: opts.ip ?? "127.0.0.1", userAgent: "jest" });
+  const { token, session } = await sessions.issue({ userId: user.id, authIdentityId: identity.id, kind, ip: opts.ip ?? "127.0.0.1", userAgent: "jest" });
   const fresh = (await ctx.dataSource.getRepository(UserEntity).findOne({ where: { id: user.id } })) ?? user;
   return { user: fresh, identity, session, token, cookie: `${SESSION_COOKIE}=${encodeURIComponent(token)}`, bearer: `Bearer ${token}` };
 }
 
-/** `signInWithWallet` with purpose `admin-sign-in`: a `kind = "admin"` session for an operator party (§6.8). */
-export async function signInAsAdmin(
-  agent: request.Agent,
-  operator: TestWallet,
-  opts: { client?: "web" | "native" } = {},
-): Promise<{ user: ApiUser; cookie: string; token?: string; result: ApiLoginResult }> {
-  return signInWithWallet(agent, operator, "admin-sign-in", opts);
-}
-
 /**
- * Links an additional wallet to the session's account over HTTP (`POST /wallets/link-challenge`
- * → sign → `POST /wallets/link`, ARCHITECTURE §8.1). Throws with the body when the link is refused.
+ * Links a wallet to the session's account over HTTP (`POST /wallets/link-challenge` → sign →
+ * `POST /wallets/link`, ARCHITECTURE §8.1); the first linked wallet becomes the primary. Throws
+ * with the body when the link is refused.
  */
-export async function linkWallet(
-  agent: request.Agent,
-  cookie: string,
-  wallet: TestWallet,
-  opts: { label?: string } = {},
-): Promise<{ wallet: ApiWallet; identity: ApiIdentity }> {
+export async function linkWallet(agent: request.Agent, cookie: string, wallet: TestWallet, opts: { label?: string } = {}): Promise<{ wallet: ApiWallet }> {
   const headers: Record<string, string> = { Origin: TEST_ORIGIN, "Content-Type": "application/json", Cookie: cookie };
   const challenge = await agent.post("/api/v1/wallets/link-challenge").set(headers).send({ partyId: wallet.partyId }).expect(200);
   const { challengeId, message } = challenge.body as ApiChallenge;
@@ -131,5 +126,5 @@ export async function linkWallet(
   if (res.status !== 200) {
     throw new Error(`POST /wallets/link → ${res.status} ${JSON.stringify(res.body)}`);
   }
-  return res.body as { wallet: ApiWallet; identity: ApiIdentity };
+  return res.body as { wallet: ApiWallet };
 }

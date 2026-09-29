@@ -1,5 +1,8 @@
 # TruthOracle backend — HTTP API contract (v1)
 
+All times are UTC: ISO 8601 strings end in `Z`, epoch fields are seconds since the Unix epoch, and daily candles are UTC days.
+
+
 Shared contract between `truthoracle-backend` and the `truthoracle-canton` frontend. Every
 route is under `/api/v1` (frontend reaches it as `/__backend/api/v1/...`). Bodies and
 responses are JSON. Money is a **string with exactly 10 decimals** (`"12.5000000000"`),
@@ -77,9 +80,9 @@ interface Payout {
 - `POST /auth/telegram/miniapp` `{ initData, client? }` → `200 LoginResult`
 - `GET /auth/telegram/oidc/start?mode=login|link&returnTo=/path` → `302` to Telegram (sets `to_oidc`)
 - `GET /auth/telegram/oidc/callback?code&state` → `302` to `<app origin><returnTo>?auth=ok` or `?auth=error&code=<error code>`
-- `POST /auth/wallet/challenge` `{ partyId, purpose: "sign-in" | "link-wallet" | "admin-sign-in" }` → `200 { challengeId, message, expiresAt }`
-- `POST /auth/wallet` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", client? }` → `200 LoginResult`
-- `POST /auth/logout` → `200 { ok: true }` (clears cookie, revokes the session)
+- `POST /auth/admin/challenge` `{ partyId }` → `200 { challengeId, message, expiresAt }` (purpose `admin-sign-in`; `409 challenge_purpose_mismatch` when a session cookie is present)
+- `POST /auth/admin` `{ challengeId, partyId, publicKey, signature, kind: "cantor8" }` → `200 LoginResult` with `kind: "admin"` | `403 forbidden` (not an operator, or a session is present)
+- `POST /auth/logout` → `200 { ok: true }` (clears cookie, revokes the session; accepts an admin session)
 
 ```ts
 interface LoginResult {
@@ -90,17 +93,25 @@ interface LoginResult {
   token?: string;                            // only for client = "native"
 }
 ```
-With a session cookie present, the three login routes act in **link mode** (they attach the
-identity to the current account and return `mode: "link"`); `/auth/wallet` in link mode
-requires a `link-wallet` challenge issued to that session. Signing in with an unlinked
-identity returns `403 identity_unlinked`; linking an identity owned by another account
-returns `409 identity_already_linked`; a wallet owned by another account `409 wallet_already_linked`.
+Google and Telegram are the only ways a USER account is created or opened. With a session
+cookie present those routes act in **link mode** (they attach the identity to the current
+account and return `mode: "link"`). A Cantor8 wallet never signs a user in: it is linked to a
+signed-in account under "Wallets" below. `POST /auth/admin` is operator-only, issues a
+`kind = "admin"` session and never runs in link mode.
+
+Signing in with an unlinked identity returns `403 identity_unlinked`; linking an identity owned
+by another account returns `409 identity_already_linked`; a wallet owned by another account
+`409 wallet_already_linked`.
+
+**Session kind.** A `kind = "admin"` session is accepted only on `/admin/**`, `POST /auth/logout`,
+`GET /me` and the `/me/sessions` routes. Every other account route answers `403 forbidden`
+("admin sessions cannot use account routes").
 
 ## Me
 - `GET /me` → `200 { user: User, identities: Identity[], wallets: Wallet[], kyc: KycSummary, capabilities: Capabilities }`
 - `PATCH /me` `{ displayName?, avatarUrl? }` → `200 { user }`
 - `DELETE /me/identities/:id` → `200 { ok: true }` | `409 last_identity` | `409 identity_locked_by_kyc`
-- `POST /me/identities/:id/reattach` → `200 { identity }` (only the original owner; requires a fresh proof for that provider: body is the same as the matching login route)
+- `POST /me/identities/:id/reattach` → `200 { identity }` (only the original owner; requires a fresh proof for that provider — a Google credential or a Telegram payload; an unlinked WALLET is restored by linking it again, not here)
 - `GET /me/sessions` → `200 { sessions: Session[] }`
 - `DELETE /me/sessions/:id` → `200 { ok: true }`
 - `POST /me/sessions/revoke-others` → `200 { revoked: number }`
@@ -109,8 +120,8 @@ returns `409 identity_already_linked`; a wallet owned by another account `409 wa
 ## Wallets
 - `GET /wallets` → `200 { wallets: Wallet[] }`
 - `POST /wallets/link-challenge` `{ partyId }` → `200 { challengeId, message, expiresAt }`
-- `POST /wallets/link` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", label? }` → `200 { wallet: Wallet, identity: Identity }` (never reads the ledger; works while it is down)
-- `DELETE /wallets/:id` → `200 { ok: true }` | `409 primary_wallet_in_use` | `409 last_identity` | `409 identity_locked_by_kyc`
+- `POST /wallets/link` `{ challengeId, partyId, publicKey, signature, kind: "cantor8", label? }` → `200 { wallet: Wallet }` (never reads the ledger; works while it is down; creates no identity)
+- `DELETE /wallets/:id` → `200 { ok: true }` | `409 primary_wallet_in_use`
 - `POST /wallets/:id/primary` → `200 { wallet }` | `409 primary_wallet_in_use`
 
 ## In-app wallet
@@ -140,6 +151,7 @@ credits a `UserWallet` presupposes one exists — i.e. an account that deposited
 - `POST /admin/users/:id/kyc/override` `{ status: "approved" | "rejected_final" | "expired", reason }` → `{ verification }` | `409 kyc_duplicate_identity`
 - `GET /admin/kyc/duplicates` · `GET /admin/kyc/needs-review` → `{ items: (KycVerification & { userId })[] }`
 - `POST /admin/kyc/persons/:fingerprint/transfer` `{ toUserId, reason }` → `{ ok: true }`
+- `GET /admin/kyc/provider` → `{ provider: "mock" | "sumsub", configured: boolean, levelName, enforceWithdrawals: boolean, webhookPath, health: { ok, message, upstreamStatus: number | null, checkedAt, details } }` — a live credential probe of the KYC provider (docs/KYC.md §6); never applicant data
 - `GET /admin/payouts?status=` → `{ items: Payout[] }`
 - `POST /admin/payouts/:cid/settle` `{ force?: boolean, reason }` → `{ payout, mode }`
 - `GET /admin/audit?subjectType=&subjectId=&actorUserId=&page=` → `{ items: AuditEvent[], page, limit, total }`
@@ -148,3 +160,163 @@ credits a `UserWallet` presupposes one exists — i.e. an account that deposited
 interface AuditEvent { id: string; actorType: "user" | "admin" | "system"; actorUserId: string | null; action: string;
   subjectType: string; subjectId: string; metadata: Record<string, unknown>; createdAt: string }
 ```
+
+## Ledger index (docs/INDEXER.md)
+
+Read-only routes over the backend's index of the treasury's ledger view. Daml `Decimal`s
+(prices, shares, CC) are 10-dp strings like Money; Daml `Int` epoch seconds are ISO-8601; durations
+are integer seconds; parties are Canton party ids. Every response below carries
+`x-ledger-offset: <last applied offset>`.
+
+```ts
+type Decimal = string;                     // "0.5500000000"
+type MarketStatus = "Trading" | "Proposed" | "Resolved" | "Voided";
+type Outcome = "Yes" | "No" | "VoidOutcome";
+type Phase = "liquidity" | "trading" | "expired" | "proposed" | "resolved" | "voided";
+type MarketEventKind = "market_created" | "buy" | "sell" | "swap" | "split" | "merge" | "provide_liquidity" | "withdraw_liquidity" |
+  "resolve_t0" | "resolve" | "propose" | "challenge" | "finalize" | "void" | "redeem" | "commit_forecast" | "score_and_distribute" | "archive";
+
+interface Market {
+  marketId: number; ticker: string; eventTicker: string; yesSubTitle; noSubTitle: string;   // the contract's own identity (docs/MARKETS.md §2)
+  seriesTicker: string | null;                                                               // through the event's catalog row (null only for a placeholder event without a series)
+  contractId: string; templateId: string | null; admin: string; question; resolutionDescription: string;
+  imageUrl; description; category: string;                                                   // backend-owned presentation (docs/MARKETS.md §1): own image else the event's; the series' category
+  metadata: { imageUrl; description; updatedAt: string } | null;                             // the operator's own presentation row, null when the market shows its event's image
+  createdAt; expiresAt; tradingStartsAt: string; gracePeriodSecs; liquidityPeriodSecs: number; isDynamic: boolean;
+  reserveYes; reserveNo; liquidityL; lpTokenSupply; currentPrice: Decimal; feeBps; prizeFeeShareBps: number;
+  accumulatedFeesCC; prizePoolCC; totalVolumeCC: Decimal; status: MarketStatus; outcome: Outcome | null; resolvedAt: string | null;
+  proposal: { proposer; proposedOutcome: Outcome; proposedAt; bondCC; challenger: string | null; challengerOutcome: Outcome | null; challengeEndsAt } | null;
+  policy: { operatorResolution: boolean; sources: string[]; sourceKeys: { sourceUri; publicKey }[]; reporters: string[]; quorum; challengeSecs: number; bondCC: Decimal };
+  auditObservers: string[]; phase: Phase; archived: boolean; tradeCount: number; lastTradeAt: string | null;
+  previousPrice: Decimal | null; priceChange24h: Decimal | null; volume24hCC: Decimal;   // from the hourly candles
+  openInterest: { yes; no; total: Decimal }; liquidityCC: Decimal;                        // outstanding shares; pool value V(P)
+  book: { yesBid; yesAsk; noBid; noAsk; referenceCC: Decimal } | null;                    // AMM-implied for a 1 CC order, trading only
+  updatedOffset; createdOffset: number; synchronizerId: string | null;
+  createdEventBlob?: string | null;        // GET /markets/:id only — the disclosed contract a user-signed trade needs
+}
+interface MarketSummary { marketId; ticker; eventTicker; yesSubTitle; noSubTitle; contractId; question; imageUrl; category; status; outcome; currentPrice; expiresAt; resolvedAt; phase; archived }
+interface MarketEvent {
+  id: string; eventId: string; marketId: number; kind: MarketEventKind; actor: string; side: "Yes" | "No" | null;
+  amountCC; netCC; shares; sharesOut; feeCC; priceBefore; priceAfter; lpTokens: Decimal | null; outcome: Outcome | null;
+  details: Record<string, unknown>; offset: number; updateId: string; commandId: string | null; effectiveAt: string;
+}
+interface PricePoint { t: string; price: Decimal; volumeCC: Decimal; offset: number }
+interface Position { contractId; holder; marketId; yesShares; noShares; costBasisCC; active; createdAt; createdOffset; archivedAt;
+  market: MarketSummary | null; valueCC: Decimal | null; redeemableCC: Decimal | null }
+interface LiquidityPosition { contractId; provider; marketId; lpTokens; depositedCC; active; createdAt; createdOffset; archivedAt; market; poolShare: Decimal | null }
+interface WalletEntry { id; eventId; owner; kind: "deposit" | "credit" | "debit" | "withdraw"; amountCC; reason: string | null; txRef: string | null;
+  balanceAfter: Decimal | null; marketId: number | null; rootChoice: string | null; walletContractId; offset; updateId; effectiveAt }
+interface IndexedWallet { contractId; owner; balanceCC; depositedCC; withdrawnCC; depositRefs: string[]; updatedOffset; updatedAt }
+interface LedgerPayout { contractId; user; marketId; amountCC; reason; createdAt; createdOffset; active;
+  settledKind: "mark_paid" | "settle_to_wallet" | "cancelled" | "archived" | null; settledAt; settledOffset; txHash: string | null; refunded: boolean | null }
+interface LedgerTransfer { updateId; offset; direction: "in" | "out"; counterparty; amountCC; choice; recordTime }
+interface Attestation { contractId; attester; marketId; sourceUri; fetchedAt; outcome; payloadHash; hasSourceSignature; responseExcerpt; active; createdOffset }
+interface ModelForecast { contractId; author; marketId; modelId; probabilityYes; committedAt; marketPriceAtCommit; active; createdOffset }
+interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt; bootstrapOffset; offset: number; ledgerEnd; lag; prunedOffset: number | null;
+  lastUpdateId; lastRecordTime; lastError; lastErrorAt: string | null; gaps: { fromOffset; toOffset; reason; at }[]; updatedAt }
+```
+
+### Markets (public)
+`:market` is a numeric `marketId` or a ticker (case-insensitive) on every route below (docs/MARKETS.md §2).
+- `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&event=&series=&tickers=A,B&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&withSparkline=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked; `event` / `series` filter by catalog membership; `withSparkline=true` attaches `sparkline: { periodInterval: 60, startTs, closes: Decimal[] }` — the last 24 hourly closes, dense, carried forward — to every market of the page with one extra query)
+- `GET /markets/categories` → `{ category, markets }[]` (series categories through the event; uncategorised series left out)
+- `GET /markets/:market` → `{ market: Market }` (with `createdEventBlob`) | `404 not_found`
+- `GET /markets/:market/activity?kind=&page=&limit=` → `{ items: MarketEvent[], … }` newest first
+- `GET /markets/:market/trades?kind=&page=&limit=&cursor=` → the `buy sell swap split merge` subset; with `cursor=` (empty for the first page, then the previous answer's `nextCursor`) the feed is keyset-paginated (`nextCursor: string | null`, no `total`) — what an activity feed polls
+
+```ts
+// every activity row also carries the trade-feed view (Kalshi GET /markets/trades):
+interface MarketEvent { …; tradeId: string /* = eventId */; ticker: string; action: "buy" | "sell" | "swap" | "split" | "merge" | null;
+  yesPrice: Decimal | null /* priceAfter */; noPrice: Decimal | null /* 1 − yesPrice */; notionalCC: Decimal | null /* amountCC */;
+  takerParty: string /* masked: first 8…last 6 of the party id */; createdAt: string /* effectiveAt */ }
+```
+- `GET /markets/:market/price-history?from=&to=&resolution=raw|1m|5m|15m|1h|4h|1d&limit=` → `{ marketId, resolution, points: PricePoint[] }` oldest first (one point per market version, or the last per bucket; the latest `limit` win)
+- `GET /markets/:market/forecasts` → `{ forecasts: ModelForecast[] }` · `GET /markets/:market/attestations` → `{ attestations: Attestation[] }`
+
+### Candlesticks (public; docs/MARKETS.md §5)
+- `GET /markets/:market/candlesticks?startTs=&endTs=&periodInterval=1|60|1440` → `Candlesticks` — epoch seconds; `periodInterval` in minutes (default 60); defaults to the last 200 periods ending now; dense (every period from the market's first candle on, quiet periods carried forward with `empty: true`); at most 5 000 candles (`400 validation_failed`)
+- `GET /events/:ticker/candlesticks?startTs=&endTs=&periodInterval=` → `EventCandlesticks` — the same read for every member market of the event at once (every status, busiest by 24 h volume first), one shared window so the series align by construction: the lines of a Kalshi event chart | `404 not_found`
+
+```ts
+interface Candle { startTs: number; endTs: number;   // [startTs, endTs) epoch seconds
+  price: { open; high; low; close; mean: Decimal; previous: Decimal | null };   // mean = volume-weighted post-trade price
+  volumeCC: Decimal; trades: number; openInterest: Decimal; liquidityL: Decimal | null; empty: boolean }
+interface Candlesticks { marketId: number; ticker: string; periodInterval: 1 | 60 | 1440; startTs; endTs: number; candlesticks: Candle[] }
+interface EventCandlesticks { eventTicker: string; periodInterval; startTs; endTs: number;
+  markets: { marketId; ticker; yesSubTitle; noSubTitle; status; currentPrice: Decimal; candlesticks: Candle[] }[] }
+```
+
+### Quotes and orders (docs/MARKETS.md §6–§7)
+- `GET /markets/:market/quote?action=buy|sell|swap|provide_liquidity&side=Yes|No&amountCC=&shares=&slippageBps=` (public) → `Quote` | `409 market_not_tradable` (`details.phase`) | `409 quote_unavailable` | `400 validation_failed` — `amountCC` for buy / provide_liquidity, `shares` for sell / swap; slippage 0..2000 bps (default 100)
+- `POST /markets/:market/orders/prepare` (user session) `{ action: buy|sell|swap|split|merge|provide_liquidity|withdraw_liquidity|redeem, side?, amountCC?, shares?, lpTokens?, slippageBps? }` → `PreparedOrder` | `409 no_primary_wallet` | `409 no_in_app_wallet` | `409 no_position` | `409 insufficient_balance` (`details.balanceCC`, `details.requiredCC`) | `409 insufficient_shares` (`details.heldShares`, `details.requestedShares`) | `409 market_not_tradable` | `409 trading_halted` (`details.estimatedResumeAt`; never for `redeem`) | `409 quote_unavailable`
+
+```ts
+interface Quote { marketId; ticker; contractId; updatedOffset; nowSeconds: number; phase: Phase; effectiveL: Decimal;
+  quote: QuoteBuy | QuoteSell | QuoteSwap | QuoteLiquidity;
+  bounds: { slippageBps: number; minSharesOut?: Decimal; minProceedsCC?: Decimal; maxCostCC?: Decimal } }
+interface QuoteBuy { action: "buy"; side; collateralCC; feeCC; netCC; sharesOut; avgPrice; priceBefore; priceAfter; priceImpact; maxPayoutCC: Decimal }
+interface QuoteSell { action: "sell"; side; sharesIn; grossCC; feeCC; netCC; avgPrice; priceBefore; priceAfter; priceImpact: Decimal }
+interface QuoteSwap { action: "swap"; fromSide; sharesIn; feeShares; sharesOut; priceBefore; priceAfter; priceImpact: Decimal }
+interface QuoteLiquidity { action: "provide_liquidity"; valueIncreaseCC; costCC; lpMinted; poolShare; newL: Decimal }
+interface PreparedOrder { action; marketId; ticker; actAs: string;                       // the account's primary party signs
+  command: { ExerciseCommand: { templateId; contractId; choice; choiceArgument } };      // JSON Ledger API v2, sign as-is
+  disclosedContracts: { templateId; contractId; createdEventBlob; synchronizerId }[];   // the market version
+  quote: Quote | null; inputs: { marketContractId; walletContractId; positionContractId; lpPositionContractId: string | null };
+  ledgerOffset: number; nowSeconds: number; expiresAt: string }
+```
+
+### Catalog (public; docs/MARKETS.md §2–§3)
+- `GET /series?category=&status=active|archived|all&q=&page=&limit=` → `{ items: Series[], … }` (active only by default)
+- `GET /series/:ticker` → `{ series: Series, events: Event[] }` | `404 not_found`
+- `GET /events?series=&status=unopened|open|closed|settled|all&category=&q=&sort=trending|newest|closing|volume&withNestedMarkets=&includeArchived=&page=&limit=` → `{ items: Event[], … }` (status derived from the member markets; `sort` ranks the whole catalog — `trending` = 24 h hourly-candle volume across the members then lifetime volume, `closing` = soonest still-open close time first, `newest` = created, `volume` = lifetime; default by strike date, newest first; nested markets likeliest outcome first)
+- `GET /events/:ticker` → `{ event: Event }` with `markets` nested | `404 not_found`
+- `GET /events/:ticker/trades?limit=&cursor=` → `{ items: MarketEvent[], limit, nextCursor }` — the pool trades of every member market, newest first, keyset-paginated (`cursor` = the previous `nextCursor`) | `404 not_found`
+
+```ts
+interface Series { ticker; title; category: string; frequency: "one_off" | "daily" | "weekly" | "monthly" | "quarterly" | "annual" | "custom";
+  tags: string[]; settlementSources: { name; url }[]; contractUrl: string | null; description: string; status: "active" | "archived";
+  productMetadata: Record<string, unknown>; eventCount; marketCount: number; createdAt; updatedAt }
+interface Event { ticker; seriesTicker; title; subTitle; category; imageUrl; description: string; mutuallyExclusive: boolean;
+  strikeDate: string | null; strikePeriod: string | null; settlementSources: { name; url }[]; productMetadata; archived: boolean;
+  status: "unopened" | "open" | "closed" | "settled"; marketCount: number; volumeCC: Decimal; closeTime: string | null;
+  volume24hCC: Decimal /* Σ members' last 24 h */; openInterestCC: Decimal /* Σ outstanding shares */; liquidityCC: Decimal /* Σ pool value */;
+  topMarket: { marketId; ticker; yesSubTitle; currentPrice: Decimal } | null /* the likeliest outcome */;
+  markets?: Market[] /* likeliest first */; createdAt; updatedAt }
+```
+
+### Exchange (public; docs/MARKETS.md §8)
+- `GET /exchange/status` → `{ exchangeActive, tradingActive: boolean, halt: { active, reason, since, estimatedResumeAt }, ledger: { indexEnabled, indexRunning, offset, ledgerEnd, lag, lastRecordTime, lastError, stale }, network, packageName, serverTime }`
+
+### Ledger (public)
+- `GET /ledger/status` → `LedgerStatus`
+- `GET /ledger/wait?offset=&timeoutMs=` → `200 { reached: boolean, offset, requested }` — resolves once the index reaches `offset` or after `timeoutMs` (default 10 s, max 30 s)
+- `GET /stats` → `{ markets: { total, trading, proposed, resolved, voided }, totalVolumeCC, volume24hCC, trades, trades24h, traders, indexedOffset }`
+- `GET /leaderboard?window=24h|7d|30d|all&limit=` → `{ window, entries: { party, volumeCC, trades, markets, realizedPnlCC }[] }`
+
+### Portfolio (session; user sessions only)
+The account's parties = the primary party + every active linked wallet.
+- `GET /me/positions?status=open|all` → `{ parties, positions: Position[] }` (`valueCC` = mark-to-market while Trading, the redeemable amount once settled)
+- `GET /me/liquidity?status=open|all` → `{ parties, positions: LiquidityPosition[] }`
+- `GET /me/trades?marketId=&kind=&page=&limit=` · `GET /me/activity?…` → `{ items: MarketEvent[], … }`
+
+### In-app wallet ledger (session)
+- `GET /in-app-wallet/ledger` → `{ partyId, wallet: IndexedWallet | null, payouts: LedgerPayout[] }`
+- `GET /in-app-wallet/history?kind=&page=&limit=` → `{ items: WalletEntry[], … }` — the statement of the primary party's UserWallet
+- `GET /in-app-wallet/transfers?direction=&page=&limit=` → `{ items: LedgerTransfer[], … }` — Canton Coin between the treasury and the account's wallets
+
+### Admin — ledger (admin session)
+- `GET /admin/ledger/status` → `LedgerStatus`
+- `POST /admin/ledger/resync` `{ reason }` → `{ status }` (re-snapshot the ACS at the ledger end; audited `ledger.resync`)
+- `GET /admin/ledger/events?updateId=&contractId=&marketId=&entity=&choice=&fromOffset=&page=` → raw created / exercised events (`{ id, eventId, offset, nodeId, updateId, kind, template, contractId, choice, consuming, actingParties, payload, result, parentNodeId, effectiveAt, commandId }`)
+- `GET /admin/ledger/wallets?owner=` · `GET /admin/ledger/payouts?active=&user=` · `GET /admin/ledger/transfers?direction=&counterparty=`
+- `GET /admin/ledger/markets/:marketId/positions` · `/liquidity` → holders / providers, largest first
+
+### Admin — catalog and exchange (admin session; docs/MARKETS.md §2–§4, §8)
+`reason` is optional on the catalog routes (presentational data) and recorded on the audit row when given.
+- `POST /admin/series` `{ ticker, title, category?, frequency?, tags?, settlementSources?, contractUrl?, description?, productMetadata?, reason? }` → `{ series }` | `409 catalog_conflict`
+- `PATCH /admin/series/:ticker` `{ …any of the above, status?: active | archived }` → `{ series }`
+- `POST /admin/events` `{ ticker, seriesTicker, title, subTitle?, imageUrl?, description?, mutuallyExclusive?, strikeDate?, strikePeriod?, settlementSources?, productMetadata?, reason? }` → `{ event }` | `404 not_found` (series) | `409 catalog_conflict`
+- `PATCH /admin/events/:ticker` `{ …, archived? }` → `{ event }`
+- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars) | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract. `imageUrl` / `description` are backend-owned presentation written to `to_market_metadata` before the submit, never to the ledger (a blank `imageUrl` shows the event's image); the category is the series'.
+- `PATCH /admin/markets/:market/metadata` `{ imageUrl?, description?, reason? }` → `{ market }` | `400 validation_failed` (neither field) | `404 not_found`. Audited `catalog.market_metadata_updated`; publishes `truthoracle.catalog.changed { kind: "market" }`.
+- `POST /admin/exchange/halt` `{ active: boolean, reason, estimatedResumeAt? }` → `{ halt }`

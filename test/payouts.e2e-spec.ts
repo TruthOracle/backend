@@ -39,7 +39,8 @@ import type { ErrorBody } from "../src/util/errors";
 import { parseCC } from "../src/util/money";
 import { type TestApp, useTestApp } from "./helpers/app";
 import type { FakeEnterpriseWallet } from "./helpers/fakes";
-import { bodyOf, issueSessionDirect, signInAsAdmin, signInWithWallet } from "./helpers/session";
+import { bodyOf, linkWallet, signInAsAdmin } from "./helpers/session";
+import { nextTelegramUser, signInWithTelegram } from "./helpers/telegram";
 import { makeTestWallet, type TestWallet } from "./helpers/wallet";
 
 const operator = makeTestWallet("operator");
@@ -56,26 +57,21 @@ interface SignedIn {
   cookie: string;
   user: UserEntity;
   session: SessionEntity;
-  /** The `to_wallets` row the sign-in seeded (primary). */
+  /** The `to_wallets` row the link created (the account's primary, §8.1). */
   walletRow: WalletEntity;
 }
 
 /**
- * The real challenge → sign → login flow on a throwaway agent (supertest's cookie jar would
- * otherwise attach this session to every later request and override the explicit `Cookie`
- * header the tests set for other users). Falls back to a directly issued session while P1's
- * login route is a 501 stub — the guards, wallet row and primary party are the same either way.
+ * An account opened through the real Telegram widget route (§6.1) with `hint`'s wallet linked as
+ * its primary (`POST /wallets/link-challenge` → sign → `POST /wallets/link`, §8.1). Jar-less
+ * requests: a supertest agent would attach this session to every later request and override the
+ * explicit `Cookie` header the tests set for other users.
  */
 async function signIn(ctx: TestApp, hint: string): Promise<SignedIn> {
   const wallet = makeTestWallet(hint);
-  const agent = request.agent(ctx.app.getHttpServer() as Server);
-  let cookie: string;
-  try {
-    ({ cookie } = await signInWithWallet(agent, wallet));
-  } catch (err) {
-    if (!/→ 501\b/.test((err as Error).message)) throw err;
-    ({ cookie } = await issueSessionDirect(ctx, wallet));
-  }
+  const agent = request(ctx.app.getHttpServer() as Server);
+  const { cookie } = await signInWithTelegram(agent, nextTelegramUser(hint));
+  await linkWallet(agent, cookie, wallet);
   const token = decodeURIComponent(cookie.slice(SESSION_COOKIE.length + 1));
   const verified = await ctx.get(SessionService).verify(token);
   if (!verified) throw new Error("the sign-in cookie does not verify");

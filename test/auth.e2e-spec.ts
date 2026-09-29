@@ -1,21 +1,23 @@
 /**
  * Sign-in end to end (docs/API.md "Auth" + "Me"; ARCHITECTURE §6–§7, §13) over the real HTTP
- * pipeline: wallet challenge → signature → session cookie / bearer token, link mode and purpose
- * isolation, unlink / reattach, admin sign-in, Google (verifier faked at the OAuth2Client seam),
- * Telegram Login Widget (payload signed here with the documented HMAC), logout, sessions, CSRF
- * and the login rate limit.
+ * pipeline. User accounts are opened only by Google (verifier faked at the OAuth2Client seam) and
+ * Telegram (Login Widget payloads signed in-process with the documented HMAC; Mini App initData).
+ * A Cantor8 wallet never signs a user in: it is linked to a signed-in account through
+ * `/wallets/link-challenge` + `/wallets/link` (purpose isolation, session binding, the party →
+ * first-account rule, unlink / relink). Operators sign into the admin API through
+ * `/auth/admin/challenge` + `/auth/admin`. Also: unlink / reattach of identities, native bearer
+ * sessions, logout, sessions, CSRF and the login rate limits.
  *
  * Every request goes through a jar-less `request(server)`: superagent's agent merges its cookie
  * jar into an explicit `Cookie` header (the jar wins for a same-named cookie), which would make
  * multi-session scenarios ambiguous. Cookies are therefore always passed explicitly.
  *
  * Every scenario is written to the spec and passes against the current tree, so nothing carries
- * a `.failing` marker. Two statuses the spec leaves open are pinned by comments where asserted:
- * verify-time `challenge_purpose_mismatch` is 401 (INTERNALS "WalletChallengeService.verify"),
- * and the sole identity of a wallet-only account is refused as either `last_identity` (§6.3) or
- * `primary_wallet_in_use` (§8.2).
+ * a `.failing` marker. One status the spec leaves open is pinned where asserted: verify-time
+ * `challenge_purpose_mismatch` is 401 (INTERNALS "WalletChallengeService.verify"); the
+ * issue-time refusal is 409.
  */
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import { LoginTicket, type OAuth2Client, type TokenPayload, type VerifyIdTokenOptions } from "google-auth-library";
 import request from "supertest";
@@ -29,12 +31,13 @@ import { UserEntity } from "../src/entities/user.entity";
 import { WalletEntity } from "../src/entities/wallet.entity";
 import { GoogleAuthService } from "../src/services/google-auth.service";
 import { RedisService } from "../src/services/redis.service";
-import type { ApiChallenge, ApiIdentity, ApiLoginResult, ApiMe, ApiSession, ApiSessionState, ChallengePurpose } from "../src/types";
+import type { ApiChallenge, ApiIdentity, ApiLoginResult, ApiMe, ApiSession, ApiSessionState, ApiWallet } from "../src/types";
 import { SESSION_COOKIE } from "../src/util/cookies";
 import type { ErrorBody } from "../src/util/errors";
 import { signMiniAppInitData } from "../src/util/telegram";
 import { TEST_ORIGIN, useTestApp } from "./helpers/app";
-import { bodyOf, cookieFromResponse, signInWithWallet } from "./helpers/session";
+import { bodyOf, cookieFromResponse, linkWallet } from "./helpers/session";
+import { freshWidgetPayload, signInWithTelegram, signTelegramWidget, type TelegramTestUser } from "./helpers/telegram";
 import { makeTestWallet, type TestWallet } from "./helpers/wallet";
 
 const operator = makeTestWallet("operator");
@@ -49,10 +52,16 @@ const OIDC_DISCOVERY = {
 };
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const CHALLENGE_URL = "/api/v1/auth/wallet/challenge";
-const WALLET_URL = "/api/v1/auth/wallet";
+const ADMIN_CHALLENGE_URL = "/api/v1/auth/admin/challenge";
+const ADMIN_URL = "/api/v1/auth/admin";
+const LINK_CHALLENGE_URL = "/api/v1/wallets/link-challenge";
+const LINK_URL = "/api/v1/wallets/link";
+const WIDGET_URL = "/api/v1/auth/telegram/widget";
 /** Browser-style headers for every non-GET (API.md "Auth"): Origin + JSON + x-requested-with. */
 const CSRF: Record<string, string> = { Origin: TEST_ORIGIN, "Content-Type": "application/json", "x-requested-with": "truthoracle" };
+
+/** A Telegram user for a test; every test names its own numeric id. */
+const tg = (id: string, first_name: string): TelegramTestUser => ({ id, first_name });
 
 // ───────────────────────────────────────── Google stand-in ─────────────────────────────────────
 
@@ -77,19 +86,6 @@ const fakeOAuthClient: Pick<OAuth2Client, "verifyIdToken"> = {
     return new LoginTicket(segments[0], payload);
   },
 };
-
-// ───────────────────────────────────────── Telegram stand-in ───────────────────────────────────
-
-/** Signs a Login Widget payload the way Telegram does (§7.2): key = SHA256(bot token), sorted `k=v` lines. */
-function signTelegramWidget(fields: Record<string, string>, botToken: string): Record<string, string> {
-  const key = createHash("sha256").update(botToken, "utf8").digest();
-  const dataCheckString = Object.keys(fields)
-    .filter((k) => k !== "hash")
-    .sort()
-    .map((k) => `${k}=${fields[k]}`)
-    .join("\n");
-  return { ...fields, hash: createHmac("sha256", key).update(dataCheckString, "utf8").digest("hex") };
-}
 
 describe("auth (e2e)", () => {
   const ctx = useTestApp({
@@ -124,21 +120,34 @@ describe("auth (e2e)", () => {
   const auditRows = (action: string) => repo(AuditEventEntity).find({ where: { action }, order: { id: "ASC" } });
   const liveSessions = (userId: string) => repo(SessionEntity).count({ where: { userId, revokedAt: IsNull() } });
 
-  async function issueChallenge(wallet: TestWallet, purpose: ChallengePurpose = "sign-in", cookie?: string): Promise<ApiChallenge> {
-    const req = http().post(CHALLENGE_URL).set(CSRF);
-    if (cookie) req.set("Cookie", cookie);
-    const res = await req.send({ partyId: wallet.partyId, purpose });
-    if (res.status !== 200) throw new Error(`POST /auth/wallet/challenge → ${res.status} ${JSON.stringify(res.body)}`);
+  /** Accounts are opened by Google or Telegram only (§6.1): every user fixture starts here. With `cookie`, link mode. */
+  const tgSignIn = (user: TelegramTestUser, cookie?: string) => signInWithTelegram(http(), user, cookie ? { cookie } : {});
+
+  async function issueAdminChallenge(wallet: TestWallet): Promise<ApiChallenge> {
+    const res = await http().post(ADMIN_CHALLENGE_URL).set(CSRF).send({ partyId: wallet.partyId });
+    if (res.status !== 200) throw new Error(`POST /auth/admin/challenge → ${res.status} ${JSON.stringify(res.body)}`);
     return bodyOf<ApiChallenge>(res);
   }
 
-  /** The `POST /auth/wallet` body for a challenge (also the wallet half of `POST /me/identities/:id/reattach`). */
+  async function issueLinkChallenge(wallet: TestWallet, cookie: string): Promise<ApiChallenge> {
+    const res = await http().post(LINK_CHALLENGE_URL).set(CSRF).set("Cookie", cookie).send({ partyId: wallet.partyId });
+    if (res.status !== 200) throw new Error(`POST /wallets/link-challenge → ${res.status} ${JSON.stringify(res.body)}`);
+    return bodyOf<ApiChallenge>(res);
+  }
+
+  /** The wallet proof for a challenge — the body of `POST /auth/admin` and of `POST /wallets/link`. */
   function proof(wallet: TestWallet, challenge: ApiChallenge): Record<string, string> {
     return { challengeId: challenge.challengeId, partyId: wallet.partyId, publicKey: wallet.publicKeyBase64, signature: wallet.sign(challenge.message), kind: "cantor8" };
   }
 
-  function postWallet(body: Record<string, unknown>, cookie?: string): request.Test {
-    const req = http().post(WALLET_URL).set(CSRF);
+  function postAdmin(body: Record<string, unknown>, cookie?: string): request.Test {
+    const req = http().post(ADMIN_URL).set(CSRF);
+    if (cookie) req.set("Cookie", cookie);
+    return req.send(body);
+  }
+
+  function postLink(body: Record<string, unknown>, cookie?: string): request.Test {
+    const req = http().post(LINK_URL).set(CSRF);
     if (cookie) req.set("Cookie", cookie);
     return req.send(body);
   }
@@ -146,17 +155,14 @@ describe("auth (e2e)", () => {
   /** Headers that make the backend see `ip` as the client (the relay's contract, secret + x-real-ip). */
   const fromIp = (ip: string): Record<string, string> => ({ ...CSRF, "x-truthoracle-proxy": PROXY_SECRET, "x-real-ip": ip, "x-forwarded-host": "app.test", "x-forwarded-proto": "http" });
 
-  /** The house helper over a fresh (empty-jar) agent so its cookie handling stays explicit. */
-  const signIn = (wallet: TestWallet, purpose: ChallengePurpose = "sign-in", opts: { client?: "web" | "native"; cookie?: string } = {}) =>
-    signInWithWallet(request.agent(server()), wallet, purpose, opts);
-
-  /** Link mode through `POST /auth/wallet` with a `link-wallet` challenge issued to `cookie`'s session. */
-  async function linkWallet(wallet: TestWallet, cookie: string): Promise<ApiLoginResult> {
-    const { result } = await signIn(wallet, "link-wallet", { cookie });
-    return result;
-  }
+  /** The house helper: `POST /wallets/link-challenge` → sign → `POST /wallets/link` for `cookie`'s account. */
+  const link = (wallet: TestWallet, cookie: string) => linkWallet(http(), cookie, wallet);
 
   const getMe = (cookie: string) => http().get("/api/v1/me").set("Cookie", cookie);
+  const deleteIdentity = (identityId: string, cookie: string) => http().delete(`/api/v1/me/identities/${identityId}`).set(CSRF).set("Cookie", cookie);
+  /** `POST /me/identities/:id/reattach` with a freshly signed widget payload for `user`. */
+  const reattachTelegram = (identityId: string, user: TelegramTestUser, cookie: string) =>
+    http().post(`/api/v1/me/identities/${identityId}/reattach`).set(CSRF).set("Cookie", cookie).send(freshWidgetPayload(user));
 
   /** Google sign-in through the real nonce + credential routes (the verifier is the fake above). */
   async function googleSignIn(sub: string, email: string, cookie?: string): Promise<{ result: ApiLoginResult; cookie: string }> {
@@ -168,15 +174,49 @@ describe("auth (e2e)", () => {
     return { result: bodyOf<ApiLoginResult>(res), cookie: cookie ?? cookieFromResponse(res) };
   }
 
-  // ──────────────────────────────────────── wallet sign-in ─────────────────────────────────────
-  describe("wallet sign-in (§7.3)", () => {
-    it("challenge → sign → login: session cookie, new account, canton_wallet identity and a seeded primary wallet", async () => {
-      const w = makeTestWallet("alice");
+  // ─────────────────────────────── wallets never sign users in ─────────────────────────────────
+  describe("wallet routes never issue user sessions (§7.3)", () => {
+    it("POST /auth/wallet/challenge and POST /auth/wallet no longer exist: 404 not_found envelope", async () => {
+      const w = makeTestWallet("gone");
+      const challenge = await http().post("/api/v1/auth/wallet/challenge").set(CSRF).send({ partyId: w.partyId, purpose: "sign-in" }).expect(404);
+      expect(errorOf(challenge)).toEqual({ error: "not_found", message: "Cannot POST /api/v1/auth/wallet/challenge" });
+      const login = await http()
+        .post("/api/v1/auth/wallet")
+        .set(CSRF)
+        .send({ challengeId: randomUUID(), partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign("nothing"), kind: "cantor8" })
+        .expect(404);
+      expect(errorOf(login)).toEqual({ error: "not_found", message: "Cannot POST /api/v1/auth/wallet" });
+      expect(await repo(UserEntity).count()).toBe(0);
+    });
 
-      const issued = await http().post(CHALLENGE_URL).set(CSRF).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200);
+    it("a wallet signature alone opens no account: /auth/admin/challenge answers 200 for any well-formed party, /auth/admin by a non-operator → 403 forbidden with no user, no identity, no cookie", async () => {
+      const nobody = makeTestWallet("nobody");
+      const challenge = await issueAdminChallenge(nobody);
+      expect(challenge.challengeId).toMatch(UUID_RE);
+      expect(challenge.message.split("\n")[0]).toBe("TruthOracle admin-sign-in");
+
+      const res = await postAdmin(proof(nobody, challenge)).expect(403);
+      expect(errorOf(res).error).toBe("forbidden");
+      expect(sessionCookieOf(res)).toBeUndefined();
+      expect(await repo(UserEntity).count()).toBe(0);
+      expect(await repo(AuthIdentityEntity).count()).toBe(0);
+      expect(await repo(WalletEntity).count()).toBe(0);
+      expect(await repo(SessionEntity).count()).toBe(0);
+    });
+
+    it("a link-wallet challenge needs a session (401); the link binds the wallet to a Telegram account — one primary wallet, users.partyId set, NO canton_wallet identity", async () => {
+      const w = makeTestWallet("alice");
+      const anon = await http().post(LINK_CHALLENGE_URL).set(CSRF).send({ partyId: w.partyId }).expect(401);
+      expect(errorOf(anon).error).toBe("unauthenticated");
+
+      const { cookie, user, result } = await tgSignIn(tg("100001", "Alice"));
+      expect(result).toMatchObject({ mode: "login", created: true, kind: "user" });
+      expect(user.partyId).toBeNull();
+
+      const issued = await http().post(LINK_CHALLENGE_URL).set(CSRF).set("Cookie", cookie).send({ partyId: w.partyId }).expect(200);
       const { challengeId, message, expiresAt } = bodyOf<ApiChallenge>(issued);
       expect(challengeId).toMatch(UUID_RE);
-      expect(message.split("\n")[0]).toBe("TruthOracle sign-in");
+      expect(message.split("\n")[0]).toBe("TruthOracle link-wallet");
       expect(message).toContain(`Party: ${w.partyId}`);
       expect(message).toMatch(/^Nonce: [0-9a-f]{32}$/m);
       expect(message).toMatch(/^Domain: 127\.0\.0\.1:\d+$/m);
@@ -186,346 +226,317 @@ describe("auth (e2e)", () => {
       expect(message).toContain(`Expires: ${expiresAt}`);
       expect(Date.parse(expiresAt)).toBeGreaterThan(Date.now());
 
-      const login = await postWallet({ challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(message), kind: "cantor8" }).expect(200);
-      const result = bodyOf<ApiLoginResult>(login);
-      expect(result).toMatchObject({ mode: "login", created: true, kind: "user" });
-      expect(result.identity).toMatchObject({ provider: "canton_wallet", subject: w.partyId, status: "active", kycLocked: false, profile: { name: "alice" } });
-      expect(result.user).toMatchObject({ id: expect.stringMatching(UUID_RE) as string, partyId: w.partyId, status: "active", kycStatus: "none" });
-      expect(result.user.lastLoginAt).not.toBeNull();
-      expect(result.token).toBeUndefined();
-      expect(Date.parse(result.expiresAt) - Date.now()).toBeGreaterThan(ctx.config.sessionTtlMs - 60_000);
+      const linked = await postLink({ challengeId, partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign(message), kind: "cantor8" }, cookie).expect(200);
+      const body = bodyOf<{ wallet: ApiWallet }>(linked);
+      expect(Object.keys(body)).toEqual(["wallet"]);
+      expect(body.wallet).toMatchObject({ partyId: w.partyId, isPrimary: true, status: "active", kind: "cantor8", creditedCC: "0.0000000000" });
+      expect(setCookies(linked)).toEqual([]); // linking issues no session
 
-      // §6.6: HttpOnly, SameSite=Lax, Path=/, host-only (Secure is off in the test env: COOKIE_SECURE=false).
-      const cookieHeader = sessionCookieOf(login);
-      expect(cookieHeader).toBeDefined();
-      expect(cookieHeader).toMatch(/;\s*HttpOnly(;|$)/i);
-      expect(cookieHeader).toMatch(/;\s*SameSite=Lax(;|$)/i);
-      expect(cookieHeader).toMatch(/;\s*Path=\/(;|$)/i);
-      expect(cookieHeader).not.toMatch(/Domain=/i);
-      const cookie = cookieFromResponse(login);
+      // §8.1: the row, the primary, users.party_id — and no identity for the wallet.
+      const wallets = await repo(WalletEntity).find({ where: { userId: user.id } });
+      expect(wallets).toHaveLength(1);
+      expect(wallets[0]).toMatchObject({ partyId: w.partyId, isPrimary: true, status: "active", publicKey: w.publicKeyBase64, creditedCC: 0n });
+      expect((await repo(UserEntity).findOneByOrFail({ id: user.id })).partyId).toBe(w.partyId);
+      const identities = await repo(AuthIdentityEntity).find({ where: { userId: user.id } });
+      expect(identities.map((i) => [i.provider, i.subject, i.status])).toEqual([["telegram", "100001", "active"]]);
+      expect(await repo(AuthIdentityEntity).count()).toBe(1);
+      expect(await liveSessions(user.id)).toBe(1);
 
       const state = bodyOf<ApiSessionState>(await http().get("/api/v1/auth/session").set("Cookie", cookie).expect(200));
-      expect(state).toMatchObject({ authenticated: true, kind: "user", expiresAt: result.expiresAt, user: { id: result.user.id, partyId: w.partyId } });
-      expect(bodyOf<ApiSessionState>(await http().get("/api/v1/auth/session").expect(200))).toEqual({ authenticated: false });
+      expect(state).toMatchObject({ authenticated: true, kind: "user", user: { id: user.id, partyId: w.partyId } });
+      const me = bodyOf<ApiMe>(await getMe(cookie).expect(200));
+      expect(me.identities.map((i) => [i.provider, i.subject])).toEqual([["telegram", "100001"]]);
+      expect(me.wallets.map((x) => [x.partyId, x.isPrimary])).toEqual([[w.partyId, true]]);
+      expect(me.capabilities).toMatchObject({ primaryPartyId: w.partyId, canDeposit: true, isAdmin: false });
 
-      // §7.3 "On success": identity + wallet row seeded, first wallet primary, users.party_id set.
-      const wallets = await repo(WalletEntity).find({ where: { userId: result.user.id } });
-      expect(wallets).toHaveLength(1);
-      expect(wallets[0]).toMatchObject({ partyId: w.partyId, isPrimary: true, status: "active", kind: "cantor8", publicKey: w.publicKeyBase64, creditedCC: 0n });
-      const user = await repo(UserEntity).findOneByOrFail({ id: result.user.id });
-      expect(user.partyId).toBe(w.partyId);
-      const identities = await repo(AuthIdentityEntity).find({ where: { userId: result.user.id } });
-      expect(identities.map((i) => [i.provider, i.subject, i.status])).toEqual([["canton_wallet", w.partyId, "active"]]);
-      expect(await liveSessions(result.user.id)).toBe(1);
-
-      const [loginAudit] = await auditRows("auth.login");
-      expect(loginAudit).toMatchObject({ actorType: "user", actorUserId: result.user.id, subjectType: "user", subjectId: result.user.id, metadata: { provider: "canton_wallet", created: true, client: "web" } });
-      expect(loginAudit.actorSessionId).not.toBeNull();
-      expect(ctx.nats.publishedOn("truthoracle.user.created")).toHaveLength(1);
-      expect(ctx.nats.publishedOn("truthoracle.wallet.linked")).toHaveLength(1);
-      expect(ctx.nats.publishedOn("truthoracle.auth.login")).toHaveLength(1);
+      const actions = (await repo(AuditEventEntity).find({ order: { id: "ASC" } })).map((e) => e.action);
+      expect(actions.filter((a) => a.startsWith("wallet."))).toEqual(["wallet.linked", "wallet.primary_changed"]);
+      expect(await auditRows("identity.linked")).toHaveLength(1); // the Telegram identity, at sign-in
+      expect(ctx.nats.publishedOn("truthoracle.wallet.linked")).toEqual([expect.objectContaining({ payload: { userId: user.id, walletId: body.wallet.id, relinked: false } })]);
+      expect(ctx.nats.publishedOn("truthoracle.identity.linked")).toHaveLength(0);
     });
 
-    it("a second sign-in with the same wallet reuses the account (created:false, same user id)", async () => {
-      const w = makeTestWallet("bob");
-      const first = await signIn(w);
-      const second = await signIn(w);
-      expect(first.result).toMatchObject({ created: true });
-      expect(second.result).toMatchObject({ mode: "login", created: false, kind: "user" });
-      expect(second.result.user.id).toBe(first.result.user.id);
-      expect(second.result.identity.id).toBe(first.result.identity.id);
-      expect(second.cookie).not.toBe(first.cookie);
+    it("a link-wallet challenge is bound to the session it was issued to: another session → 401 challenge_purpose_mismatch, and the failed presentation burns it", async () => {
+      const w = makeTestWallet("bound");
+      const a = await tgSignIn(tg("100011", "Anna"));
+      const b = await tgSignIn(tg("100012", "Bert"));
 
-      expect(await liveSessions(first.user.id)).toBe(2);
-      expect(await repo(WalletEntity).count({ where: { userId: first.user.id } })).toBe(1);
-      expect(await repo(UserEntity).count()).toBe(1);
-      expect(ctx.nats.publishedOn("truthoracle.user.created")).toHaveLength(1);
-      expect(ctx.nats.publishedOn("truthoracle.auth.login")).toHaveLength(2);
+      const forA = await issueLinkChallenge(w, a.cookie);
+      const byB = await postLink(proof(w, forA), b.cookie).expect(401);
+      expect(errorOf(byB).error).toBe("challenge_purpose_mismatch");
+      const burned = await postLink(proof(w, forA), a.cookie).expect(401);
+      expect(errorOf(burned).error).toBe("challenge_rejected");
+      // The link route itself needs a session: without one the challenge is never reached.
+      const orphan = await issueLinkChallenge(w, a.cookie);
+      expect(errorOf(await postLink(proof(w, orphan)).expect(401)).error).toBe("unauthenticated");
+      expect(await repo(WalletEntity).count()).toBe(0);
+
+      // A fresh challenge presented by the right session links.
+      const fresh = await issueLinkChallenge(w, a.cookie);
+      await postLink(proof(w, fresh), a.cookie).expect(200);
+      expect((await repo(WalletEntity).findOneByOrFail({ partyId: w.partyId })).userId).toBe(a.user.id);
+      expect(await repo(WalletEntity).count({ where: { userId: b.user.id } })).toBe(0);
     });
 
     it("refuses a foreign key (wallet_key_mismatch), a tampered signature (signature_invalid), a replayed challenge (challenge_rejected) and a malformed party (validation_failed)", async () => {
+      const { cookie, user } = await tgSignIn(tg("100021", "Carol"));
       const w = makeTestWallet("carol");
       const other = makeTestWallet("mallory");
 
       // Wrong public key for the party: the fingerprint does not match → 401, and the attempt burns the challenge.
-      const c1 = await issueChallenge(w);
-      const mismatch = await postWallet({ ...proof(w, c1), publicKey: other.publicKeyBase64, signature: other.sign(c1.message) }).expect(401);
+      const c1 = await issueLinkChallenge(w, cookie);
+      const mismatch = await postLink({ ...proof(w, c1), publicKey: other.publicKeyBase64, signature: other.sign(c1.message) }, cookie).expect(401);
       expect(errorOf(mismatch).error).toBe("wallet_key_mismatch");
-      const burned = await postWallet(proof(w, c1)).expect(401);
+      const burned = await postLink(proof(w, c1), cookie).expect(401);
       expect(errorOf(burned).error).toBe("challenge_rejected");
 
       // Tampered signature (one byte flipped, still 64 bytes).
-      const tamperer = makeTestWallet("dave");
-      const c2 = await issueChallenge(tamperer);
-      const sig = Buffer.from(tamperer.sign(c2.message), "base64");
+      const c2 = await issueLinkChallenge(w, cookie);
+      const sig = Buffer.from(w.sign(c2.message), "base64");
       sig[3] ^= 0xff;
-      const tampered = await postWallet({ ...proof(tamperer, c2), signature: sig.toString("base64") }).expect(401);
+      const tampered = await postLink({ ...proof(w, c2), signature: sig.toString("base64") }, cookie).expect(401);
       expect(errorOf(tampered).error).toBe("signature_invalid");
 
       // Replay: the same challengeId a second time.
-      const c3 = await issueChallenge(w);
+      const c3 = await issueLinkChallenge(w, cookie);
       const body = proof(w, c3);
-      await postWallet(body).expect(200);
-      const replay = await postWallet(body).expect(401);
+      await postLink(body, cookie).expect(200);
+      const replay = await postLink(body, cookie).expect(401);
       expect(errorOf(replay).error).toBe("challenge_rejected");
 
       // Unknown / made-up challenge id.
-      const unknown = await postWallet({ ...proof(w, c3), challengeId: randomUUID() }).expect(401);
+      const unknown = await postLink({ ...proof(w, c3), challengeId: randomUUID() }, cookie).expect(401);
       expect(errorOf(unknown).error).toBe("challenge_rejected");
 
       // Invalid party id shape (two `::`, no fingerprint) → 400 on both routes.
-      const badChallenge = await http().post(CHALLENGE_URL).set(CSRF).send({ partyId: "a::b::1220" + "0".repeat(64), purpose: "sign-in" }).expect(400);
+      const badChallenge = await http().post(LINK_CHALLENGE_URL).set(CSRF).set("Cookie", cookie).send({ partyId: "a::b::1220" + "0".repeat(64) }).expect(400);
       expect(errorOf(badChallenge).error).toBe("validation_failed");
       expect(errorOf(badChallenge).details?.issues).toEqual(expect.arrayContaining([expect.stringMatching(/partyId/)]));
-      const badLogin = await postWallet({ ...proof(w, c3), challengeId: randomUUID(), partyId: "nope" }).expect(400);
-      expect(errorOf(badLogin).error).toBe("validation_failed");
+      const badLink = await postLink({ ...proof(w, c3), challengeId: randomUUID(), partyId: "nope" }, cookie).expect(400);
+      expect(errorOf(badLink).error).toBe("validation_failed");
 
-      // Exactly one session was issued (the successful login); every refusal issued none.
-      const users = await repo(UserEntity).find();
-      expect(users).toHaveLength(1);
-      expect(await liveSessions(users[0].id)).toBe(1);
-      expect(await repo(AuthIdentityEntity).count()).toBe(1);
+      // Exactly one wallet was linked; every refusal linked none and touched no identity or session.
+      expect(await repo(WalletEntity).count()).toBe(1);
       expect(await repo(WalletEntity).count({ where: { partyId: other.partyId } })).toBe(0);
-    });
-  });
-
-  // ──────────────────────────────────── purpose isolation + linking ────────────────────────────
-  describe("purpose isolation and link mode (§7.3, §8.1)", () => {
-    it("sign-in challenges are refused while signed in; a link-wallet challenge attaches a second, non-primary wallet", async () => {
-      const a = makeTestWallet("alice");
-      const b = makeTestWallet("alice-cold");
-      const { cookie, user } = await signIn(a);
-
-      // Issuing a sign-in challenge with a session present → 409 challenge_purpose_mismatch.
-      const issued = await http().post(CHALLENGE_URL).set(CSRF).set("Cookie", cookie).send({ partyId: b.partyId, purpose: "sign-in" }).expect(409);
-      expect(errorOf(issued).error).toBe("challenge_purpose_mismatch");
-
-      // A sign-in challenge issued anonymously and presented with the session → challenge_purpose_mismatch.
-      // Status: INTERNALS pins `WalletChallengeService.verify` to 401 for every verify-time refusal
-      // (ARCHITECTURE §11 / API.md only fix the code); the issue-time refusal above is the 409.
-      const anon = await issueChallenge(b);
-      const misuse = await postWallet(proof(b, anon), cookie).expect(401);
-      expect(errorOf(misuse).error).toBe("challenge_purpose_mismatch");
-
-      // "and vice versa": link-wallet needs a session to be issued and the SAME session to be used.
-      const noSession = await http().post(CHALLENGE_URL).set(CSRF).send({ partyId: b.partyId, purpose: "link-wallet" }).expect(401);
-      expect(errorOf(noSession).error).toBe("unauthenticated");
-      const orphan = await issueChallenge(b, "link-wallet", cookie);
-      const withoutCookie = await postWallet(proof(b, orphan)).expect(401);
-      expect(errorOf(withoutCookie).error).toBe("challenge_purpose_mismatch");
-      const stranger = await signIn(makeTestWallet("stranger"));
-      const wrongSession = await issueChallenge(b, "link-wallet", cookie);
-      const otherSession = await postWallet(proof(b, wrongSession), stranger.cookie).expect(401);
-      expect(errorOf(otherSession).error).toBe("challenge_purpose_mismatch");
-      expect(await repo(WalletEntity).count({ where: { partyId: b.partyId } })).toBe(0);
-
-      // The real link.
-      const linkChallenge = await issueChallenge(b, "link-wallet", cookie);
-      expect(linkChallenge.message.split("\n")[0]).toBe("TruthOracle link-wallet");
-      const link = await postWallet(proof(b, linkChallenge), cookie).expect(200);
-      const result = bodyOf<ApiLoginResult>(link);
-      expect(result).toMatchObject({ mode: "link", kind: "user", created: false });
-      expect(result.identity).toMatchObject({ provider: "canton_wallet", subject: b.partyId, status: "active" });
-      expect(result.user).toMatchObject({ id: user.id, partyId: a.partyId });
-      expect(result.token).toBeUndefined();
-      expect(setCookies(link)).toEqual([]); // no new session in link mode
-
-      const rows = await repo(WalletEntity).find({ where: { userId: user.id }, order: { createdAt: "ASC" } });
-      expect(rows.map((r) => [r.partyId, r.isPrimary, r.status])).toEqual([
-        [a.partyId, true, "active"],
-        [b.partyId, false, "active"],
-      ]);
-      expect((await repo(UserEntity).findOneByOrFail({ id: user.id })).partyId).toBe(a.partyId);
+      expect(await repo(AuthIdentityEntity).count()).toBe(1);
       expect(await liveSessions(user.id)).toBe(1);
-      const linked = await auditRows("identity.linked");
-      expect(linked.map((e) => e.metadata.mode)).toEqual(["login", "login", "link"]);
-      expect(ctx.nats.publishedOn("truthoracle.wallet.linked")).toHaveLength(3);
     });
 
-    it("linking a wallet that belongs to another account → 409 wallet_already_linked", async () => {
-      const a = makeTestWallet("owner-a");
-      const b = makeTestWallet("owner-b");
-      const sessA = await signIn(a);
-      const sessB = await signIn(b);
+    it("linking a wallet that belongs to another account → 409 wallet_already_linked, active or revoked; nothing moves", async () => {
+      const hot = makeTestWallet("owner-hot");
+      const cold = makeTestWallet("owner-cold");
+      const owner = await tgSignIn(tg("100031", "Owen"));
+      await link(hot, owner.cookie);
+      const coldRow = (await link(cold, owner.cookie)).wallet;
+      const intruder = await tgSignIn(tg("100032", "Ivy"));
 
-      const challenge = await issueChallenge(b, "link-wallet", sessA.cookie);
-      const res = await postWallet(proof(b, challenge), sessA.cookie).expect(409);
-      expect(errorOf(res).error).toBe("wallet_already_linked");
+      const active = await postLink(proof(hot, await issueLinkChallenge(hot, intruder.cookie)), intruder.cookie).expect(409);
+      expect(errorOf(active).error).toBe("wallet_already_linked");
 
-      // Nothing moved: b's row and identity still belong to b's account, a still has one wallet.
-      const row = await repo(WalletEntity).findOneByOrFail({ partyId: b.partyId });
-      expect(row).toMatchObject({ userId: sessB.user.id, status: "active", isPrimary: true });
-      const identity = await repo(AuthIdentityEntity).findOneByOrFail({ provider: "canton_wallet", subject: b.partyId });
-      expect(identity).toMatchObject({ userId: sessB.user.id, status: "active" });
-      expect(await repo(WalletEntity).count({ where: { userId: sessA.user.id } })).toBe(1);
+      await http().delete(`/api/v1/wallets/${coldRow.id}`).set(CSRF).set("Cookie", owner.cookie).expect(200);
+      const revoked = await postLink(proof(cold, await issueLinkChallenge(cold, intruder.cookie)), intruder.cookie).expect(409);
+      expect(errorOf(revoked).error).toBe("wallet_already_linked");
+
+      // Both rows still belong to the owner; the intruder has no wallet; no identity was created for either party.
+      expect(await repo(WalletEntity).findOneByOrFail({ partyId: hot.partyId })).toMatchObject({ userId: owner.user.id, status: "active", isPrimary: true });
+      expect(await repo(WalletEntity).findOneByOrFail({ partyId: cold.partyId })).toMatchObject({ userId: owner.user.id, status: "revoked" });
+      expect(await repo(WalletEntity).count({ where: { userId: intruder.user.id } })).toBe(0);
+      expect((await repo(AuthIdentityEntity).find()).map((i) => i.provider)).toEqual(["telegram", "telegram"]);
+    });
+
+    it("DELETE /wallets/:id: the primary → 409 primary_wallet_in_use; a secondary is revoked and relinking reactivates the same row; identities are never touched", async () => {
+      const a = makeTestWallet("hot");
+      const b = makeTestWallet("cold");
+      const { cookie, user } = await tgSignIn(tg("100041", "Rita"));
+      const primary = (await link(a, cookie)).wallet;
+      const secondary = (await link(b, cookie)).wallet;
+      expect([primary.isPrimary, secondary.isPrimary]).toEqual([true, false]);
+
+      const refused = await http().delete(`/api/v1/wallets/${primary.id}`).set(CSRF).set("Cookie", cookie).expect(409);
+      expect(errorOf(refused).error).toBe("primary_wallet_in_use");
+
+      const ok = await http().delete(`/api/v1/wallets/${secondary.id}`).set(CSRF).set("Cookie", cookie).expect(200);
+      expect(ok.body).toEqual({ ok: true });
+      const revoked = await repo(WalletEntity).findOneByOrFail({ id: secondary.id });
+      expect(revoked).toMatchObject({ status: "revoked", isPrimary: false, userId: user.id });
+      expect(revoked.revokedAt).not.toBeNull();
+      expect(await auditRows("wallet.unlinked")).toEqual([expect.objectContaining({ subjectType: "wallet", subjectId: secondary.id, metadata: { userId: user.id, partyId: b.partyId } })]);
+      expect(ctx.nats.publishedOn("truthoracle.wallet.unlinked")).toEqual([expect.objectContaining({ payload: { userId: user.id, walletId: secondary.id } })]);
+      expect(await auditRows("identity.unlinked")).toHaveLength(0);
+      expect(await liveSessions(user.id)).toBe(1); // no identity died, so the session survives
+
+      // Relink by the same user: the same row comes back, never a second one.
+      const relinked = (await link(b, cookie)).wallet;
+      expect(relinked).toMatchObject({ id: secondary.id, status: "active", isPrimary: false });
+      expect(await repo(WalletEntity).count({ where: { partyId: b.partyId } })).toBe(1);
+      expect(await auditRows("wallet.relinked")).toHaveLength(1);
+      expect((await repo(AuthIdentityEntity).find({ where: { userId: user.id } })).map((i) => [i.provider, i.status])).toEqual([["telegram", "active"]]);
+    });
+
+    it("an unlinked Telegram identity cannot sign in (403 identity_unlinked) until the original owner re-attaches it with a fresh widget payload", async () => {
+      const main = tg("100051", "Main");
+      const spare = tg("100052", "Spare");
+      const { cookie, user } = await tgSignIn(main);
+      const linked = await tgSignIn(spare, cookie); // link mode
+      expect(linked.result).toMatchObject({ mode: "link", created: false });
+      expect(linked.result.user.id).toBe(user.id);
+      expect(linked.result.identity).toMatchObject({ provider: "telegram", subject: "100052", status: "active" });
+      const spareId = linked.result.identity.id;
+
+      const unlinked = await deleteIdentity(spareId, cookie).expect(200);
+      expect(unlinked.body).toEqual({ ok: true });
+      const row = await repo(AuthIdentityEntity).findOneByOrFail({ id: spareId });
+      expect(row.status).toBe("unlinked");
+      expect(row.unlinkedAt).not.toBeNull();
+
+      // §6.4: sign-in with the unlinked identity fails closed — no session, audited, no second account.
+      const refused = await http().post(WIDGET_URL).set(CSRF).send(freshWidgetPayload(spare)).expect(403);
+      expect(errorOf(refused).error).toBe("identity_unlinked");
+      expect(sessionCookieOf(refused)).toBeUndefined();
+      expect(await liveSessions(user.id)).toBe(1);
+      expect(await auditRows("identity.unlinked_signin_refused")).toHaveLength(1);
+      expect(await repo(UserEntity).count()).toBe(1);
+
+      // Another account can neither take it over in link mode (§6.2) nor re-attach it (the row is not theirs).
+      const other = await tgSignIn(tg("100053", "Other"));
+      const takeover = await http().post(WIDGET_URL).set(CSRF).set("Cookie", other.cookie).send(freshWidgetPayload(spare)).expect(409);
+      expect(errorOf(takeover).error).toBe("identity_already_linked");
+      expect(errorOf(await reattachTelegram(spareId, spare, other.cookie).expect(404)).error).toBe("not_found");
+      // A proof for a different Telegram user does not re-attach it either.
+      await reattachTelegram(spareId, tg("100054", "Wrong"), cookie).expect(403);
+      expect((await repo(AuthIdentityEntity).findOneByOrFail({ id: spareId })).status).toBe("unlinked");
+
+      // Re-attachment by the original owner with a fresh widget payload …
+      const reattached = await reattachTelegram(spareId, spare, cookie).expect(200);
+      expect(bodyOf<{ identity: ApiIdentity }>(reattached).identity).toMatchObject({ id: spareId, provider: "telegram", subject: "100052", status: "active" });
+      expect(ctx.nats.publishedOn("truthoracle.identity.reattached")).toHaveLength(1);
+
+      // … and signing in with it lands on the same account again.
+      const again = await tgSignIn(spare);
+      expect(again.result).toMatchObject({ mode: "login", created: false, kind: "user" });
+      expect(again.result.user.id).toBe(user.id);
+      expect(again.result.identity.id).toBe(spareId);
+    });
+
+    it("refuses to unlink the last identity (409 last_identity): a linked wallet is not an identity, a second sign-in method is", async () => {
+      const { cookie, result } = await googleSignIn("g-solo", "solo@example.com");
+      expect(errorOf(await deleteIdentity(result.identity.id, cookie).expect(409)).error).toBe("last_identity");
+      expect((await repo(AuthIdentityEntity).findOneByOrFail({ id: result.identity.id })).status).toBe("active");
+      await getMe(cookie).expect(200);
+
+      // Linking a wallet changes nothing about identities: Google is still the last one.
+      const w = makeTestWallet("solo-wallet");
+      await link(w, cookie);
+      expect(errorOf(await deleteIdentity(result.identity.id, cookie).expect(409)).error).toBe("last_identity");
+
+      // A second sign-in method (Telegram, link mode) frees it; the session Google authenticated dies with it (§6.4).
+      const spare = tg("100061", "Solo");
+      const linked = await tgSignIn(spare, cookie);
+      expect((await deleteIdentity(result.identity.id, cookie).expect(200)).body).toEqual({ ok: true });
+      await getMe(cookie).expect(401);
+      const via = await tgSignIn(spare);
+      expect(via.result.user.id).toBe(result.user.id);
+      expect(via.user.partyId).toBe(w.partyId); // the wallet stayed with the account
+      // The remaining identity is again the last one.
+      expect(errorOf(await deleteIdentity(linked.result.identity.id, via.cookie).expect(409)).error).toBe("last_identity");
     });
   });
 
   // ────────────────────────────────────────── GET /me ──────────────────────────────────────────
   describe("GET /me (API.md 'Me')", () => {
-    it("shows the canton_wallet identity, the wallet as primary and capabilities.primaryPartyId", async () => {
-      const w = makeTestWallet("me");
-      const { cookie, result } = await signIn(w);
+    it("a fresh Telegram account: one identity, no wallets, primaryPartyId null and canDeposit false", async () => {
+      const { cookie, result } = await tgSignIn(tg("100101", "Me"));
       const me = bodyOf<ApiMe>(await getMe(cookie).expect(200));
-      expect(me.user).toMatchObject({ id: result.user.id, partyId: w.partyId, status: "active" });
-      expect(me.identities).toEqual([expect.objectContaining({ id: result.identity.id, provider: "canton_wallet", subject: w.partyId, status: "active", kycLocked: false })]);
-      expect(me.wallets).toEqual([
-        expect.objectContaining({ chain: "canton", kind: "cantor8", partyId: w.partyId, isPrimary: true, status: "active", creditedCC: "0.0000000000", ownLedgerWallet: null }),
-      ]);
-      expect(me.capabilities).toMatchObject({ primaryPartyId: w.partyId, isAdmin: false });
+      expect(me.user).toMatchObject({ id: result.user.id, partyId: null, status: "active" });
+      expect(me.identities).toEqual([expect.objectContaining({ id: result.identity.id, provider: "telegram", subject: "100101", status: "active", kycLocked: false })]);
+      expect(me.wallets).toEqual([]);
+      expect(me.capabilities).toMatchObject({ primaryPartyId: null, canDeposit: false, canWithdraw: false, isAdmin: false });
       expect(me.kyc).toMatchObject({ status: "none" });
     });
 
-    it("lists a linked second wallet as non-primary alongside its identity", async () => {
+    it("lists linked wallets (first primary, second not) without adding identities", async () => {
       const a = makeTestWallet("hot");
       const b = makeTestWallet("cold");
-      const { cookie, user } = await signIn(a);
-      const linked = await linkWallet(b, cookie);
+      const { cookie, user } = await tgSignIn(tg("100102", "Two"));
+      await link(a, cookie);
+      await link(b, cookie);
 
       const me = bodyOf<ApiMe>(await getMe(cookie).expect(200));
-      expect(me.user.partyId).toBe(a.partyId);
+      expect(me.user).toMatchObject({ id: user.id, partyId: a.partyId });
       expect(me.wallets.map((x) => [x.partyId, x.isPrimary, x.status])).toEqual([
         [a.partyId, true, "active"],
         [b.partyId, false, "active"],
       ]);
-      expect(me.identities.map((i) => [i.provider, i.subject, i.status])).toEqual([
-        ["canton_wallet", a.partyId, "active"],
-        ["canton_wallet", b.partyId, "active"],
-      ]);
-      expect(me.identities.map((i) => i.id)).toContain(linked.identity.id);
-      expect(me.user.id).toBe(user.id);
-    });
-  });
-
-  // ─────────────────────────────────── unlink / reattach through /me ───────────────────────────
-  describe("unlink and reattach through /me/identities (§6.3–6.4)", () => {
-    it("refuses to unlink the last identity (409 last_identity)", async () => {
-      // A wallet-less account: its single Google identity is the last one and nothing else refuses first.
-      const { cookie, result } = await googleSignIn("g-solo", "solo@example.com");
-      const res = await http().delete(`/api/v1/me/identities/${result.identity.id}`).set(CSRF).set("Cookie", cookie).expect(409);
-      expect(errorOf(res).error).toBe("last_identity");
-      expect((await repo(AuthIdentityEntity).findOneByOrFail({ id: result.identity.id })).status).toBe("active");
-      // The account keeps working.
-      await getMe(cookie).expect(200);
-
-      // Once a second identity exists the first can go; the remaining one is again the last.
-      const wallet = makeTestWallet("solo-wallet");
-      const linked = await linkWallet(wallet, cookie);
-      const unlinked = await http().delete(`/api/v1/me/identities/${result.identity.id}`).set(CSRF).set("Cookie", cookie).expect(200);
-      expect(unlinked.body).toEqual({ ok: true });
-      // The Google identity authenticated this session, so the session died with it (§6.4 "unlink is revocation").
-      await getMe(cookie).expect(401);
-      const viaWallet = await signIn(wallet);
-      expect(viaWallet.result.user.id).toBe(result.user.id);
-      const again = await http().delete(`/api/v1/me/identities/${linked.identity.id}`).set(CSRF).set("Cookie", viaWallet.cookie).expect(409);
-      // This row is both the last identity (§6.3) and the primary wallet's (§8.2); the spec does not
-      // order the two refusals, IdentityService documents primary_wallet_in_use first.
-      expect(["last_identity", "primary_wallet_in_use"]).toContain(errorOf(again).error);
-      expect((await repo(AuthIdentityEntity).findOneByOrFail({ id: linked.identity.id })).status).toBe("active");
-    });
-
-    it("an unlinked wallet identity cannot sign in (403 identity_unlinked) until the original owner re-attaches it with a fresh link proof", async () => {
-      const a = makeTestWallet("main");
-      const b = makeTestWallet("spare");
-      const { cookie, user } = await signIn(a);
-      const linked = await linkWallet(b, cookie);
-
-      const unlinked = await http().delete(`/api/v1/me/identities/${linked.identity.id}`).set(CSRF).set("Cookie", cookie).expect(200);
-      expect(unlinked.body).toEqual({ ok: true });
-      const row = await repo(AuthIdentityEntity).findOneByOrFail({ id: linked.identity.id });
-      expect(row.status).toBe("unlinked");
-      expect(row.unlinkedAt).not.toBeNull();
-      expect((await repo(WalletEntity).findOneByOrFail({ partyId: b.partyId })).status).toBe("revoked");
-
-      // §6.4: sign-in with the unlinked identity fails closed — no session, audited.
-      const challenge = await issueChallenge(b);
-      const refused = await postWallet(proof(b, challenge)).expect(403);
-      expect(errorOf(refused).error).toBe("identity_unlinked");
-      expect(sessionCookieOf(refused)).toBeUndefined();
-      expect(await liveSessions(user.id)).toBe(1);
-      expect(await auditRows("identity.unlinked_signin_refused")).toHaveLength(1);
-      // The row persists: no second account was created for the party.
-      expect(await repo(UserEntity).count()).toBe(1);
-
-      // Re-attachment by the original owner with a fresh link-wallet proof issued to this session.
-      const reproof = await issueChallenge(b, "link-wallet", cookie);
-      const reattached = await http().post(`/api/v1/me/identities/${linked.identity.id}/reattach`).set(CSRF).set("Cookie", cookie).send(proof(b, reproof)).expect(200);
-      expect(bodyOf<{ identity: ApiIdentity }>(reattached).identity).toMatchObject({ id: linked.identity.id, provider: "canton_wallet", subject: b.partyId, status: "active" });
-      expect((await repo(WalletEntity).findOneByOrFail({ partyId: b.partyId })).status).toBe("active");
-      expect(ctx.nats.publishedOn("truthoracle.identity.reattached")).toHaveLength(1);
-
-      // … and signing in with that wallet works again, landing on the same account.
-      const again = await signIn(b);
-      expect(again.result).toMatchObject({ mode: "login", created: false, kind: "user" });
-      expect(again.result.user.id).toBe(user.id);
-      expect(again.result.identity.id).toBe(linked.identity.id);
-    });
-
-    it("only the original owner can re-attach: another account gets 404, a stale proof is refused", async () => {
-      const a = makeTestWallet("orig");
-      const b = makeTestWallet("orig-spare");
-      const { cookie } = await signIn(a);
-      const linked = await linkWallet(b, cookie);
-      await http().delete(`/api/v1/me/identities/${linked.identity.id}`).set(CSRF).set("Cookie", cookie).expect(200);
-
-      const other = await signIn(makeTestWallet("someone"));
-      const foreignProof = await issueChallenge(b, "link-wallet", other.cookie);
-      const foreign = await http().post(`/api/v1/me/identities/${linked.identity.id}/reattach`).set(CSRF).set("Cookie", other.cookie).send(proof(b, foreignProof)).expect(404);
-      expect(errorOf(foreign).error).toBe("not_found");
-
-      // A proof for the wrong wallet does not re-attach b.
-      const wrongWallet = makeTestWallet("wrong");
-      const wrongProof = await issueChallenge(wrongWallet, "link-wallet", cookie);
-      await http().post(`/api/v1/me/identities/${linked.identity.id}/reattach`).set(CSRF).set("Cookie", cookie).send(proof(wrongWallet, wrongProof)).expect(403);
-      expect((await repo(AuthIdentityEntity).findOneByOrFail({ id: linked.identity.id })).status).toBe("unlinked");
+      expect(me.wallets[0]).toMatchObject({ chain: "canton", kind: "cantor8", creditedCC: "0.0000000000", ownLedgerWallet: null });
+      expect(me.identities.map((i) => [i.provider, i.subject, i.status])).toEqual([["telegram", "100102", "active"]]);
+      expect(me.capabilities).toMatchObject({ primaryPartyId: a.partyId, canDeposit: true });
     });
   });
 
   // ─────────────────────────────────────── admin sign-in ───────────────────────────────────────
   describe("admin sign-in (§6.8, §7.4)", () => {
-    it("purpose admin-sign-in by an operator → kind:'admin' with the short TTL; the same party with sign-in → kind:'user'", async () => {
-      const admin = await signIn(operator, "admin-sign-in");
-      expect(admin.result).toMatchObject({ mode: "login", kind: "admin", created: true });
-      expect(admin.result.identity).toMatchObject({ provider: "canton_wallet", subject: operator.partyId });
-      const ttl = Date.parse(admin.result.expiresAt) - Date.now();
+    it("an operator through /auth/admin/challenge + /auth/admin → kind admin, short TTL, one canton_wallet identity carrying its key, NO wallet row; the admin session cannot start KYC or re-attach that identity", async () => {
+      const challenge = await issueAdminChallenge(operator);
+      expect(challenge.message.split("\n")[0]).toBe("TruthOracle admin-sign-in");
+      const login = await postAdmin(proof(operator, challenge)).expect(200);
+      const result = bodyOf<ApiLoginResult>(login);
+      expect(result).toMatchObject({ mode: "login", kind: "admin", created: true });
+      expect(result.identity).toMatchObject({ provider: "canton_wallet", subject: operator.partyId, status: "active", profile: { name: "operator", publicKey: operator.publicKeyBase64 } });
+      expect(result.user.partyId).toBeNull();
+      expect(result.token).toBeUndefined();
+      const ttl = Date.parse(result.expiresAt) - Date.now();
       expect(ttl).toBeLessThanOrEqual(ctx.config.adminSessionTtlMs + 5_000);
       expect(ttl).toBeGreaterThan(ctx.config.adminSessionTtlMs - 60_000);
-      expect(bodyOf<ApiSessionState>(await http().get("/api/v1/auth/session").set("Cookie", admin.cookie).expect(200))).toMatchObject({ authenticated: true, kind: "admin" });
-      await http().get("/api/v1/admin/users").set("Cookie", admin.cookie).expect(200);
-      expect(await auditRows("auth.admin_login")).toHaveLength(1);
-      expect(ctx.nats.publishedOn("truthoracle.auth.admin_login")).toHaveLength(1);
-      expect((await repo(SessionEntity).findOneByOrFail({ userId: admin.user.id })).kind).toBe("admin");
+      const cookie = cookieFromResponse(login);
+      expect(bodyOf<ApiSessionState>(await http().get("/api/v1/auth/session").set("Cookie", cookie).expect(200))).toMatchObject({ authenticated: true, kind: "admin" });
+      await http().get("/api/v1/admin/users").set("Cookie", cookie).expect(200);
 
-      const plain = await signIn(operator, "sign-in");
-      expect(plain.result).toMatchObject({ mode: "login", kind: "user", created: false });
-      expect(plain.result.user.id).toBe(admin.result.user.id);
-      const denied = await http().get("/api/v1/admin/users").set("Cookie", plain.cookie).expect(403);
-      expect(errorOf(denied).error).toBe("forbidden");
-      expect(await auditRows("auth.login")).toHaveLength(1);
+      // §7.4: the operator's wallet is a credential for the admin API, not a linked wallet.
+      expect(await repo(WalletEntity).count()).toBe(0);
+      expect((await repo(AuthIdentityEntity).find()).map((i) => [i.provider, i.subject])).toEqual([["canton_wallet", operator.partyId]]);
+      expect((await repo(SessionEntity).findOneByOrFail({ userId: result.user.id })).kind).toBe("admin");
+      expect(await auditRows("auth.admin_login")).toHaveLength(1);
+      expect(await auditRows("auth.login")).toHaveLength(0);
+      expect(ctx.nats.publishedOn("truthoracle.auth.admin_login")).toHaveLength(1);
+      expect(bodyOf<ApiMe>(await getMe(cookie).expect(200)).capabilities.isAdmin).toBe(true);
+
+      // §9.5: identity verification is started from a user session only.
+      const kyc = await http().post("/api/v1/kyc/sessions").set(CSRF).set("Cookie", cookie).send({}).expect(403);
+      expect(errorOf(kyc).error).toBe("forbidden");
+      // A wallet identity is never re-attached through /me — and the admin session cannot reach identity routes anyway (§6.8).
+      const reattach = await http().post(`/api/v1/me/identities/${result.identity.id}/reattach`).set(CSRF).set("Cookie", cookie).send({}).expect(403);
+      expect(errorOf(reattach).error).toBe("forbidden");
+      // Admin sign-in is web only: `client` is not part of the body.
+      const native = await postAdmin({ ...proof(operator, await issueAdminChallenge(operator)), client: "native" }).expect(400);
+      expect(errorOf(native).error).toBe("validation_failed");
     });
 
-    it("a non-operator party is refused admin-sign-in at verify time (403 forbidden), never at issue time; admin-sign-in never runs in link mode", async () => {
+    it("a non-operator is refused at verify time (403 forbidden), never at issue time; with a session cookie: 409 at issue, 403 at login BEFORE the challenge is consumed", async () => {
       // Issue answers 200 for any well-formed party: the operator list is not an anonymous 403-vs-200 oracle.
       const nobody = makeTestWallet("nobody");
-      const challenge = await issueChallenge(nobody, "admin-sign-in");
-      const res = await postWallet(proof(nobody, challenge)).expect(403);
+      const res = await postAdmin(proof(nobody, await issueAdminChallenge(nobody))).expect(403);
       expect(errorOf(res).error).toBe("forbidden");
       expect(sessionCookieOf(res)).toBeUndefined();
       expect(await repo(UserEntity).count()).toBe(0);
 
-      const { cookie } = await signIn(operator, "sign-in");
-      const linkMode = await http().post(CHALLENGE_URL).set(CSRF).set("Cookie", cookie).send({ partyId: operator.partyId, purpose: "admin-sign-in" }).expect(409);
+      const { cookie } = await tgSignIn(tg("100071", "Opal"));
+      const linkMode = await http().post(ADMIN_CHALLENGE_URL).set(CSRF).set("Cookie", cookie).send({ partyId: operator.partyId }).expect(409);
       expect(errorOf(linkMode).error).toBe("challenge_purpose_mismatch");
+      // A challenge issued anonymously and presented with a session is refused before it is consumed …
+      const anon = await issueAdminChallenge(operator);
+      const withSession = await postAdmin(proof(operator, anon), cookie).expect(403);
+      expect(errorOf(withSession)).toMatchObject({ error: "forbidden", message: expect.stringMatching(/link mode/) as string });
       expect(await repo(SessionEntity).count({ where: { kind: "admin" } })).toBe(0);
+      // … so the operator can still use it without the cookie.
+      expect(bodyOf<ApiLoginResult>(await postAdmin(proof(operator, anon)).expect(200)).kind).toBe("admin");
     });
   });
 
   // ─────────────────────────────────────── native clients ──────────────────────────────────────
   describe("native clients (bearer sessions)", () => {
-    it("client:'native' returns the token in the body and sets no cookie; the bearer authenticates and skips CSRF on logout", async () => {
-      const w = makeTestWallet("phone");
-      const challenge = await issueChallenge(w);
-      const login = await postWallet({ ...proof(w, challenge), client: "native" }).expect(200);
+    it("client:'native' returns the token in the body and sets no cookie; the bearer authenticates GET /me and skips CSRF on logout", async () => {
+      const phone = tg("100081", "Phone");
+      const login = await http().post(WIDGET_URL).set(CSRF).send({ ...freshWidgetPayload(phone), client: "native" }).expect(200);
       const result = bodyOf<ApiLoginResult>(login);
       expect(result).toMatchObject({ mode: "login", kind: "user", created: true });
       expect(typeof result.token).toBe("string");
@@ -535,6 +546,10 @@ describe("auth (e2e)", () => {
 
       const state = bodyOf<ApiSessionState>(await http().get("/api/v1/auth/session").set("Authorization", bearer).expect(200));
       expect(state).toMatchObject({ authenticated: true, user: { id: result.user.id } });
+      const me = bodyOf<ApiMe>(await http().get("/api/v1/me").set("Authorization", bearer).expect(200));
+      expect(me.user.id).toBe(result.user.id);
+      expect(me.identities.map((i) => i.id)).toEqual([result.identity.id]);
+      expect(me.wallets).toEqual([]);
       const garbage = await http().get("/api/v1/me").set("Authorization", "Bearer definitely-not-a-session-token-xxxxxxxxxxxx").expect(401);
       expect(errorOf(garbage).error).toBe("unauthenticated");
 
@@ -547,25 +562,12 @@ describe("auth (e2e)", () => {
       const [audit] = await auditRows("auth.login");
       expect(audit.metadata).toMatchObject({ client: "native" });
     });
-
-    it("Authorization: Bearer reaches GET /me", async () => {
-      // Not through signInWithWallet: the helper insists on a Set-Cookie, which native logins never send.
-      const w = makeTestWallet("tablet");
-      const challenge = await issueChallenge(w);
-      const result = bodyOf<ApiLoginResult>(await postWallet({ ...proof(w, challenge), client: "native" }).expect(200));
-      expect(result.token).toBeDefined();
-      const me = bodyOf<ApiMe>(await http().get("/api/v1/me").set("Authorization", `Bearer ${result.token}`).expect(200));
-      expect(me.user.id).toBe(result.user.id);
-      expect(me.wallets.map((x) => x.partyId)).toEqual([w.partyId]);
-      expect(me.identities.map((i) => i.id)).toEqual([result.identity.id]);
-    });
   });
 
   // ───────────────────────────────────────────── logout ────────────────────────────────────────
   describe("logout", () => {
     it("POST /auth/logout revokes the session and clears the cookie; the old cookie is dead", async () => {
-      const w = makeTestWallet("bye");
-      const { cookie, user } = await signIn(w);
+      const { cookie, user } = await tgSignIn(tg("100091", "Bye"));
       await http().get("/api/v1/auth/session").set("Cookie", cookie).expect(200);
 
       const out = await http().post("/api/v1/auth/logout").set(CSRF).set("Cookie", cookie).send({}).expect(200);
@@ -592,13 +594,15 @@ describe("auth (e2e)", () => {
   // ─────────────────────────────────────────── sessions ────────────────────────────────────────
   describe("sessions through /me/sessions", () => {
     it("lists the current session, a second sign-in adds one, revoke-others leaves exactly one", async () => {
-      const w = makeTestWallet("multi");
-      const first = await signIn(w);
+      const multi = tg("100111", "Multi");
+      const first = await tgSignIn(multi);
       const list1 = bodyOf<{ sessions: ApiSession[] }>(await http().get("/api/v1/me/sessions").set("Cookie", first.cookie).expect(200)).sessions;
       expect(list1).toHaveLength(1);
-      expect(list1[0]).toMatchObject({ current: true, kind: "user", authMethod: "canton_wallet", identityId: first.result.identity.id });
+      expect(list1[0]).toMatchObject({ current: true, kind: "user", authMethod: "telegram", identityId: first.result.identity.id });
 
-      const second = await signIn(w);
+      const second = await tgSignIn(multi);
+      expect(second.result).toMatchObject({ mode: "login", created: false });
+      expect(second.result.user.id).toBe(first.result.user.id);
       const list2 = bodyOf<{ sessions: ApiSession[] }>(await http().get("/api/v1/me/sessions").set("Cookie", second.cookie).expect(200)).sessions;
       expect(list2).toHaveLength(2);
       expect(list2.filter((s) => s.current)).toHaveLength(1);
@@ -670,7 +674,7 @@ describe("auth (e2e)", () => {
       const now = Math.floor(Date.now() / 1000);
       const fields = { id: "777000111", first_name: "Tele", last_name: "Gram", username: "telegram_user", photo_url: "https://t.me/i/userpic/320/tele.jpg", auth_date: String(now) };
       const payload = signTelegramWidget(fields, botToken);
-      const post = (body: Record<string, unknown>) => http().post("/api/v1/auth/telegram/widget").set(CSRF).send(body);
+      const post = (body: Record<string, unknown>) => http().post(WIDGET_URL).set(CSRF).send(body);
 
       // Telegram posts id / auth_date as numbers; the hash is over their string forms.
       const login = await post({ ...payload, id: Number(payload.id), auth_date: Number(payload.auth_date) }).expect(200);
@@ -707,27 +711,27 @@ describe("auth (e2e)", () => {
 
   // ───────────────────────────────────────────── CSRF ──────────────────────────────────────────
   describe("CSRF (§6.7)", () => {
-    it("POST /auth/wallet/challenge without Origin → 403 csrf_rejected; text/plain without x-requested-with → 403", async () => {
+    it("POST /auth/admin/challenge without Origin → 403 csrf_rejected; text/plain without x-requested-with → 403", async () => {
       const w = makeTestWallet("csrf");
-      const body = { partyId: w.partyId, purpose: "sign-in" };
+      const body = { partyId: w.partyId };
 
-      const noOrigin = await http().post(CHALLENGE_URL).set("Content-Type", "application/json").send(body).expect(403);
+      const noOrigin = await http().post(ADMIN_CHALLENGE_URL).set("Content-Type", "application/json").send(body).expect(403);
       expect(errorOf(noOrigin)).toMatchObject({ error: "csrf_rejected" });
 
-      const textPlain = await http().post(CHALLENGE_URL).set("Origin", TEST_ORIGIN).set("Content-Type", "text/plain").send(JSON.stringify(body)).expect(403);
+      const textPlain = await http().post(ADMIN_CHALLENGE_URL).set("Origin", TEST_ORIGIN).set("Content-Type", "text/plain").send(JSON.stringify(body)).expect(403);
       expect(errorOf(textPlain)).toMatchObject({ error: "csrf_rejected" });
       expect(errorOf(textPlain).message).toMatch(/application\/json/);
 
       // x-requested-with satisfies the second condition (the text/plain body then fails validation, not CSRF).
-      const rescued = await http().post(CHALLENGE_URL).set("Origin", TEST_ORIGIN).set("Content-Type", "text/plain").set("x-requested-with", "truthoracle").send(JSON.stringify(body));
+      const rescued = await http().post(ADMIN_CHALLENGE_URL).set("Origin", TEST_ORIGIN).set("Content-Type", "text/plain").set("x-requested-with", "truthoracle").send(JSON.stringify(body));
       expect(rescued.status).not.toBe(403);
       expect(rescued.status).toBe(400);
 
       // A disallowed origin is refused even with JSON.
-      const evil = await http().post(CHALLENGE_URL).set("Origin", "https://evil.test").set("Content-Type", "application/json").send(body).expect(403);
+      const evil = await http().post(ADMIN_CHALLENGE_URL).set("Origin", "https://evil.test").set("Content-Type", "application/json").send(body).expect(403);
       expect(errorOf(evil).error).toBe("csrf_rejected");
 
-      await http().post(CHALLENGE_URL).set(CSRF).send(body).expect(200);
+      await http().post(ADMIN_CHALLENGE_URL).set(CSRF).send(body).expect(200);
     });
   });
 
@@ -736,7 +740,7 @@ describe("auth (e2e)", () => {
     it("more than 10 login attempts per minute from one IP → 429 rate_limited with Retry-After", async () => {
       const attempt = (hint: string) => {
         const w = makeTestWallet(hint);
-        return postWallet({ challengeId: randomUUID(), partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign("nothing to see here"), kind: "cantor8" });
+        return postAdmin({ challengeId: randomUUID(), partyId: w.partyId, publicKey: w.publicKeyBase64, signature: w.sign("nothing to see here"), kind: "cantor8" });
       };
       for (let i = 0; i < 10; i += 1) {
         const res = await attempt(`rl-${i}`);
@@ -751,24 +755,22 @@ describe("auth (e2e)", () => {
       expect(limited.headers["cache-control"]).toBe("no-store");
     });
 
-    it("more than 5 VERIFIED sign-ins per minute for one wallet → 429, even from different IPs and under every IP limit", async () => {
-      const w = makeTestWallet("hammered");
-      const attempt = async (ip: string) => {
-        const challenge = bodyOf<ApiChallenge>(await http().post(CHALLENGE_URL).set(fromIp(ip)).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200));
-        return http().post(WALLET_URL).set(fromIp(ip)).send(proof(w, challenge));
-      };
+    it("more than 5 VERIFIED sign-ins per minute for one Telegram user → 429, even from different IPs and under every IP limit", async () => {
+      const hammered = tg("100121", "Hammer");
+      const attempt = (ip: string) => http().post(WIDGET_URL).set(fromIp(ip)).send(freshWidgetPayload(hammered));
       for (let i = 0; i < 5; i += 1) expect((await attempt(`10.9.0.${i + 1}`)).status).toBe(200);
       const limited = await attempt("10.9.0.99");
       expect(limited.status).toBe(429);
       expect(errorOf(limited)).toMatchObject({ error: "rate_limited", details: { scope: "login" } });
       expect(Number(limited.headers["retry-after"])).toBeGreaterThanOrEqual(1);
+      expect(await repo(UserEntity).count()).toBe(1);
     });
 
-    it("junk sign-in attempts naming a party never spend that party's quota: 10 from IP A, then the real owner signs in from IP B", async () => {
-      // The party id is public (it is on the ledger); before this fix five junk posts kept its owner — an
-      // ADMIN_OPERATORS party included — at 429 for as long as the attacker cared to continue.
+    it("junk attempts naming an operator's party never spend that party's quota: 10 from IP A, then the real operator signs in from IP B", async () => {
+      // The party id is public (it is on the ledger); a limit keyed on the unverified body would keep
+      // the operator at 429 for as long as an attacker cared to continue.
       const victim = operator;
-      const junk = () => http().post(WALLET_URL).set(fromIp("203.0.113.66")).send({ challengeId: randomUUID(), partyId: victim.partyId, publicKey: victim.publicKeyBase64, signature: victim.sign("junk"), kind: "cantor8" });
+      const junk = () => http().post(ADMIN_URL).set(fromIp("203.0.113.66")).send({ challengeId: randomUUID(), partyId: victim.partyId, publicKey: victim.publicKeyBase64, signature: victim.sign("junk"), kind: "cantor8" });
       for (let i = 0; i < 10; i += 1) {
         const res = await junk();
         expect(res.status).toBe(401);
@@ -777,17 +779,17 @@ describe("auth (e2e)", () => {
       // The attacker's own IP is now exhausted …
       expect((await junk()).status).toBe(429);
       // … the victim's party is not: challenge and admin sign-in from another IP succeed.
-      const challenge = bodyOf<ApiChallenge>(await http().post(CHALLENGE_URL).set(fromIp("198.51.100.7")).send({ partyId: victim.partyId, purpose: "admin-sign-in" }).expect(200));
-      const login = await http().post(WALLET_URL).set(fromIp("198.51.100.7")).send(proof(victim, challenge)).expect(200);
+      const challenge = bodyOf<ApiChallenge>(await http().post(ADMIN_CHALLENGE_URL).set(fromIp("198.51.100.7")).send({ partyId: victim.partyId }).expect(200));
+      const login = await http().post(ADMIN_URL).set(fromIp("198.51.100.7")).send(proof(victim, challenge)).expect(200);
       expect(bodyOf<ApiLoginResult>(login).kind).toBe("admin");
     });
 
     it("the per-party challenge limit is keyed by (IP, party): 10 challenges for a party from IP A leave IP B's quota for that party untouched", async () => {
       const w = makeTestWallet("challenged");
-      for (let i = 0; i < 10; i += 1) await http().post(CHALLENGE_URL).set(fromIp("203.0.113.1")).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200);
-      const limited = await http().post(CHALLENGE_URL).set(fromIp("203.0.113.1")).send({ partyId: w.partyId, purpose: "sign-in" }).expect(429);
+      for (let i = 0; i < 10; i += 1) await http().post(ADMIN_CHALLENGE_URL).set(fromIp("203.0.113.1")).send({ partyId: w.partyId }).expect(200);
+      const limited = await http().post(ADMIN_CHALLENGE_URL).set(fromIp("203.0.113.1")).send({ partyId: w.partyId }).expect(429);
       expect(errorOf(limited).details).toMatchObject({ scope: "challenge" });
-      await http().post(CHALLENGE_URL).set(fromIp("203.0.113.2")).send({ partyId: w.partyId, purpose: "sign-in" }).expect(200);
+      await http().post(ADMIN_CHALLENGE_URL).set(fromIp("203.0.113.2")).send({ partyId: w.partyId }).expect(200);
     });
   });
 
@@ -809,7 +811,7 @@ describe("auth (e2e)", () => {
       expect(errorOf(replay).error).toBe("invalid_credential");
       // The same Telegram user through the widget lands on the same account (§7.2 "one identity").
       const widget = signTelegramWidget({ id: "424242", first_name: "Mini", auth_date: String(now) }, botToken);
-      expect(bodyOf<ApiLoginResult>(await http().post("/api/v1/auth/telegram/widget").set(CSRF).send(widget).expect(200)).user.id).toBe(result.user.id);
+      expect(bodyOf<ApiLoginResult>(await http().post(WIDGET_URL).set(CSRF).send(widget).expect(200)).user.id).toBe(result.user.id);
     });
 
     it("GET /auth/telegram/oidc/start → 302 to the authorization endpoint with PKCE + nonce + state, and the to_oidc cookie", async () => {

@@ -2,34 +2,38 @@ import { Body, Controller, Get, HttpCode, Post, Query, Req, Res } from "@nestjs/
 import { ApiTags } from "@nestjs/swagger";
 import type { Response } from "express";
 
-import { Public } from "../auth/decorators";
+import { AllowAdminSession, Public } from "../auth/decorators";
 import { type AuthedRequest, optionalPrincipalOf } from "../auth/request";
 import { Config } from "../config";
-import { GoogleLoginDto, TelegramMiniAppDto, TelegramWidgetDto, WalletChallengeDto, WalletLoginDto } from "../dto/auth.dto";
+import { AdminChallengeDto, AdminLoginDto, GoogleLoginDto, TelegramMiniAppDto, TelegramWidgetDto } from "../dto/auth.dto";
 import { AuditService } from "../services/audit.service";
 import { GoogleAuthService } from "../services/google-auth.service";
-import { IdentityService } from "../services/identity.service";
 import { LoginService } from "../services/login.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { SessionService } from "../services/session.service";
 import { OidcCallbackError, type OidcMode, type OidcRedirectTarget, TelegramAuthService, withAuthResult } from "../services/telegram-auth.service";
 import { UserService } from "../services/user.service";
 import { WalletChallengeService } from "../services/wallet-challenge.service";
-import { WalletLinkService } from "../services/wallet-link.service";
-import type { ApiChallenge, ApiLoginResult, ApiSessionState, IdentityClaim, SessionKind } from "../types";
+import type { ApiChallenge, ApiLoginResult, ApiSessionState, IdentityClaim } from "../types";
 import { partyHint } from "../util/canton-crypto";
 import { OIDC_COOKIE, clearedOidcCookie, readCookie } from "../util/cookies";
 import { ApiError } from "../util/errors";
 
 /**
- * Sign-in routes (docs/API.md "Auth", ARCHITECTURE §6–§7). Every login route is @Public: with a
- * session cookie present it runs in link mode (the identity is attached to the current account
- * and no new session is issued). Rate limits: login 10/min/IP + 5/min/subject, nonce 30/min/IP,
- * challenge 30/min/IP + 10/min per (IP, party), telegram 10/min/IP, link 10/min/user (§13).
+ * Sign-in routes (docs/API.md "Auth", ARCHITECTURE §6–§7). User accounts are opened and resolved
+ * ONLY by Google and Telegram (§6.1); with a session cookie present those routes run in link mode
+ * (the identity is attached to the current account and no new session is issued). A Cantor8
+ * wallet never signs a user in: it is linked to a signed-in account through
+ * `POST /wallets/link-challenge` + `POST /wallets/link` (§7.3, §8.1). Operators sign into the
+ * admin API with their wallet on `POST /auth/admin/challenge` + `POST /auth/admin` (§7.4), which
+ * issue only `kind = admin` sessions and never run in link mode.
+ *
+ * Rate limits (§13): login 10/min/IP + 5/min/subject, nonce 30/min/IP, challenge 30/min/IP +
+ * 10/min per (IP, party), telegram 10/min/IP.
  *
  * Every per-SUBJECT login limit is applied only AFTER the credential verified (Google, Telegram
- * and wallet alike): a party id or account id is public, so a limit keyed on the unverified body
- * would let anyone lock the real owner out — including every ADMIN_OPERATORS party.
+ * and the operator wallet alike): a party id or account id is public, so a limit keyed on the
+ * unverified body would let anyone lock the real owner out — including every ADMIN_OPERATORS party.
  */
 @ApiTags("auth")
 @Controller("auth")
@@ -40,8 +44,6 @@ export class AuthController {
     private readonly telegram: TelegramAuthService,
     private readonly login: LoginService,
     private readonly challenges: WalletChallengeService,
-    private readonly walletLink: WalletLinkService,
-    private readonly identities: IdentityService,
     private readonly users: UserService,
     private readonly sessions: SessionService,
     private readonly audit: AuditService,
@@ -182,84 +184,66 @@ export class AuthController {
     }
   }
 
-  // ── Canton wallet ──────────────────────────────────────────────────────────
+  // ── Admin (operator wallet) ────────────────────────────────────────────────
 
+  /**
+   * §7.4: issues an `admin-sign-in` challenge. Deliberately NO operator check here: the challenge
+   * is issued to any well-formed party and ADMIN_OPERATORS is consulted at verify time only, so an
+   * anonymous caller cannot enumerate the operator list by watching 403 vs 200 on this route. With
+   * a session present the service answers 409 challenge_purpose_mismatch — admin sign-in never
+   * runs in link mode.
+   */
   @Public()
-  @Post("wallet/challenge")
+  @Post("admin/challenge")
   @HttpCode(200)
-  async walletChallenge(@Body() body: WalletChallengeDto, @Req() req: AuthedRequest): Promise<ApiChallenge> {
+  async adminChallenge(@Body() body: AdminChallengeDto, @Req() req: AuthedRequest): Promise<ApiChallenge> {
     // The party dimension is keyed together with the IP: a stranger cannot spend the owner's quota.
     await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: `${req.clientIp ?? "unknown"}:${body.partyId}` });
     return this.challenges.issue({
       partyId: body.partyId,
-      purpose: body.purpose,
+      purpose: "admin-sign-in",
       sessionId: optionalPrincipalOf(req)?.session.id ?? null,
       host: req.requestHost ?? "",
     });
   }
 
   /**
-   * §7.3 purpose isolation: with a session only a `link-wallet` challenge issued to that session
-   * is accepted (the link itself is WalletLinkService.link, so the wallet row + seed rule live in
-   * one place); without one, `sign-in` / `admin-sign-in`. The claim is consumed before
-   * verification, so a bad signature burns the challenge. Rejections keep the service's codes
-   * (INTERNALS: 401 challenge_rejected / challenge_purpose_mismatch / wallet_key_mismatch / signature_invalid).
+   * §6.8 / §7.4: a `kind = admin` session for a party in ADMIN_OPERATORS, web only. A present
+   * session is refused BEFORE the challenge is consumed (the operator keeps it). The claim is then
+   * consumed before verification, so a bad signature burns it; rejections keep the service's codes
+   * (INTERNALS: 401 challenge_rejected / challenge_purpose_mismatch / wallet_key_mismatch /
+   * signature_invalid; 403 forbidden for a party outside ADMIN_OPERATORS). The verified key is
+   * stored on the operator's identity so AdminGuard can re-check it against the pin per request.
    */
   @Public()
-  @Post("wallet")
+  @Post("admin")
   @HttpCode(200)
-  async wallet(@Body() body: WalletLoginDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
+  async admin(@Body() body: AdminLoginDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
     await this.rateLimit.enforce("login", { ip: req.clientIp });
-    const principal = optionalPrincipalOf(req);
-    const session = principal?.session ?? null;
-    const user = principal?.user ?? null;
+    if (optionalPrincipalOf(req)) throw new ApiError(403, "forbidden", "admin sign-in cannot run in link mode");
 
     const verified = await this.challenges.verify({
       challengeId: body.challengeId,
       partyId: body.partyId,
       publicKey: body.publicKey,
       signature: body.signature,
-      expectedPurpose: session ? "link-wallet" : ["sign-in", "admin-sign-in"],
-      sessionId: session?.id ?? null,
+      expectedPurpose: "admin-sign-in",
+      sessionId: null,
     });
     // Per-subject limit only once the signature proved control of the party (same order as Google / Telegram).
     await this.rateLimit.enforce("login", { subject: `wallet:${verified.partyId}` });
 
-    if (session && user) {
-      await this.rateLimit.enforce("link", { userId: user.id });
-      const linked = await this.walletLink.link(
-        user.id,
-        { partyId: verified.partyId, publicKeyBase64: verified.publicKeyBase64, kind: body.kind },
-        { actor: { type: session.kind === "admin" ? "admin" : "user", userId: user.id, sessionId: session.id, ip: req.clientIp ?? null } },
-      );
-      const fresh = (await this.users.findById(user.id)) ?? user;
-      const locked = await this.identities.lockedIdentityId(user.id);
-      return {
-        mode: "link",
-        user: this.users.toApi(fresh),
-        kind: session.kind,
-        expiresAt: session.expiresAt.toISOString(),
-        identity: this.identities.toApi(linked.identity, locked),
-        created: false,
-      };
-    }
-
-    const kind: SessionKind = verified.purpose === "admin-sign-in" ? "admin" : "user";
     const claim: IdentityClaim = {
       provider: "canton_wallet",
       subject: verified.partyId,
-      profile: { name: partyHint(verified.partyId) },
+      profile: { name: partyHint(verified.partyId), publicKey: verified.publicKeyBase64 },
     };
-    return this.login.completeLogin(res, claim, {
-      req,
-      kind,
-      client: body.client ?? "web",
-      wallet: { publicKeyBase64: verified.publicKeyBase64, kind: body.kind },
-    });
+    return this.login.completeLogin(res, claim, { req, kind: "admin", client: "web" });
   }
 
   // ── Logout ─────────────────────────────────────────────────────────────────
 
+  @AllowAdminSession()
   @Post("logout")
   @HttpCode(200)
   async logout(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<{ ok: true }> {

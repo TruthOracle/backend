@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import type { DataSource } from "typeorm";
 
 import type { Config } from "../config";
@@ -20,7 +21,16 @@ function build(overrides: Partial<Config> = {}): { service: AppService; m: Mocks
     query: jest.fn().mockResolvedValue([]),
     getRepository: jest.fn().mockReturnValue(repo),
   };
-  const config = { appEnv: "dev", appNetwork: "devnet", dbMigrateOnBoot: true, kycPepperHash: "hash-new", kycPepperRotationAck: "", ...overrides } as unknown as Config;
+  const config = {
+    appEnv: "dev",
+    appNetwork: "devnet",
+    dbMigrateOnBoot: true,
+    kycPepperHash: "hash-new",
+    kycPepperRotationAck: "",
+    googleClientIds: ["e2e-client.apps.googleusercontent.com"],
+    telegramBotToken: "",
+    ...overrides,
+  } as unknown as Config;
   const service = new AppService(config, dataSource as unknown as DataSource, { ping: jest.fn().mockResolvedValue(true) } as unknown as RedisService, { isConnected: () => true } as unknown as NatsService);
   return { service, m: { runner, dataSource, repo } };
 }
@@ -65,6 +75,30 @@ describe("AppService boot", () => {
     await expect(service.onModuleInit()).resolves.toBeUndefined();
     expect(m.repo.update).toHaveBeenCalledWith({ key: "kyc_pepper_hash" }, { value: "hash-new" });
     expect(m.dataSource.runMigrations).not.toHaveBeenCalled();
+  });
+
+  it("warns once, and boots, when neither Google nor Telegram is configured; stays quiet when either is (ARCHITECTURE §6.1, RUNBOOK §1)", async () => {
+    const warn = jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    try {
+      const none = build({ dbMigrateOnBoot: false, googleClientIds: [], telegramBotToken: "" });
+      none.m.dataSource.query.mockResolvedValue([{ key: "x" }]);
+      await expect(none.service.onModuleInit()).resolves.toBeUndefined();
+      const messages = warn.mock.calls.map((c) => String(c[0]));
+      expect(messages.filter((m) => m.includes("no sign-in provider is configured"))).toEqual([
+        "no sign-in provider is configured (GOOGLE_CLIENT_IDS / TELEGRAM_BOT_TOKEN): nobody can create an account, so nobody can deposit or trade",
+      ]);
+
+      warn.mockClear();
+      const telegramOnly = build({ dbMigrateOnBoot: false, googleClientIds: [], telegramBotToken: "123:token" });
+      telegramOnly.m.dataSource.query.mockResolvedValue([{ key: "x" }]);
+      await telegramOnly.service.onModuleInit();
+      const googleOnly = build({ dbMigrateOnBoot: false });
+      googleOnly.m.dataSource.query.mockResolvedValue([{ key: "x" }]);
+      await googleOnly.service.onModuleInit();
+      expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("no sign-in provider"))).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("readiness reports draining (503) from beforeApplicationShutdown on, even while every dependency is fine", async () => {

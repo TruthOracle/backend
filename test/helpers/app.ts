@@ -17,15 +17,18 @@ import { Config, getConfiguration } from "../../src/config";
 import { buildDataSourceOptions } from "../../src/data-source";
 import { EnterpriseWalletService } from "../../src/services/enterprise-wallet.service";
 import { LedgerClientService } from "../../src/services/ledger-client.service";
+import { LedgerStreamService } from "../../src/services/ledger-stream.service";
 import { NatsService } from "../../src/services/nats.service";
 import { RedisService } from "../../src/services/redis.service";
-import { FakeEnterpriseWallet, FakeLedgerClient, FakeNatsService } from "./fakes";
+import { FakeEnterpriseWallet, FakeLedgerClient, FakeLedgerStream, FakeNatsService } from "./fakes";
 
 export const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgresql://localhost:5432/truthoracle_backend_test";
 export const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://localhost:6379/1";
 /** An allowed browser origin for CSRF-passing requests (FRONTEND_ORIGINS in the test env). */
 export const TEST_ORIGIN = "http://app.test";
 export const TEST_TREASURY = "treasury::1220" + "f".repeat(64);
+/** The bot token the test env configures; test/helpers/telegram.ts signs Login Widget payloads with it. */
+export const TEST_TELEGRAM_BOT_TOKEN = "123456789:AAFakeBotTokenForE2E";
 
 export function testEnv(overrides: Record<string, string> = {}): Record<string, string> {
   return {
@@ -41,7 +44,7 @@ export function testEnv(overrides: Record<string, string> = {}): Record<string, 
     FRONTEND_ORIGINS: TEST_ORIGIN,
     COOKIE_SECURE: "false",
     GOOGLE_NONCE_REQUIRED: "false",
-    TELEGRAM_BOT_TOKEN: "123456789:AAFakeBotTokenForE2E",
+    TELEGRAM_BOT_TOKEN: TEST_TELEGRAM_BOT_TOKEN,
     TELEGRAM_BOT_USERNAME: "truthoracle_test_bot",
     TREASURY_PARTY_ID: TEST_TREASURY,
     TRUTHORACLE_PACKAGE_ID: "fakepkg",
@@ -52,6 +55,8 @@ export function testEnv(overrides: Record<string, string> = {}): Record<string, 
     LEDGER_CACHE_MS: "0",
     SWAGGER_ENABLED: "false",
     SESSION_CLEANUP_MS: "3600000",
+    // The indexer loop stays off under test; specs drive IndexerService against the FakeLedgerStream.
+    INDEXER_ENABLED: "false",
     ...overrides,
   };
 }
@@ -69,6 +74,8 @@ export interface TestApp {
   nats: FakeNatsService;
   ledger: FakeLedgerClient;
   wallet: FakeEnterpriseWallet;
+  /** The indexer's source (docs/INDEXER.md); push transactions, then run `IndexerService.runOnce()`. */
+  stream: FakeLedgerStream;
   redis: RedisService;
   dataSource: DataSource;
   /** `{ Origin, Content-Type }` that satisfy the CSRF guard. */
@@ -118,6 +125,7 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
   const nats = new FakeNatsService();
   const ledger = new FakeLedgerClient();
   const wallet = new FakeEnterpriseWallet(ledger, config.treasuryPartyId);
+  const stream = new FakeLedgerStream(config.indexerParty);
 
   let builder = Test.createTestingModule({ imports: [AppModule.register(config)] })
     .overrideProvider(NatsService)
@@ -125,7 +133,9 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
     .overrideProvider(LedgerClientService)
     .useValue(ledger)
     .overrideProvider(EnterpriseWalletService)
-    .useValue(wallet);
+    .useValue(wallet)
+    .overrideProvider(LedgerStreamService)
+    .useValue(stream);
   if (overrides.configure) builder = overrides.configure(builder);
   const moduleRef = await builder.compile();
 
@@ -152,16 +162,20 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
     nats,
     ledger,
     wallet,
+    stream,
     redis,
     dataSource,
     csrf: { Origin: TEST_ORIGIN, "Content-Type": "application/json" },
     get: <T>(token: abstract new (...args: never[]) => T): T => app.get(token),
     reset: async () => {
       await dataSource.query(`TRUNCATE TABLE ${tables} RESTART IDENTITY CASCADE`);
+      // to_settings survives the truncate (boot facts); the operator halt must not leak between specs.
+      await dataSource.query(`DELETE FROM to_settings WHERE key = 'exchange_halt'`);
       await redis.flushDb();
       nats.reset();
       ledger.reset();
       wallet.reset();
+      stream.reset();
     },
     close: async () => {
       await app.close();

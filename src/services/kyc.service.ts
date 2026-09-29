@@ -294,6 +294,10 @@ export class KycService implements KycLockLookup {
    * route); otherwise a new attempt is opened with `initiated_identity_id = session.auth_identity_id`.
    */
   async startSession(user: UserEntity, session: SessionEntity, actor?: Actor): Promise<KycSessionStart> {
+    // §9.5: the verification attaches to the session's identity and locks it (§6.5). An admin
+    // session is authenticated by an operator's canton_wallet identity, which must never become
+    // anyone's KYC-locked identity — SessionGuard already refuses the kind here; this pins the rule.
+    if (session.kind !== "user") throw new ApiError(403, "forbidden", "identity verification is started from a user session");
     if (user.kycStatus === "blocked_duplicate") throw duplicateIdentityError();
     if (!this.providerConfigured()) {
       throw new ApiError(503, "kyc_provider_unavailable", "identity verification is not available right now");

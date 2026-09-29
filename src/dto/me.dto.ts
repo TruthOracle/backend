@@ -1,14 +1,13 @@
 /**
  * Request bodies for docs/API.md "Me". `POST /me/identities/:id/reattach` takes "the same body
  * as the matching login route" — the provider is decided by the identity row, so one DTO
- * carries the union of the three proof shapes (every field optional; the controller requires
- * the ones its provider needs). `GET /me/audit` reuses PageQueryDto.
+ * carries the union of the Google and Telegram proof shapes (every field optional; the
+ * controller requires the ones its provider needs). A `canton_wallet` identity (operators only)
+ * is never re-attached here. `GET /me/audit` reuses PageQueryDto.
  */
 import { Transform } from "class-transformer";
-import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength, ValidateIf } from "class-validator";
+import { IsOptional, IsString, Matches, MaxLength, MinLength, ValidateIf } from "class-validator";
 
-import { WALLET_KIND_ALLOWLIST, type WalletKind } from "../types";
-import { PARTY_ID_RE } from "../util/canton-crypto";
 import { numberToString } from "./common.dto";
 
 export class UpdateMeDto {
@@ -82,30 +81,4 @@ export class ReattachIdentityDto {
   @MinLength(16)
   @MaxLength(8192)
   initData?: string;
-
-  // ── canton wallet (a `link-wallet` challenge issued to this session; bounds as WalletProofDto) ─
-  @IsOptional()
-  @IsUUID()
-  challengeId?: string;
-
-  @IsOptional()
-  @IsString()
-  @Matches(PARTY_ID_RE)
-  partyId?: string;
-
-  @IsOptional()
-  @IsString()
-  @MinLength(40)
-  @MaxLength(128)
-  publicKey?: string;
-
-  @IsOptional()
-  @IsString()
-  @MinLength(64)
-  @MaxLength(256)
-  signature?: string;
-
-  @IsOptional()
-  @IsIn(WALLET_KIND_ALLOWLIST)
-  kind?: WalletKind;
 }

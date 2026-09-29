@@ -35,9 +35,11 @@ export interface VerifiedChallenge {
 }
 
 /**
- * Canton wallet challenge / signature (docs/ARCHITECTURE.md §7.3). The record lives in Redis
- * (`wc:<id>`, 5 min); the message is regenerated from it — never trusted from the client — and
- * the claim is consumed BEFORE verification so a bad signature burns the challenge.
+ * Canton wallet challenge / signature (docs/ARCHITECTURE.md §7.3–7.4) for the two things a wallet
+ * signature does: `link-wallet` (bind the wallet to the signed-in account, session-bound) and
+ * `admin-sign-in` (an operator's admin session, never with a session present). The record lives
+ * in Redis (`wc:<id>`, 5 min); the message is regenerated from it — never trusted from the
+ * client — and the claim is consumed BEFORE verification so a bad signature burns the challenge.
  */
 @Injectable()
 export class WalletChallengeService {
@@ -73,8 +75,8 @@ export class WalletChallengeService {
     if (input.purpose === "link-wallet" && !input.sessionId) {
       throw new ApiError(401, "unauthenticated", "link-wallet challenges require a session");
     }
-    if (input.purpose !== "link-wallet" && input.sessionId) {
-      throw new ApiError(409, "challenge_purpose_mismatch", "sign-in challenges cannot be issued to an existing session; use link-wallet");
+    if (input.purpose === "admin-sign-in" && input.sessionId) {
+      throw new ApiError(409, "challenge_purpose_mismatch", "admin-sign-in challenges cannot be issued to an existing session");
     }
     // Deliberately NO operator check here: an admin-sign-in challenge is issued to any well-formed
     // party and the operator list is consulted at verify time only, so an anonymous caller cannot
@@ -102,7 +104,7 @@ export class WalletChallengeService {
     partyId: string;
     publicKey: string;
     signature: string;
-    expectedPurpose: ChallengePurpose | ChallengePurpose[];
+    expectedPurpose: ChallengePurpose;
     sessionId?: string | null;
   }): Promise<VerifiedChallenge> {
     const challengeId = String(input.challengeId ?? "").trim();
@@ -117,18 +119,17 @@ export class WalletChallengeService {
     const partyId = String(input.partyId ?? "").trim();
     if (partyId !== record.partyId) throw new ApiError(401, "challenge_rejected", "challenge was issued for another party");
 
-    const expected = Array.isArray(input.expectedPurpose) ? input.expectedPurpose : [input.expectedPurpose];
-    if (!expected.includes(record.purpose)) {
+    if (record.purpose !== input.expectedPurpose) {
       throw new ApiError(401, "challenge_purpose_mismatch", `challenge purpose ${record.purpose} is not accepted here`);
     }
-    // Purpose isolation: a link challenge is bound to the session it was issued to; sign-in
-    // challenges must not be presented with a session.
-    if (record.purpose === "link-wallet") {
-      if (!input.sessionId || input.sessionId !== record.sessionId) {
-        throw new ApiError(401, "challenge_purpose_mismatch", "link-wallet challenge was issued to another session");
-      }
-    } else if (input.sessionId) {
-      throw new ApiError(401, "challenge_purpose_mismatch", "sign-in challenges cannot be used while signed in");
+    // Purpose isolation (§7.3 / §7.4): a link-wallet challenge is bound to the session it was
+    // issued to and must be presented by that very session; an admin-sign-in challenge is refused
+    // as soon as any session is presented — admin sign-in never runs in link mode.
+    if (record.purpose === "link-wallet" && (!input.sessionId || input.sessionId !== record.sessionId)) {
+      throw new ApiError(401, "challenge_purpose_mismatch", "link-wallet challenge was issued to another session");
+    }
+    if (record.purpose === "admin-sign-in" && input.sessionId) {
+      throw new ApiError(401, "challenge_purpose_mismatch", "admin-sign-in challenges cannot be used while signed in");
     }
 
     const publicKeyBase64 = publicKeyToBase64(input.publicKey);

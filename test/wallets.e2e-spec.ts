@@ -2,8 +2,9 @@
  * Wallets + deposits end to end (docs/API.md "Wallets" / "In-app wallet"; ARCHITECTURE §8.1–8.4).
  * Real Postgres + Redis; the ledger and the Enterprise Wallet are the in-memory fakes, so every
  * treasury-signed `Create UserWallet` / `Deposit` is applied to FakeLedgerClient the way the real
- * ledger would and can be inspected afterwards. Google sign-in is replaced by a fake verifier so a
- * wallet-less (social-login) account can be minted through the real `POST /auth/google` route.
+ * ledger would and can be inspected afterwards. Accounts are opened the only way a user account can
+ * be opened (§6.1) — Google or Telegram — and the wallet is then LINKED to that account; Google
+ * sign-in uses a fake verifier so both social paths are exercised without the network.
  *
  * Every request goes through a jar-less supertest instance with an explicit `Cookie` header: a
  * supertest *agent* stores the last `Set-Cookie` it saw and merges it over an explicit header, so
@@ -25,7 +26,6 @@ import { walletCreateCommandIdFor } from "../src/services/ledger-client.service"
 import { UserService } from "../src/services/user.service";
 import type {
   ApiChallenge,
-  ApiIdentity,
   ApiLoginResult,
   ApiMe,
   ApiSessionState,
@@ -38,7 +38,8 @@ import type {
 import { ApiError, type ErrorBody } from "../src/util/errors";
 import { formatCC, parseCC } from "../src/util/money";
 import { TEST_ORIGIN, useTestApp } from "./helpers/app";
-import { bodyOf, cookieFromResponse, signInWithWallet } from "./helpers/session";
+import { bodyOf, cookieFromResponse, linkWallet } from "./helpers/session";
+import { nextTelegramUser, signInWithTelegram } from "./helpers/telegram";
 import { makeTestWallet, type TestWallet } from "./helpers/wallet";
 
 // ─────────────────────────────────────────── fakes ───────────────────────────────────────────────
@@ -90,9 +91,9 @@ interface Signed {
   cookie: string;
 }
 
+/** `POST /wallets/link` answers with the wallet row alone — linking creates no identity (§8.1). */
 interface LinkResponse {
   wallet: ApiWallet;
-  identity: ApiIdentity;
 }
 
 type LedgerCommand = {
@@ -117,13 +118,20 @@ describe("Wallets + deposits (e2e)", () => {
   const credits = (): ReturnType<typeof ctx.dataSource.getRepository<DepositCreditEntity>> => ctx.dataSource.getRepository(DepositCreditEntity);
   const auditRows = (action: string): Promise<AuditEventEntity[]> => ctx.dataSource.getRepository(AuditEventEntity).find({ where: { action }, order: { id: "ASC" } });
   const walletRow = (partyId: string): Promise<WalletEntity> => wallets().findOneByOrFail({ partyId });
-  const identityRow = (partyId: string): Promise<AuthIdentityEntity> => ctx.dataSource.getRepository(AuthIdentityEntity).findOneByOrFail({ provider: "canton_wallet", subject: partyId });
+  /** §8.1: a user's wallet is a `to_wallets` row and never a `canton_wallet` identity — always 0 here. */
+  const walletIdentityCount = (partyId: string): Promise<number> =>
+    ctx.dataSource.getRepository(AuthIdentityEntity).count({ where: { provider: "canton_wallet", subject: partyId } });
   const userRow = (id: string): Promise<UserEntity> => ctx.dataSource.getRepository(UserEntity).findOneByOrFail({ id });
 
-  /** The real challenge → sign → `POST /auth/wallet` flow (purpose sign-in). */
+  /**
+   * An account with `wallet` linked as its primary — the starting point most tests below want.
+   * Two steps now, because a wallet cannot open an account (§6.1): sign in with Telegram, then
+   * link (§8.1), which is what sets `users.party_id`.
+   */
   async function signIn(wallet: TestWallet): Promise<Signed> {
-    const { user, cookie } = await signInWithWallet(http(), wallet);
-    return { user, cookie };
+    const { user, cookie } = await signInWithTelegram(http(), nextTelegramUser("Wallet Owner"));
+    await linkWallet(http(), cookie, wallet);
+    return { user: { ...user, partyId: wallet.partyId }, cookie };
   }
 
   /** A wallet-less account through the real `POST /auth/google` route (verifier faked). */
@@ -133,17 +141,6 @@ describe("Wallets + deposits (e2e)", () => {
     const body = bodyOf<ApiLoginResult>(res);
     expect(body).toMatchObject({ mode: "login", kind: "user", identity: { provider: "google", subject } });
     return { user: body.user, cookie: cookieFromResponse(res) };
-  }
-
-  /** The sign-in flow, but returning the final response so refusals can be asserted. */
-  async function signInAttempt(wallet: TestWallet): Promise<request.Response> {
-    const challenge = await http().post("/api/v1/auth/wallet/challenge").set(H).send({ partyId: wallet.partyId, purpose: "sign-in" });
-    expectStatus(challenge, 200);
-    const { challengeId, message } = bodyOf<ApiChallenge>(challenge);
-    return http()
-      .post("/api/v1/auth/wallet")
-      .set(H)
-      .send({ challengeId, partyId: wallet.partyId, publicKey: wallet.publicKeyBase64, signature: wallet.sign(message), kind: "cantor8" });
   }
 
   /** `POST /wallets/link-challenge` → sign → `POST /wallets/link`; the raw response so 409s can be asserted. */
@@ -170,9 +167,10 @@ describe("Wallets + deposits (e2e)", () => {
     expectStatus(res, 200);
     const body = bodyOf<LinkResponse>(res);
     expect(body.wallet.partyId).toBe(wallet.partyId);
-    expect(body.identity).toMatchObject({ provider: "canton_wallet", subject: wallet.partyId, status: "active" });
-    // Greenfield: nothing is seeded from the ledger, so the response is exactly { wallet, identity }.
-    expect(Object.keys(body).sort()).toEqual(["identity", "wallet"]);
+    // Greenfield: nothing is seeded from the ledger and no identity is created, so the response
+    // is exactly { wallet } (§8.1).
+    expect(Object.keys(body)).toEqual(["wallet"]);
+    expect(await walletIdentityCount(wallet.partyId)).toBe(0);
     return body;
   }
 
@@ -326,7 +324,6 @@ describe("Wallets + deposits (e2e)", () => {
         creditedCC: CC("0"),
         ownLedgerWallet: null,
       });
-      expect(linked.identity).toMatchObject({ provider: "canton_wallet", subject: B.partyId, status: "active", kycLocked: false });
       // Neither the sign-in nor the link read the ledger.
       expect(ctx.ledger.fetchUserWalletCalls()).toEqual([]);
 
@@ -339,7 +336,10 @@ describe("Wallets + deposits (e2e)", () => {
       const session = bodyOf<ApiSessionState>(await get("/auth/session", a.cookie).expect(200));
       expect(session.user?.partyId).toBe(A.partyId);
       expect((await userRow(a.user.id)).partyId).toBe(A.partyId);
-      expect((await identityRow(B.partyId)).userId).toBe(a.user.id);
+      // Both parties are wallet rows of this account and neither is a sign-in method (§8.1).
+      expect((await walletRow(B.partyId)).userId).toBe(a.user.id);
+      expect(await walletIdentityCount(A.partyId)).toBe(0);
+      expect(await walletIdentityCount(B.partyId)).toBe(0);
 
       const linkedAudits = await auditRows("wallet.linked");
       expect(linkedAudits).toHaveLength(2);
@@ -348,18 +348,17 @@ describe("Wallets + deposits (e2e)", () => {
       expect(ctx.nats.publishedOn("truthoracle.wallet.linked")).toHaveLength(2);
     });
 
-    it("GET /me lists both canton_wallet identities and both wallets after a link — API.md 'Me'", async () => {
+    it("GET /me lists the ONE sign-in method and both wallets after a link — API.md 'Me'", async () => {
       const A = makeTestWallet("alice");
       const B = makeTestWallet("bob");
       const a = await signIn(A);
       await linkOk(a.cookie, B);
 
       const me = bodyOf<ApiMe>(expectStatus(await get("/me", a.cookie), 200));
-      const cantonIdentities = me.identities.filter((i) => i.provider === "canton_wallet");
-      expect(cantonIdentities).toHaveLength(2);
-      expect(cantonIdentities.map((i) => i.subject).sort()).toEqual([A.partyId, B.partyId].sort());
-      expect(cantonIdentities.every((i) => i.status === "active" && i.kycLocked === false)).toBe(true);
-      expect(me.identities).toHaveLength(2);
+      // Two wallets, but only the Telegram identity signs anyone in (§6.1 / §8.1).
+      expect(me.identities.filter((i) => i.provider === "canton_wallet")).toEqual([]);
+      expect(me.identities).toHaveLength(1);
+      expect(me.identities[0]).toMatchObject({ provider: "telegram", status: "active", kycLocked: false });
       expect(me.wallets.map((w) => [w.partyId, w.isPrimary])).toEqual(expect.arrayContaining([[A.partyId, true], [B.partyId, false]]));
       expect(me.capabilities.primaryPartyId).toBe(A.partyId);
       expect(me.user.partyId).toBe(A.partyId);
@@ -460,7 +459,7 @@ describe("Wallets + deposits (e2e)", () => {
       expectError(await post(`/wallets/${randomUUID()}/primary`, a.cookie).send({}), 404, "not_found");
     });
 
-    it("DELETE /wallets/:id: primary → 409; a secondary is revoked (identity unlinked) and relinking reactivates the same row", async () => {
+    it("DELETE /wallets/:id: primary → 409; a secondary is revoked and relinking reactivates the same row", async () => {
       const A = makeTestWallet("alice");
       const B = makeTestWallet("bob");
       const a = await signIn(A);
@@ -484,28 +483,26 @@ describe("Wallets + deposits (e2e)", () => {
       const row = await walletRow(B.partyId);
       expect(row).toMatchObject({ status: "revoked", isPrimary: false, creditedCC: parseCC("3"), userId: a.user.id });
       expect(row.revokedAt).not.toBeNull();
-      const identity = await identityRow(B.partyId);
-      expect(identity.status).toBe("unlinked");
-      expect(identity.unlinkedAt).not.toBeNull();
+      // Unlinking a wallet touches wallets only: the account's sign-in methods are untouched
+      // and no identity row was ever created for the party (§8.1).
       expect(await auditRows("wallet.unlinked")).toHaveLength(1);
-      expect(await auditRows("identity.unlinked")).toHaveLength(1);
+      expect(await auditRows("identity.unlinked")).toEqual([]);
+      expect(await walletIdentityCount(B.partyId)).toBe(0);
       expect(ctx.nats.publishedOn("truthoracle.wallet.unlinked")).toHaveLength(1);
+      expect(ctx.nats.publishedOn("truthoracle.identity.unlinked")).toEqual([]);
+      // The account can still sign in: its Telegram identity is unaffected.
+      expect(bodyOf<ApiMe>(expectStatus(await get("/me", a.cookie), 200)).identities).toHaveLength(1);
       // Nothing active is left to unlink.
       expectError(await del(`/wallets/${linked.wallet.id}`, a.cookie), 404, "not_found");
-      // §6.4: the unlinked wallet cannot open a second account.
-      expectError(await signInAttempt(B), 403, "identity_unlinked");
       expect(await ctx.dataSource.getRepository(UserEntity).count()).toBe(1);
 
-      // Relink by the same user reactivates the SAME row and identity; credited_cc untouched, no ledger read.
+      // Relink by the same user reactivates the SAME row; credited_cc untouched, no ledger read.
       const relinked = await linkOk(a.cookie, B);
       expect(relinked.wallet).toMatchObject({ id: linked.wallet.id, status: "active", isPrimary: false, creditedCC: CC("3") });
-      expect(relinked.identity).toMatchObject({ id: linked.identity.id, status: "active" });
       expect(ctx.ledger.fetchUserWalletCalls()).toEqual([]);
       expect(await wallets().count({ where: { partyId: B.partyId } })).toBe(1);
-      expect(await ctx.dataSource.getRepository(AuthIdentityEntity).count({ where: { subject: B.partyId } })).toBe(1);
       const reactivated = await walletRow(B.partyId);
       expect(reactivated).toMatchObject({ status: "active", revokedAt: null, creditedCC: parseCC("3") });
-      expect((await identityRow(B.partyId)).status).toBe("active");
       expect(await auditRows("wallet.relinked")).toHaveLength(1);
       expect((await listWallets(a.cookie)).find((w) => w.partyId === A.partyId)).toMatchObject({ isPrimary: true });
     });
@@ -523,18 +520,14 @@ describe("Wallets + deposits (e2e)", () => {
       expectStatus(await del(`/wallets/${linked.wallet.id}`, a.cookie), 200);
       expectError(await link(x.cookie, B), 409, "wallet_already_linked");
 
-      // §8.1: the link is also reachable through POST /auth/wallet in link mode — same refusal.
-      const challenge = await post("/auth/wallet/challenge", x.cookie).send({ partyId: B.partyId, purpose: "link-wallet" });
-      expectStatus(challenge, 200);
-      const { challengeId, message } = bodyOf<ApiChallenge>(challenge);
-      const viaAuth = await post("/auth/wallet", x.cookie).send({ challengeId, partyId: B.partyId, publicKey: B.publicKeyBase64, signature: B.sign(message), kind: "cantor8" });
-      expectError(viaAuth, 409, "wallet_already_linked");
+      // POST /wallets/link is the ONLY link path: the old /auth/wallet route is gone (§7.3).
+      expectStatus(await post("/auth/wallet", x.cookie).send({}), 404);
 
       // Nothing was created for X, nothing moved for A.
       expect((await listWallets(x.cookie)).map((w) => w.partyId)).toEqual([D.partyId]);
       expect(await wallets().count({ where: { partyId: B.partyId } })).toBe(1);
       expect((await walletRow(B.partyId))).toMatchObject({ userId: a.user.id, status: "revoked" });
-      expect((await identityRow(B.partyId)).userId).toBe(a.user.id);
+      expect(await walletIdentityCount(B.partyId)).toBe(0);
     });
 
     it("wallet routes are scoped to the session: another user's wallets are invisible and unaddressable", async () => {
@@ -598,7 +591,7 @@ describe("Wallets + deposits (e2e)", () => {
       expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(A.partyId), res.commandId]);
       const [create] = ctx.wallet.submits[0].commands as LedgerCommand[];
       expect(create.CreateCommand?.templateId).toMatch(/:UserWallet$/);
-      // depositRefs is mandatory on truthoracle-v14 and always sent (empty on the Create; the
+      // depositRefs is mandatory on truthoracle-v16 and always sent (empty on the Create; the
       // Deposit appends the txRef).
       expect(create.CreateCommand?.createArguments).toEqual({ admin: ctx.config.treasuryPartyId, owner: A.partyId, balanceCC: CC("0"), depositedCC: CC("0"), withdrawnCC: CC("0"), depositRefs: [] });
       const [deposit] = ctx.wallet.submits[1].commands as LedgerCommand[];

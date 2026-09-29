@@ -22,6 +22,11 @@ configured.
 | `to_settings.app_network is "X" but APP_NETWORK=Y` | the database was created for another network | point `DATABASE_URL` at the right database. Never edit `to_settings.app_network` to "fix" this: the Redis prefix, NATS stream, fingerprints and ledger credentials all differ per network |
 | `KYC_FINGERPRINT_PEPPER does not match to_settings.kyc_pepper_hash` | pepper changed without acknowledgement | §2 |
 
+A **warning** (not a refusal) is logged once at boot when neither `GOOGLE_CLIENT_IDS` nor
+`TELEGRAM_BOT_TOKEN` is configured: `no sign-in provider is configured … nobody can create an
+account`. The process still starts — local development routinely runs without either — but with
+no sign-in method there is no account, and therefore no deposit and no trading (ARCHITECTURE §18).
+
 ## 2. KYC pepper rotation
 
 `to_kyc_persons.fingerprint` values are `HMAC-SHA256(KYC_FINGERPRINT_PEPPER, canonical key)`.
@@ -42,17 +47,19 @@ To rotate:
 
 The pepper itself is never stored; only its hash is.
 
-## 3. Daml package (truthoracle-v14) and deposit drift
+## 3. Daml package (truthoracle-v16) and deposit drift
 
-The backend is built against **truthoracle-v14 1.0.0**
-(`TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a`,
-`TRUTHORACLE_PACKAGE_NAME=truthoracle-v14`), whose `UserWallet.depositRefs : [Text]` is
-mandatory and is the deposit confirm pass's only confirmation rule. There is no Daml feature
-flag and no upgrade path from an older package (ARCHITECTURE §18).
+The backend is built against **truthoracle-v16 1.0.0**
+(`TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload in truthoracle-contracts>`,
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v16`), a fresh lineage deployed from scratch: its
+`UserWallet.depositRefs : [Text]` is mandatory and is the deposit confirm pass's only
+confirmation rule, and every `PredictionMarket` carries its identity (`ticker`, `eventTicker`,
+the side labels). There is no Daml feature flag and no upgrade path from an older package
+(ARCHITECTURE §18); a v16 deployment starts with an empty index and a fresh database.
 
 - `502 upstream_failed "ledger returned a UserWallet without depositRefs"` on any money route,
   with `UserWallet <cid> (owner …): UserWallet.depositRefs is missing; is TRUTHORACLE_PACKAGE_ID
-  the deployed truthoracle-v14?` in the log: the configured package id / name does not match
+  the deployed truthoracle-v16?` in the log: the configured package id / name does not match
   what is deployed. Fix the env; nothing was written.
 - `409 deposit_attribution_drift` (audit `deposit.attribution_drift`, Sentry, NATS
   `truthoracle.deposit.drift`): the primary's on-ledger `depositedCC` differs from
@@ -138,8 +145,9 @@ curl -s localhost:8091/health                  # 200 { status: "ok", env, networ
 curl -s localhost:8091/health/ready            # 200 { checks: { postgres, redis, nats } } — 503 names the failing one
 curl -s localhost:8091/api/v1/me               # 401 { error: "unauthenticated" }
 curl -s -X POST -H 'Origin: http://localhost:8091' -H 'Content-Type: application/json' \
-  -d '{"partyId":"<party>","purpose":"sign-in"}' localhost:8091/api/v1/auth/wallet/challenge   # 200 { challengeId, message, expiresAt }
-curl -s -X POST -H 'Content-Type: application/json' -d '{}' localhost:8091/api/v1/auth/wallet/challenge   # 403 csrf_rejected (no Origin)
+  -d '{"partyId":"<operator party>"}' localhost:8091/api/v1/auth/admin/challenge   # 200 { challengeId, message, expiresAt }
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' localhost:8091/api/v1/auth/admin/challenge   # 403 csrf_rejected (no Origin)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8091/api/v1/auth/wallet   # 404 — wallet sign-in no longer exists
 curl -s localhost:8091/api/v1/nope             # 404 { error: "not_found" } — never Express's HTML page
 ```
 
@@ -161,11 +169,12 @@ answers, in order (`R` = `http://127.0.0.1:5199/__backend`):
 | Step | Expect |
 |---|---|
 | `GET R/health`, `GET R/health/ready` | 200, `checks` all `ok` |
-| `POST R/api/v1/auth/wallet/challenge { partyId, purpose: "sign-in" }` | 200; message has `Domain: 127.0.0.1:5199` (the app host, not the backend's) |
-| `POST R/api/v1/auth/wallet { challengeId, partyId, publicKey, signature, kind }` | 200 `mode: login, created: true, kind: user`; `Set-Cookie: to_session=…; Path=/; HttpOnly; SameSite=Lax` relayed (no `Domain=`; `Secure` outside dev) |
+| Sign in with Google or Telegram in the browser (the only user sign-ins, §6.1) | 200 `mode: login, created: true, kind: user`; `Set-Cookie: to_session=…; Path=/; HttpOnly; SameSite=Lax` relayed (no `Domain=`; `Secure` outside dev) |
+| `POST R/api/v1/wallets/link-challenge { partyId }` | 200; message starts `TruthOracle link-wallet` and has `Domain: 127.0.0.1:5199` (the app host, not the backend's) |
+| `POST R/api/v1/wallets/link { challengeId, partyId, publicKey, signature, kind }` | 200 `{ wallet }` — the first wallet is primary and sets `users.party_id`; no identity is created |
 | `GET R/api/v1/auth/session` · `GET R/api/v1/me` | `authenticated: true`; one primary wallet, `kyc.status: none` |
 | `GET R/api/v1/kyc` → `POST R/api/v1/kyc/sessions` → `POST R/api/v1/kyc/mock/submit` (approved, one PASSPORT) → `GET R/api/v1/kyc` | `none` → `{ provider: mock, verificationId }` → `approved` → `approved`, `attachedIdentityId` set |
-| `POST R/api/v1/wallets/link-challenge` + `POST R/api/v1/wallets/link` (second key) → `GET R/api/v1/me` | 200 `isPrimary: false`; two wallets, two identities, the KYC-initiating one `kycLocked: true` |
+| `POST R/api/v1/wallets/link-challenge` + `POST R/api/v1/wallets/link` (second key) → `GET R/api/v1/me` | 200 `isPrimary: false`; two wallets, still ONE identity (the sign-in method), which is `kycLocked: true` |
 | `POST R/api/v1/in-app-wallet/deposits/reconcile` | 200 when the treasury is reachable; `502 upstream_failed` ("wallet history read failed") when it is not — never a 500 |
 | `GET R/api/v1/me/sessions` → `POST R/api/v1/auth/logout` → `GET R/api/v1/me` | one session `current: true` → `{ ok: true }` with the cleared cookie relayed → 401 |
 | `POST` without `Origin` | `403 csrf_rejected` |
@@ -184,7 +193,7 @@ process. What each route does when `fetch` fails or Keycloak refuses the client 
 
 | Route | Behaviour |
 |---|---|
-| `POST /auth/wallet`, `POST /wallets/link` (first-time or relink), Google/Telegram sign-ins | unaffected — linking never reads the ledger (ARCHITECTURE §8.1); a first-time wallet sign-in succeeds while the ledger is down |
+| `POST /wallets/link` (first-time or relink), Google/Telegram sign-ins, `POST /auth/admin` | unaffected — linking never reads the ledger (ARCHITECTURE §8.1), so a first-time link succeeds while the ledger is down |
 | `GET /me`, `GET /wallets`, `GET /in-app-wallet` | 200 with `ownLedgerWallet: null` / `ledger: null` (degraded reads are logged, not surfaced) |
 | `POST /in-app-wallet/deposits/reconcile` | `502 upstream_failed`; nothing is written (the history walk precedes the write-ahead row) |
 | `POST /in-app-wallet/payouts/:cid/settle`, admin settle, processor scan | `502 upstream_failed` (user/admin) or a logged warning (scan); a row that already recorded a submission stays `settling` — fail closed, never re-transferred (ARCHITECTURE §9.4) |
@@ -203,11 +212,113 @@ queue.
 
 ## 11. Unlink refusals, in order
 
-`DELETE /me/identities/:id`, `DELETE /wallets/:id` and the admin unlink all go through
-`IdentityService.unlink`, which refuses in this order: `409 identity_locked_by_kyc` (users
-only — the identity that started the standing KYC approval, ARCHITECTURE §6.5; operators skip
-this), then `409 primary_wallet_in_use` (every actor — the wallet `users.party_id` points at,
-§8.2; make another wallet primary first, possible only while no on-ledger `UserWallet` or queued
-payout exists), then `409 last_identity` (§6.3). A wallet-only account with an approved KYC
-therefore sees `identity_locked_by_kyc` on its single wallet; an operator sees
-`primary_wallet_in_use`.
+Identities and wallets are unlinked by different routes with different rules, because a wallet
+is not a sign-in method (ARCHITECTURE §8.1).
+
+- `DELETE /me/identities/:id` and the admin unlink go through `IdentityService.unlink`, which
+  refuses `409 identity_locked_by_kyc` first (users only — the identity that started the standing
+  KYC approval, §6.5; operators skip this), then `409 last_identity` (§6.3). An account whose
+  only sign-in method started an approved verification therefore sees `identity_locked_by_kyc`.
+- `DELETE /wallets/:id` refuses only `409 primary_wallet_in_use` (the wallet `users.party_id`
+  points at, §8.2; make another wallet primary first, possible only while no on-ledger
+  `UserWallet` or queued payout exists). Unlinking any other wallet always succeeds: it revokes
+  the row, keeps its attribution, and never touches how the person signs in.
+
+## 12. Ledger indexer (docs/INDEXER.md)
+
+**First run on a participant.** Watch the log of the replica that logs `holding the indexer lock`:
+`bootstrap: replaying the full ledger history from offset 0` (never-pruned) or `bootstrap: ACS
+snapshot at offset N` (pruned), then `applied K transaction(s)` lines until `GET /ledger/status`
+reports `lag: 0`. Compare `to_markets` with `npm run contracts:active PredictionMarket` in
+`truthoracle-contracts` — the contract ids and `currentPrice` must match exactly. The JSON shapes
+were taken from the Canton 3.4 OpenAPI spec and the production tree reader, not from a recorded
+response: an unexpected shape shows up as markets with zero fields or missing trades, never as a
+crash (`src/util/ledger-values.ts` fails soft) — `GET /admin/ledger/events?updateId=` shows the
+raw payloads to compare against.
+
+**`lastError` set / `lag` growing.** The processor retries with backoff (1 s … 60 s) and reports
+the first and every tenth failure to Sentry. `ledger updates failed (401)`: the ledger Keycloak
+client (RUNBOOK §1). `filled INDEXER_ACS_LIMIT`: raise the limit and the participant's
+`http-list-max-elements-limit`. `/v2/updates answered 404`: the participant predates the
+endpoint; `INDEXER_UPDATES_ENDPOINT=auto` already fell back to `/v2/updates/trees`.
+
+**A gap appeared** (`gaps` in `GET /ledger/status`, `truthoracle.indexer.gap`, Sentry warning):
+the index was down longer than the participant's retention and resynced from the ACS. State is
+correct; activity inside the range is missing for good. Note the range in the incident log; if
+the outage was a deploy, size the retention or the deploy window accordingly.
+
+**Rebuild.** `INDEXER_ENABLED=false` on every replica, then
+`TRUNCATE to_indexer_state, to_ledger_events, to_markets, to_market_snapshots, to_market_events,
+to_positions, to_liquidity_positions, to_ledger_wallets, to_wallet_entries, to_ledger_payouts,
+to_attestations, to_model_forecasts, to_prediction_models, to_ledger_transfers`, then
+`INDEXER_ENABLED=true`. Required after switching participants (offsets are participant-local) or
+after a projection fix. The account tables are never touched.
+
+**Operator resync.** `POST /admin/ledger/resync { reason }` re-snapshots the ACS at the ledger end
+and reconciles activeness (audited as `ledger.resync`). Use it after a manual ledger repair; it is
+not a rebuild.
+
+## 13. Markets: catalog, candles, trading halt (docs/MARKETS.md)
+
+- **Demo data for local UI work**: `npm run seed:dev` writes a demo catalog straight into the
+  index of `DATABASE_URL` — series `DEMO-FED` / `DEMO-EPL` / `DEMO-BTC`, three events, seven
+  markets (negative `market_id`s, `demo-` contract ids, `DEMO-` tickers), thirty days of candles
+  from a seeded random walk and a matching trade feed — so charts, cards and feeds have something
+  to draw. It refuses outside `APP_ENV=dev`, never touches the test database, replaces its own
+  rows when re-run, and `npm run seed:dev -- --clear` removes exactly them. The rows are local
+  only: nothing is on the ledger, so trading on a demo market fails at `orders/prepare`, and a
+  rebuild of the index does not bring them back. Run it while the dev server is up (it uses
+  ts-node, so `dist/` is left alone).
+
+- **Halt trading** (participant maintenance, a market under investigation): `POST /admin/exchange/halt
+  { active: true, reason, estimatedResumeAt? }` with an operator session. The UI shows the reason,
+  disables the trade controls and `orders/prepare` answers `409 trading_halted` (redemptions stay
+  available). Resume with `{ active: false, reason }`. Audited as `exchange.halt_changed`; the
+  state lives in `to_settings.exchange_halt` only while active.
+- **Create a market inside an event**: create the series (`POST /admin/series`) and the event
+  (`POST /admin/events`) once, then `POST /admin/markets { eventTicker, ticker, question, … }`.
+  The route needs the `MarketCounter` indexed (`503 not_ready` otherwise); `ticker` and
+  `eventTicker` are required, `yesSubTitle` / `noSubTitle` default to `Yes` / `No`. The market
+  is readable once the indexer applies the transaction.
+- **An event you never created shows up** (title = its ticker, series = the ticker's first
+  segment): a market named it on-ledger before the catalog had it (created from the frontend's
+  admin console, or the event row was never written) and the projection created a placeholder.
+  Fill it in with `PATCH /admin/events/:ticker` (title, `seriesTicker`, strike, …) and the
+  series with `PATCH /admin/series/:ticker`; `POST` answers `409 catalog_conflict` for a ticker
+  that already exists. A market's own identity has no operator route — it is the contract's.
+- **Two markets with the same ticker** (`… on-ledger ticker X is already used by market N` at
+  error level): the later one is indexed as `X~<marketId>`. Void or archive the duplicate
+  on-ledger; the index never edits identity.
+- **Candles look wrong after a projection fix**: candles and open interest are derived in the
+  indexer's transaction; rebuild the index from scratch (§ "Rebuild from scratch" in
+  docs/INDEXER.md §9). A market's identity is re-read from the ledger, and placeholder catalog
+  rows are re-created where the operator never wrote the event; operator-written series and
+  events are not ledger data and survive the rebuild.
+- **`GET /exchange/status.ledger.stale = true`**: the indexer has not touched its state row for
+  `EXCHANGE_STALE_AFTER_SEC`; check `GET /ledger/status.lastError` and the replica that holds
+  the lock (`running`).
+
+## 14. Sumsub (docs/KYC.md §5–§6)
+
+- **Is the wiring right?** `npm run kyc:check` on the host, or `GET /admin/kyc/provider` with an
+  operator session. `probe OK (HTTP 404)` = app token + signature accepted. `401`: wrong
+  `SUMSUB_APP_TOKEN` / `SUMSUB_SECRET_KEY`, or the host clock is more than a minute off UTC.
+  `403`: the token lacks *View applicants*. `webhookSecretConfigured: false`: every webhook is
+  being answered 401 — set `SUMSUB_WEBHOOK_SECRET` and restart.
+- **Webhooks answer 401 `webhook_rejected`.** Almost always the digest algorithm: the dashboard
+  webhook must use `HMAC_SHA256_HEX` (or `_SHA512_HEX`); Sumsub's default `HMAC_SHA1_HEX` is
+  refused unless `SUMSUB_ALLOW_SHA1=true`. Then the secret, then the URL (the relay forwards
+  `x-payload-digest` / `x-payload-digest-alg` and `api/v1/**` only).
+- **A review landed on Sumsub but the user still shows `pending`.** `SELECT id, type,
+  processed_at, attempts, error FROM to_kyc_webhook_events ORDER BY received_at DESC LIMIT 20`.
+  Unprocessed rows are re-published by the sweep; a row the consumer gave up on can be
+  replayed with `POST /admin/kyc/webhooks/:id/replay { reason }`. No row at all: resend the
+  webhook from the dashboard's webhook manager (idempotent on the body hash).
+- **Approved on Sumsub, `needs_review` here.** The applicant re-read had no identity document
+  the fingerprints accept (`PASSPORT`, `ID_CARD`, `DRIVERS`, `RESIDENCE_PERMIT`), the review is
+  not `completed`, the level differs from `KYC_REQUIRED_LEVEL`, or a sandbox event arrived on
+  mainnet. `GET /admin/kyc/needs-review` lists them; an operator override
+  (`POST /admin/users/:id/kyc/override`) settles it.
+- **Rotating the app token or the webhook secret.** Create the new one in the dashboard, set
+  the env, restart, run `npm run kyc:check`, then delete the old one. Webhooks signed with the
+  old secret during the switch are rejected and can be resent.

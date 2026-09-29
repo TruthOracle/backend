@@ -3,17 +3,16 @@ import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
 import { LinkChallengeDto, LinkWalletDto } from "../dto/wallets.dto";
-import { IdentityService } from "../services/identity.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { WalletChallengeService } from "../services/wallet-challenge.service";
 import { WalletLinkService } from "../services/wallet-link.service";
-import type { ApiChallenge, ApiIdentity, ApiWallet } from "../types";
+import type { ApiChallenge, ApiWallet } from "../types";
 
 /**
- * Wallet routes (docs/API.md "Wallets"; ARCHITECTURE §8.1–8.2). Linking runs the same
- * challenge/signature crypto as sign-in with purpose `link-wallet` bound to this session, and the
- * link itself is WalletLinkService.link — the one place the wallet-row rules live, shared with
- * `POST /auth/wallet` in link mode. Linking never reads the ledger.
+ * Wallet routes (docs/API.md "Wallets"; ARCHITECTURE §7.3, §8.1–8.2). Linking a Cantor8 wallet to
+ * the signed-in account is the ONLY thing a user's wallet signature does here: a `link-wallet`
+ * challenge bound to this session, verified by WalletChallengeService, then WalletLinkService.link
+ * — the one place the wallet-row rules live. Linking creates no identity and never reads the ledger.
  */
 @ApiTags("wallets")
 @ApiCookieAuth("to_session")
@@ -22,7 +21,6 @@ import type { ApiChallenge, ApiIdentity, ApiWallet } from "../types";
 export class WalletsController {
   constructor(
     private readonly walletLinks: WalletLinkService,
-    private readonly identities: IdentityService,
     private readonly challenges: WalletChallengeService,
     private readonly rateLimit: RateLimitService,
   ) {}
@@ -46,13 +44,12 @@ export class WalletsController {
   }
 
   /**
-   * `200 { wallet, identity }` | `409 wallet_already_linked`. The claim is consumed before
-   * verification; rejections keep the challenge service's codes (INTERNALS).
-   * Rate limit: link 10/min/user.
+   * `200 { wallet }` | `409 wallet_already_linked`. The claim is consumed before verification;
+   * rejections keep the challenge service's codes (INTERNALS). Rate limit: link 10/min/user.
    */
   @Post("link")
   @HttpCode(200)
-  async link(@Body() body: LinkWalletDto, @Req() req: AuthedRequest): Promise<{ wallet: ApiWallet; identity: ApiIdentity }> {
+  async link(@Body() body: LinkWalletDto, @Req() req: AuthedRequest): Promise<{ wallet: ApiWallet }> {
     const { user, session } = principalOf(req);
     await this.rateLimit.enforce("link", { userId: user.id });
     const verified = await this.challenges.verify({
@@ -68,14 +65,10 @@ export class WalletsController {
       { partyId: verified.partyId, publicKeyBase64: verified.publicKeyBase64, kind: body.kind },
       { label: body.label, actor: actorOf(req) },
     );
-    const locked = await this.identities.lockedIdentityId(user.id);
-    return {
-      wallet: this.walletLinks.toApi(linked.wallet),
-      identity: this.identities.toApi(linked.identity, locked),
-    };
+    return { wallet: this.walletLinks.toApi(linked.wallet) };
   }
 
-  /** `409 primary_wallet_in_use | last_identity | identity_locked_by_kyc` (one IdentityService.unlink, §6.5). */
+  /** `200 { ok: true }` | `409 primary_wallet_in_use` (§8.2). Identities are never touched. */
   @Delete(":id")
   @HttpCode(200)
   async unlink(@Param("id", ParseUUIDPipe) id: string, @Req() req: AuthedRequest): Promise<{ ok: true }> {

@@ -95,7 +95,7 @@ describe("util/canton-crypto", () => {
   });
 
   describe("verifyPartySignature", () => {
-    const message = "TruthOracle sign-in\nDomain: app.test\nNonce: abc";
+    const message = "TruthOracle link-wallet\nDomain: app.test\nNonce: abc";
 
     it("accepts a raw-UTF-8 Ed25519 signature in any encoding", () => {
       const kp = freshKeypair();
