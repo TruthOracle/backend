@@ -22,7 +22,8 @@
     "migration:generate": "npm run build && typeorm migration:generate -d dist/data-source.js",
     "migration:run": "npm run build && typeorm migration:run -d dist/data-source.js",
     "migration:revert": "npm run build && typeorm migration:revert -d dist/data-source.js",
-    "kyc:check": "npm run build && node dist/scripts/kyc-provider-check.js"
+    "kyc:check": "npm run build && node dist/scripts/kyc-provider-check.js",
+    "seed:dev": "ts-node --transpile-only src/scripts/seed-dev-index.ts"
   },
   "dependencies": {
     "@nats-io/jetstream": "3.4.0",

@@ -71,6 +71,8 @@ with the ledger:
 |---|---|
 | `status` | `settled` when every market is resolved / voided; else `open` when any market's phase is `trading`; else `unopened` when any is still in its liquidity period (or there are no markets); else `closed` (expired / proposed, awaiting resolution) — Kalshi's `unopened / open / closed / settled` |
 | `marketCount`, `volumeCC` | count and Σ `totalVolumeCC` of the members |
+| `volume24hCC`, `openInterestCC`, `liquidityCC` | Σ over the members of the last 24 h of hourly-candle volume, the outstanding shares, the pool value V(P) at the current effective liquidity — the figures an event card and an event header show |
+| `topMarket` | the member with the highest YES price (nested `markets` are ordered the same way, likeliest first) — what a binary-event card shows |
 | `closeTime` | the latest `expiresAt` among the members |
 | `category` | the series' |
 | `settlementSources` | the event's own sources when set, else the series' |
@@ -83,6 +85,12 @@ sum of the legs' Yes prices.
 Series carry `frequency`, `category`, `tags`, `settlementSources`, `contractUrl`, `status`
 (`active | archived`). Archiving a series or an event hides it from the public lists
 (`includeArchived=true` shows it); nothing happens to the markets.
+
+**Ranking events** (`GET /events?sort=`, the marketplace's tabs) is done in SQL over the member
+markets so the whole catalog is ranked, not one page of it: `trending` = Σ hourly-candle volume
+of the last 24 h, ties by lifetime volume; `volume` = lifetime; `closing` = the soonest close time
+still in the future among trading members, already-closed events last; `newest` = the event row's
+creation. Without `sort` the list stays by strike date, newest first.
 
 ## 4. Creating markets (operator)
 
@@ -166,6 +174,30 @@ at the snapshot (one candle at the snapshot price, volume 0); the raw
 **Rebuild.** Candles and open interest are projections of the raw event log: `TRUNCATE
 to_market_candles`, reset `open_interest_*`, and re-run the indexer from scratch
 (`docs/INDEXER.md` §9 "Rebuild from scratch"). A partial rebuild tool is not part of this change.
+
+**Charts — which read feeds which picture.** Everything a Kalshi-style UI draws is a read over
+the tables above; nothing is pre-aggregated:
+
+| Picture | Read | Notes |
+|---|---|---|
+| Event page chart, one line per outcome | `GET /events/:ticker/candlesticks?periodInterval=&startTs=&endTs=` | every member market (every status), one shared window, busiest first; the series align by construction |
+| Market page chart | `GET /markets/:market/candlesticks?…` | same candle shape |
+| Card sparkline | `GET /markets?withSparkline=true` (and the `markets` nested by `GET /events?withNestedMarkets=true`) | the last 24 hourly closes per market, one query per page |
+| Activity feed | `GET /events/:ticker/trades?cursor=` · `GET /markets/:market/trades?cursor=` | keyset pages (`nextCursor`), masked takers, `yesPrice` / `noPrice` / `notionalCC` |
+| Headline figures | `Market.previousPrice / priceChange24h / volume24hCC / openInterest / liquidityCC`, `Event.volume24hCC / openInterestCC / liquidityCC / topMarket` | from the hourly candles and the market rows |
+
+Timeframe tabs map to periods and windows like this — the cap of 5 000 candles per series is
+never hit: **1H** and **6H** → `periodInterval=1` (60 / 360 candles); **1D** → `1` (1 440) or
+`60` (24); **1W** → `60` (168); **1M** → `60` (720); **ALL** → `1440` from the market's creation.
+Windows start before the first trade are fine: the series begins at the market's first candle,
+and a window that starts after it is carried forward from the last close before the window.
+
+**No aggregation worker.** Sachin's offer of a BullMQ processor was declined on purpose. Candles
+are folded inside the indexer's Postgres transaction, so they are exactly-once and replay-safe
+already; every figure above is a set query over them and over the market rows; and the backend's
+job system is NATS JetStream (`src/processors/*`) — a second queue would be a second source of
+truth for numbers the index already holds. If a list page ever gets slow, the scaling step is a
+`to_market_stats` row refreshed from the same transaction, not a worker that re-aggregates trades.
 
 **24 h figures on every market** (`previousPrice`, `priceChange24h`, `volume24hCC`) are read from
 the hourly candles in two set queries per list page: `volume24hCC` = Σ hourly volume since

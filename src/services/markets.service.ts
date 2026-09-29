@@ -26,10 +26,13 @@ import {
   type MarketEventKind,
   type MarketPhase,
   type MarketStatus,
+  type TradeAction,
+  TRADE_ACTIONS,
 } from "../types";
 import { ApiError } from "../util/errors";
 import { divDecimal, mulDecimal, ONE_DECIMAL } from "../util/ledger-values";
 import { formatCC, parseCC } from "../util/money";
+import { maskParty } from "../util/party";
 
 export type MarketStatusFilter = MarketStatus | "active" | "settled";
 export type MarketSort = "newest" | "oldest" | "volume" | "expiry" | "activity";
@@ -85,8 +88,21 @@ export interface ActivityQuery {
   kinds?: readonly MarketEventKind[];
   actors?: string[];
   marketId?: number;
+  /** Every market of one event (the event feed). */
+  marketIds?: number[];
   page: number;
   limit: number;
+  /**
+   * Keyset mode (`cursor=`): rows strictly after the cursor in feed order (offset, node id desc),
+   * `nextCursor` in the answer, no total. Pass `""` for the first page in keyset mode.
+   */
+  cursor?: string;
+}
+
+/** `offset:nodeId` of the last row served — opaque to clients, validated by the DTO. */
+export function parseCursor(cursor: string): { offset: number; nodeId: number } | null {
+  const m = /^(\d+):(\d+)$/.exec(cursor);
+  return m ? { offset: Number(m[1]), nodeId: Number(m[2]) } : null;
 }
 
 /** Bucket widths for `GET /markets/:id/price-history` (seconds); `raw` = every version. */
@@ -349,6 +365,11 @@ export class MarketsService {
     const qb = this.dataSource.getRepository(MarketEventEntity).createQueryBuilder("e");
     if (query.marketId !== undefined)
       qb.andWhere("e.market_id = :marketId", { marketId: query.marketId });
+    if (query.marketIds) {
+      if (query.marketIds.length === 0)
+        return { items: [], page: query.page, limit: query.limit, total: 0, ...(query.cursor !== undefined ? { nextCursor: null } : {}) };
+      qb.andWhere("e.market_id IN (:...marketIds)", { marketIds: query.marketIds });
+    }
     if (query.kind) qb.andWhere("e.kind = :kind", { kind: query.kind });
     else if (query.kinds) qb.andWhere("e.kind IN (:...kinds)", { kinds: [...query.kinds] });
     if (query.actors) {
@@ -356,18 +377,51 @@ export class MarketsService {
         return { items: [], page: query.page, limit: query.limit, total: 0 };
       qb.andWhere("e.actor IN (:...actors)", { actors: query.actors });
     }
+    qb.orderBy("e.offset", "DESC").addOrderBy("e.node_id", "DESC");
+    if (query.cursor !== undefined) {
+      // Keyset: no count, one row over the limit tells whether there is a next page.
+      const after = query.cursor === "" ? null : parseCursor(query.cursor);
+      if (query.cursor !== "" && !after)
+        throw new ApiError(400, "validation_failed", "cursor is not one this feed issued");
+      if (after)
+        qb.andWhere("(e.offset < :cOffset OR (e.offset = :cOffset AND e.node_id < :cNode))", {
+          cOffset: after.offset,
+          cNode: after.nodeId,
+        });
+      const rows = await qb.take(query.limit + 1).getMany();
+      const page = rows.slice(0, query.limit);
+      const last = page[page.length - 1];
+      const items = await this.toApiEvents(page);
+      return {
+        items,
+        page: 1,
+        limit: query.limit,
+        total: items.length,
+        nextCursor: rows.length > query.limit && last ? `${last.offset}:${last.nodeId}` : null,
+      };
+    }
     const [rows, total] = await qb
-      .orderBy("e.offset", "DESC")
-      .addOrderBy("e.node_id", "DESC")
       .skip((query.page - 1) * query.limit)
       .take(query.limit)
       .getManyAndCount();
     return {
-      items: rows.map((e) => this.toApiEvent(e)),
+      items: await this.toApiEvents(rows),
       page: query.page,
       limit: query.limit,
       total,
     };
+  }
+
+  /** Shape activity rows with their markets' tickers looked up in one query. */
+  async toApiEvents(rows: MarketEventEntity[]): Promise<ApiMarketEvent[]> {
+    if (rows.length === 0) return [];
+    const ids = [...new Set(rows.map((e) => e.marketId))];
+    const tickers = await this.dataSource.query<{ market_id: string; ticker: string }[]>(
+      `SELECT market_id::text, ticker FROM to_markets WHERE market_id = ANY($1::bigint[])`,
+      [ids.map(String)],
+    );
+    const tickerOf = new Map(tickers.map((r) => [Number(r.market_id), r.ticker]));
+    return rows.map((e) => this.toApiEvent(e, tickerOf.get(e.marketId) ?? ""));
   }
 
   trades(query: Omit<ActivityQuery, "kinds">): Promise<ApiPage<ApiMarketEvent>> {
@@ -735,8 +789,9 @@ export class MarketsService {
     };
   }
 
-  toApiEvent(e: MarketEventEntity): ApiMarketEvent {
+  toApiEvent(e: MarketEventEntity, ticker = ""): ApiMarketEvent {
     const dec = (v: bigint | null): string | null => (v === null ? null : formatCC(v));
+    const action = (TRADE_ACTIONS as readonly string[]).includes(e.kind) ? (e.kind as TradeAction) : null;
     return {
       id: String(e.id),
       eventId: e.eventId,
@@ -758,6 +813,14 @@ export class MarketsService {
       updateId: e.updateId,
       commandId: e.commandId,
       effectiveAt: e.effectiveAt.toISOString(),
+      tradeId: e.eventId,
+      ticker,
+      action,
+      yesPrice: dec(e.priceAfter),
+      noPrice: e.priceAfter === null ? null : formatCC(ONE_DECIMAL - e.priceAfter),
+      notionalCC: dec(e.amountCC),
+      takerParty: maskParty(e.actor),
+      createdAt: e.effectiveAt.toISOString(),
     };
   }
 

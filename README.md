@@ -79,6 +79,7 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm run typeorm -- <cmd>` | TypeORM CLI against `dist/data-source.js` |
 | `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (against a migrated database it must print "No changes in database schema") |
 | `npm run migration:run` · `migration:revert` | apply / roll back |
+| `npm run seed:dev [-- --clear]` | write (or remove) a demo catalog with 30 days of candles and a trade feed into the local index for UI work — `APP_ENV=dev` only, never on the ledger (docs/RUNBOOK.md §13) |
 
 Four migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
 an earlier layout is dropped and recreated, never upgraded), `LedgerIndex` (the fourteen

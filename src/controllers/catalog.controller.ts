@@ -2,10 +2,12 @@ import { Controller, Get, Param, Query, UseInterceptors } from "@nestjs/common";
 import { ApiTags } from "@nestjs/swagger";
 
 import { Public } from "../auth/decorators";
-import { EventListQueryDto, SeriesListQueryDto } from "../dto/catalog.dto";
+import { EventListQueryDto, EventTradesQueryDto, SeriesListQueryDto } from "../dto/catalog.dto";
 import { DEFAULT_PAGE_LIMIT } from "../dto/common.dto";
+import { CandlesQueryDto } from "../dto/ledger.dto";
+import { CandlesService } from "../services/candles.service";
 import { CatalogService } from "../services/catalog.service";
-import type { ApiEvent, ApiPage, ApiSeries } from "../types";
+import type { ApiEvent, ApiEventCandlesticks, ApiMarketEvent, ApiPage, ApiSeries } from "../types";
 import { LedgerOffsetInterceptor } from "../util/ledger-offset.interceptor";
 
 /**
@@ -18,7 +20,10 @@ import { LedgerOffsetInterceptor } from "../util/ledger-offset.interceptor";
 @Public()
 @UseInterceptors(LedgerOffsetInterceptor)
 export class CatalogController {
-  constructor(private readonly catalog: CatalogService) {}
+  constructor(
+    private readonly catalog: CatalogService,
+    private readonly candles: CandlesService,
+  ) {}
 
   @Get("series")
   listSeries(@Query() query: SeriesListQueryDto): Promise<ApiPage<ApiSeries>> {
@@ -43,6 +48,7 @@ export class CatalogController {
       status: query.status,
       category: query.category,
       q: query.q,
+      sort: query.sort,
       withNestedMarkets: query.withNestedMarkets ?? false,
       includeArchived: query.includeArchived ?? false,
       page: query.page ?? 1,
@@ -54,5 +60,30 @@ export class CatalogController {
   @Get("events/:ticker")
   getEvent(@Param("ticker") ticker: string): Promise<{ event: ApiEvent }> {
     return this.catalog.getEvent(ticker).then((event) => ({ event }));
+  }
+
+  /** Every member market's candles over one window — the lines of an event chart (docs/MARKETS.md §5 "Charts"). */
+  @Get("events/:ticker/candlesticks")
+  eventCandlesticks(
+    @Param("ticker") ticker: string,
+    @Query() query: CandlesQueryDto,
+  ): Promise<ApiEventCandlesticks> {
+    return this.candles.eventCandlesticks(ticker, {
+      startTs: query.startTs,
+      endTs: query.endTs,
+      periodMinutes: query.periodInterval ?? 60,
+    });
+  }
+
+  /** The pool trades of every member market, newest first, keyset-paginated (`nextCursor`). */
+  @Get("events/:ticker/trades")
+  eventTrades(
+    @Param("ticker") ticker: string,
+    @Query() query: EventTradesQueryDto,
+  ): Promise<ApiPage<ApiMarketEvent>> {
+    return this.catalog.eventTrades(ticker, {
+      limit: query.limit ?? DEFAULT_PAGE_LIMIT,
+      cursor: query.cursor ?? "",
+    });
   }
 }

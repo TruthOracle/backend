@@ -22,7 +22,14 @@ import {
   ValidateNested,
 } from "class-validator";
 
-import { EVENT_STATUS_FILTERS, SERIES_FREQUENCIES, type EventStatus, type SeriesFrequency } from "../types";
+import {
+  EVENT_SORTS,
+  EVENT_STATUS_FILTERS,
+  SERIES_FREQUENCIES,
+  type EventSort,
+  type EventStatus,
+  type SeriesFrequency,
+} from "../types";
 import { REASON_MAX_LENGTH } from "./admin.dto";
 import { PageQueryDto } from "./common.dto";
 
@@ -219,6 +226,28 @@ export class EventListQueryDto extends PageQueryDto {
   @toBool()
   @IsBoolean()
   includeArchived?: boolean;
+
+  /** Card ordering; default is by strike date, newest first. */
+  @IsOptional()
+  @IsIn(EVENT_SORTS)
+  sort?: EventSort;
+}
+
+/** `GET /events/:ticker/trades?limit=&cursor=` — keyset feed, newest first. */
+export class EventTradesQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+
+  /** `nextCursor` of the previous page (`offset:nodeId`); omit for the first page. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^\d{1,20}:\d{1,10}$/)
+  cursor?: string;
 }
 
 export class CreateEventDto extends CatalogReasonDto {

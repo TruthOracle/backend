@@ -519,6 +519,8 @@ export interface ApiMe {
 }
 
 export interface ApiPage<T> {
+  /** Keyset continuation for feeds that accept `cursor=` (`GET …/trades`): pass it back for the next page; null at the end. Absent on page-numbered lists. */
+  nextCursor?: string | null;
   items: T[];
   page: number;
   limit: number;
@@ -688,6 +690,14 @@ export interface ApiMarket {
   synchronizerId: string | null;
   /** Only on `GET /markets/:id` — the disclosed-contract blob a user-signed trade needs. */
   createdEventBlob?: string | null;
+  /** Only with `GET /markets?withSparkline=true`: the last 24 hourly closes for a card's mini chart. */
+  sparkline?: ApiSparkline;
+}
+export interface ApiSparkline {
+  periodInterval: 60;
+  /** Epoch seconds of the first close's period; each later close is one period on. Fewer than 24 for a market younger than a day. */
+  startTs: number;
+  closes: ApiDecimal[];
 }
 
 /** The market fields a portfolio row is enriched with. */
@@ -743,7 +753,25 @@ export interface ApiMarketEvent {
   updateId: string;
   commandId: string | null;
   effectiveAt: string;
+  // ── trade-feed view (Kalshi `GET /markets/trades`), additive on every activity row ──
+  /** Stable id of the row (`eventId`). */
+  tradeId: string;
+  /** The market's ticker (batch-loaded; "" only for a market the index no longer holds). */
+  ticker: string;
+  /** `buy` / `sell` / `swap` / `split` / `merge` for the pool trades, null for the other kinds. */
+  action: TradeAction | null;
+  /** The YES price after the trade (`priceAfter`) and its complement; null when the kind moved no price. */
+  yesPrice: ApiDecimal | null;
+  noPrice: ApiDecimal | null;
+  /** CC the trade turned over (`amountCC`). */
+  notionalCC: ApiDecimal | null;
+  /** The taker, masked (`first 8…last 6` of the party id) — a feed never shows a whole party id. */
+  takerParty: string;
+  /** `effectiveAt`, the ledger time of the trade. */
+  createdAt: string;
 }
+export const TRADE_ACTIONS = ["buy", "sell", "swap", "split", "merge"] as const;
+export type TradeAction = (typeof TRADE_ACTIONS)[number];
 
 export interface ApiPricePoint {
   t: string;
@@ -1019,11 +1047,27 @@ export interface ApiEvent {
   volumeCC: ApiDecimal;
   /** Latest `expiresAt` among the member markets; null without markets. */
   closeTime: string | null;
-  /** Only with `withNestedMarkets=true` (and always on `GET /events/:ticker`). */
+  /** Σ hourly-candle volume of the member markets over the last 24 h (what `sort=trending` ranks by). */
+  volume24hCC: ApiDecimal;
+  /** Σ outstanding YES + NO shares across the member markets. */
+  openInterestCC: ApiDecimal;
+  /** Σ pool value V(P) at the current effective liquidity across the member markets. */
+  liquidityCC: ApiDecimal;
+  /** The likeliest outcome (highest YES price) — what a binary-event card shows; null without markets. */
+  topMarket: ApiEventTopMarket | null;
+  /** Only with `withNestedMarkets=true` (and always on `GET /events/:ticker`), likeliest outcome first. */
   markets?: ApiMarket[];
   createdAt: string;
   updatedAt: string;
 }
+export interface ApiEventTopMarket {
+  marketId: number;
+  ticker: string;
+  yesSubTitle: string;
+  currentPrice: ApiDecimal;
+}
+export const EVENT_SORTS = ["trending", "newest", "closing", "volume"] as const;
+export type EventSort = (typeof EVENT_SORTS)[number];
 
 /** The implied one-share bid / ask of an AMM pool for a reference-sized order (docs/MARKETS.md §6). */
 export interface ApiImpliedBook {
@@ -1080,6 +1124,24 @@ export interface ApiCandlesticks {
   startTs: number;
   endTs: number;
   candlesticks: ApiCandle[];
+}
+/** One market's series on an event chart — the same window and period as every sibling, so the series align by construction. */
+export interface ApiEventCandlestickSeries {
+  marketId: number;
+  ticker: string;
+  yesSubTitle: string;
+  noSubTitle: string;
+  status: MarketStatus;
+  currentPrice: ApiDecimal;
+  candlesticks: ApiCandle[];
+}
+export interface ApiEventCandlesticks {
+  eventTicker: string;
+  periodInterval: CandlePeriodMinutes;
+  startTs: number;
+  endTs: number;
+  /** Busiest market (24 h volume) first. */
+  markets: ApiEventCandlestickSeries[];
 }
 
 export const ORDER_ACTIONS = [

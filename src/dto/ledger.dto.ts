@@ -94,6 +94,12 @@ export class MarketsQueryDto extends PageQueryDto {
   @IsString()
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}(,[A-Za-z0-9][A-Za-z0-9._-]{1,63}){0,49}$/)
   tickers?: string;
+
+  /** Attach `sparkline` (the last 24 hourly closes) to every market of the page — one extra query. */
+  @IsOptional()
+  @toBool()
+  @IsBoolean()
+  withSparkline?: boolean;
 }
 
 /** `GET /markets/:market/candlesticks?startTs=&endTs=&periodInterval=` (epoch seconds; period in minutes: 1, 60, 1440) */
@@ -116,7 +122,7 @@ export class CandlesQueryDto {
   periodInterval?: CandlePeriodMinutes;
 }
 
-/** `GET /markets/:id/activity?kind=` · `GET /me/activity` · `GET /me/trades` */
+/** `GET /markets/:id/activity?kind=` · `GET /markets/:id/trades?cursor=` · `GET /me/activity` · `GET /me/trades` */
 export class ActivityQueryDto extends PageQueryDto {
   @IsOptional()
   @IsIn(MARKET_EVENT_KINDS)
@@ -127,6 +133,16 @@ export class ActivityQueryDto extends PageQueryDto {
   @IsInt()
   @Min(1)
   marketId?: number;
+
+  /**
+   * Keyset mode for feeds: `cursor=` (empty for the first page) returns rows after the cursor
+   * and `nextCursor`, ignoring `page`. Value is the `nextCursor` of the previous answer.
+   */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^(\d{1,20}:\d{1,10})?$/)
+  cursor?: string;
 }
 
 /** `GET /markets/:id/price-history?from=&to=&resolution=&limit=` */

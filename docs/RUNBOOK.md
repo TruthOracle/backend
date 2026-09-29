@@ -260,6 +260,16 @@ not a rebuild.
 
 ## 13. Markets: catalog, candles, trading halt (docs/MARKETS.md)
 
+- **Demo data for local UI work**: `npm run seed:dev` writes a demo catalog straight into the
+  index of `DATABASE_URL` — series `DEMO-FED` / `DEMO-EPL` / `DEMO-BTC`, three events, seven
+  markets (negative `market_id`s, `demo-` contract ids, `DEMO-` tickers), thirty days of candles
+  from a seeded random walk and a matching trade feed — so charts, cards and feeds have something
+  to draw. It refuses outside `APP_ENV=dev`, never touches the test database, replaces its own
+  rows when re-run, and `npm run seed:dev -- --clear` removes exactly them. The rows are local
+  only: nothing is on the ledger, so trading on a demo market fails at `orders/prepare`, and a
+  rebuild of the index does not bring them back. Run it while the dev server is up (it uses
+  ts-node, so `dist/` is left alone).
+
 - **Halt trading** (participant maintenance, a market under investigation): `POST /admin/exchange/halt
   { active: true, reason, estimatedResumeAt? }` with an operator session. The UI shows the reason,
   disables the trade controls and `orders/prepare` answers `409 trading_halted` (redemptions stay

@@ -46,8 +46,8 @@ export class MarketsController {
   ) {}
 
   @Get()
-  list(@Query() query: MarketsQueryDto): Promise<ApiPage<ApiMarket>> {
-    return this.markets.list({
+  async list(@Query() query: MarketsQueryDto): Promise<ApiPage<ApiMarket>> {
+    const page = await this.markets.list({
       status: query.status,
       category: query.category,
       event: query.event,
@@ -59,6 +59,14 @@ export class MarketsController {
       page: query.page ?? 1,
       limit: query.limit ?? DEFAULT_PAGE_LIMIT,
     });
+    if (query.withSparkline) {
+      const sparklines = await this.candles.sparklines(page.items.map((m) => m.marketId));
+      for (const m of page.items) {
+        const s = sparklines.get(m.marketId);
+        if (s) m.sparkline = s;
+      }
+    }
+    return page;
   }
 
   @Get("categories")
@@ -86,7 +94,7 @@ export class MarketsController {
     });
   }
 
-  /** buy · sell · swap · split · merge only. */
+  /** buy · sell · swap · split · merge only; `cursor=` switches to the keyset feed (`nextCursor`). */
   @Get(":market/trades")
   async trades(
     @Param("market") ref: string,
@@ -98,6 +106,7 @@ export class MarketsController {
       kind: query.kind,
       page: query.page ?? 1,
       limit: query.limit ?? DEFAULT_PAGE_LIMIT,
+      cursor: query.cursor,
     });
   }
 

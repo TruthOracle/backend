@@ -1,6 +1,8 @@
 import { Injectable } from "@nestjs/common";
 import { DataSource, type EntityManager } from "typeorm";
 
+import { ammStateOf, numberToDecimal } from "../amm/market-state";
+import { marketEffectiveL, poolValue } from "../amm/pm-amm";
 import { CatalogEventEntity } from "../entities/catalog-event.entity";
 import { MarketMetadataEntity } from "../entities/market-metadata.entity";
 import { MarketEntity } from "../entities/market.entity";
@@ -8,12 +10,15 @@ import { SeriesEntity } from "../entities/series.entity";
 import {
   NatsSubjects,
   TICKER_PATTERN,
+  TRADE_KINDS,
   type Actor,
   type ApiEvent,
   type ApiMarket,
+  type ApiMarketEvent,
   type ApiPage,
   type ApiSeries,
   type ApiSettlementSource,
+  type EventSort,
   type EventStatus,
   type MarketPhase,
   type SeriesFrequency,
@@ -72,10 +77,46 @@ export interface EventListQuery {
   status?: EventStatus | "all";
   category?: string;
   q?: string;
+  /** Card ordering (docs/MARKETS.md §3); without it the list is by strike date, newest first. */
+  sort?: EventSort;
   withNestedMarkets: boolean;
   includeArchived: boolean;
   page: number;
   limit: number;
+}
+
+/**
+ * SQL ordering for `sort=` — computed over the member markets so the whole catalog is ranked,
+ * not just the page. `trending` is the last 24 h of hourly-candle volume (ties by lifetime
+ * volume); `closing` is the soonest still-open close time (already-closed events last).
+ */
+export function eventSortOrder(sort: EventSort | undefined): { select: string; direction: "ASC" | "DESC"; nulls?: "NULLS FIRST" | "NULLS LAST"; then?: string }[] {
+  const members = "FROM to_markets m WHERE m.event_ticker = e.ticker AND m.archived = false";
+  const volume = `(SELECT COALESCE(SUM(m.total_volume_cc), 0) ${members})`;
+  switch (sort) {
+    case "trending":
+      return [
+        {
+          select: `(SELECT COALESCE(SUM(c.volume_cc), 0) FROM to_market_candles c JOIN to_markets m ON m.market_id = c.market_id WHERE m.event_ticker = e.ticker AND m.archived = false AND c.period_secs = 3600 AND c.period_start >= now() - interval '24 hours')`,
+          direction: "DESC",
+        },
+        { select: volume, direction: "DESC" },
+      ];
+    case "volume":
+      return [{ select: volume, direction: "DESC" }];
+    case "closing":
+      return [
+        {
+          select: `(SELECT MAX(m.expires_at_sec) ${members} AND m.expires_at_sec > extract(epoch FROM now()) AND m.status = 'Trading')`,
+          direction: "ASC",
+          nulls: "NULLS LAST",
+        },
+      ];
+    case "newest":
+      return [{ select: "e.created_at", direction: "DESC" }];
+    default:
+      return [];
+  }
 }
 
 /**
@@ -229,11 +270,17 @@ export class CatalogService {
         q: `%${escapeLike(query.q)}%`,
       });
     const status = query.status ?? "all";
+    const order = eventSortOrder(query.sort);
+    order.forEach((o, i) => {
+      qb.addSelect(o.select, `sort_${i}`);
+      if (i === 0) qb.orderBy(`sort_${i}`, o.direction, o.nulls);
+      else qb.addOrderBy(`sort_${i}`, o.direction, o.nulls);
+    });
+    if (order.length === 0) qb.orderBy("e.strike_date", "DESC", "NULLS LAST");
+    qb.addOrderBy("e.created_at", "DESC").addOrderBy("e.ticker", "ASC");
     // The status is derived from the markets, so a status filter pages over the filtered set in memory.
     if (status === "all") {
       const [rows, total] = await qb
-        .orderBy("e.strike_date", "DESC", "NULLS LAST")
-        .addOrderBy("e.created_at", "DESC")
         .skip((query.page - 1) * query.limit)
         .take(query.limit)
         .getManyAndCount();
@@ -244,10 +291,7 @@ export class CatalogService {
         total,
       };
     }
-    const all = await qb
-      .orderBy("e.strike_date", "DESC", "NULLS LAST")
-      .addOrderBy("e.created_at", "DESC")
-      .getMany();
+    const all = await qb.getMany();
     const shaped = (await this.toApiEvents(all, query.withNestedMarkets)).filter(
       (e) => e.status === status,
     );
@@ -377,6 +421,28 @@ export class CatalogService {
     return this.markets.get(market.marketId);
   }
 
+  // ───────────────────────────────────────────── feed ─────────────────────────────────────────────
+
+  /** `GET /events/:ticker/trades`: the pool trades of every member market, newest first, keyset-paginated. */
+  async eventTrades(tickerRaw: string, opts: { limit: number; cursor: string }): Promise<ApiPage<ApiMarketEvent>> {
+    const ticker = tickerRaw.trim().toUpperCase();
+    const row = await this.dataSource.getRepository(CatalogEventEntity).findOneBy({ ticker });
+    if (!row) throw new ApiError(404, "not_found", `event ${ticker} does not exist`);
+    const members = await this.dataSource
+      .getRepository(MarketEntity)
+      .createQueryBuilder("m")
+      .select(["m.marketId"])
+      .where("m.event_ticker = :ticker", { ticker })
+      .getMany();
+    return this.markets.activity({
+      marketIds: members.map((m) => m.marketId),
+      kinds: TRADE_KINDS,
+      page: 1,
+      limit: opts.limit,
+      cursor: opts.cursor,
+    });
+  }
+
   // ───────────────────────────────────────────── shaping ─────────────────────────────────────────────
 
   private async toApiEvents(
@@ -392,11 +458,13 @@ export class CatalogService {
       .where("s.ticker IN (:...tickers)", { tickers: [...new Set(rows.map((r) => r.seriesTicker))] })
       .getMany();
     const series = new Map(seriesRows.map((s) => [s.ticker, s]));
+    // Likeliest outcome first — what an event page and a card list (Kalshi orders by price).
     const marketRows = await manager
       .getRepository(MarketEntity)
       .createQueryBuilder("m")
       .where("m.event_ticker IN (:...tickers) AND m.archived = false", { tickers })
-      .orderBy("m.market_id", "ASC")
+      .orderBy("m.current_price", "DESC")
+      .addOrderBy("m.market_id", "ASC")
       .getMany();
     const byEvent = new Map<string, MarketEntity[]>();
     for (const m of marketRows) {
@@ -404,25 +472,36 @@ export class CatalogService {
       list.push(m);
       byEvent.set(m.eventTicker, list);
     }
-    const shapedMarkets = withMarkets
-      ? await this.markets.toApiMany(marketRows, false, manager)
-      : [];
+    // One batch of extras for every member: the 24 h volume feeds the event aggregate whether or
+    // not the markets are nested, and shaping reuses it.
+    const extras = await this.markets.extrasFor(marketRows, manager);
     const shapedByEvent = new Map<string, ApiMarket[]>();
-    for (const m of shapedMarkets) {
-      const list = shapedByEvent.get(m.eventTicker) ?? [];
-      list.push(m);
-      shapedByEvent.set(m.eventTicker, list);
-    }
+    if (withMarkets)
+      for (const m of marketRows) {
+        const list = shapedByEvent.get(m.eventTicker) ?? [];
+        list.push(this.markets.toApi(m, false, extras.get(m.marketId)));
+        shapedByEvent.set(m.eventTicker, list);
+      }
+    const nowSec = Math.floor(Date.now() / 1000);
     return rows.map((e) => {
       const members = byEvent.get(e.ticker) ?? [];
-      const phases = members.map((m) => this.markets.phaseOf(m));
+      const phases = members.map((m) => this.markets.phaseOf(m, nowSec));
       const s = series.get(e.seriesTicker);
       let volume = 0n;
+      let volume24h = 0n;
+      let openInterest = 0n;
+      let liquidity = 0;
       let close: number | null = null;
       for (const m of members) {
         volume += m.totalVolumeCC;
+        volume24h += extras.get(m.marketId)?.volume24h ?? 0n;
+        openInterest += m.openInterestYes + m.openInterestNo;
+        const amm = ammStateOf(m);
+        const effectiveL = marketEffectiveL(amm, nowSec);
+        liquidity += effectiveL > 0 ? poolValue(amm.currentPrice, effectiveL) : 0;
         close = close === null ? m.expiresAtSec : Math.max(close, m.expiresAtSec);
       }
+      const top = members[0];
       const api: ApiEvent = {
         ticker: e.ticker,
         seriesTicker: e.seriesTicker,
@@ -442,6 +521,12 @@ export class CatalogService {
         marketCount: members.length,
         volumeCC: formatCC(volume),
         closeTime: close === null ? null : new Date(close * 1000).toISOString(),
+        volume24hCC: formatCC(volume24h),
+        openInterestCC: formatCC(openInterest),
+        liquidityCC: formatCC(numberToDecimal(liquidity)),
+        topMarket: top
+          ? { marketId: top.marketId, ticker: top.ticker, yesSubTitle: top.yesSubTitle, currentPrice: formatCC(top.currentPrice) }
+          : null,
         createdAt: e.createdAt.toISOString(),
         updatedAt: e.updatedAt.toISOString(),
       };

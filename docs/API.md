@@ -215,22 +215,32 @@ interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt
 
 ### Markets (public)
 `:market` is a numeric `marketId` or a ticker (case-insensitive) on every route below (docs/MARKETS.md §2).
-- `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&event=&series=&tickers=A,B&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked; `event` / `series` filter by catalog membership)
+- `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&event=&series=&tickers=A,B&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&withSparkline=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked; `event` / `series` filter by catalog membership; `withSparkline=true` attaches `sparkline: { periodInterval: 60, startTs, closes: Decimal[] }` — the last 24 hourly closes, dense, carried forward — to every market of the page with one extra query)
 - `GET /markets/categories` → `{ category, markets }[]` (series categories through the event; uncategorised series left out)
 - `GET /markets/:market` → `{ market: Market }` (with `createdEventBlob`) | `404 not_found`
 - `GET /markets/:market/activity?kind=&page=&limit=` → `{ items: MarketEvent[], … }` newest first
-- `GET /markets/:market/trades?kind=&page=&limit=` → the `buy sell swap split merge` subset
+- `GET /markets/:market/trades?kind=&page=&limit=&cursor=` → the `buy sell swap split merge` subset; with `cursor=` (empty for the first page, then the previous answer's `nextCursor`) the feed is keyset-paginated (`nextCursor: string | null`, no `total`) — what an activity feed polls
+
+```ts
+// every activity row also carries the trade-feed view (Kalshi GET /markets/trades):
+interface MarketEvent { …; tradeId: string /* = eventId */; ticker: string; action: "buy" | "sell" | "swap" | "split" | "merge" | null;
+  yesPrice: Decimal | null /* priceAfter */; noPrice: Decimal | null /* 1 − yesPrice */; notionalCC: Decimal | null /* amountCC */;
+  takerParty: string /* masked: first 8…last 6 of the party id */; createdAt: string /* effectiveAt */ }
+```
 - `GET /markets/:market/price-history?from=&to=&resolution=raw|1m|5m|15m|1h|4h|1d&limit=` → `{ marketId, resolution, points: PricePoint[] }` oldest first (one point per market version, or the last per bucket; the latest `limit` win)
 - `GET /markets/:market/forecasts` → `{ forecasts: ModelForecast[] }` · `GET /markets/:market/attestations` → `{ attestations: Attestation[] }`
 
 ### Candlesticks (public; docs/MARKETS.md §5)
 - `GET /markets/:market/candlesticks?startTs=&endTs=&periodInterval=1|60|1440` → `Candlesticks` — epoch seconds; `periodInterval` in minutes (default 60); defaults to the last 200 periods ending now; dense (every period from the market's first candle on, quiet periods carried forward with `empty: true`); at most 5 000 candles (`400 validation_failed`)
+- `GET /events/:ticker/candlesticks?startTs=&endTs=&periodInterval=` → `EventCandlesticks` — the same read for every member market of the event at once (every status, busiest by 24 h volume first), one shared window so the series align by construction: the lines of a Kalshi event chart | `404 not_found`
 
 ```ts
 interface Candle { startTs: number; endTs: number;   // [startTs, endTs) epoch seconds
   price: { open; high; low; close; mean: Decimal; previous: Decimal | null };   // mean = volume-weighted post-trade price
   volumeCC: Decimal; trades: number; openInterest: Decimal; liquidityL: Decimal | null; empty: boolean }
 interface Candlesticks { marketId: number; ticker: string; periodInterval: 1 | 60 | 1440; startTs; endTs: number; candlesticks: Candle[] }
+interface EventCandlesticks { eventTicker: string; periodInterval; startTs; endTs: number;
+  markets: { marketId; ticker; yesSubTitle; noSubTitle; status; currentPrice: Decimal; candlesticks: Candle[] }[] }
 ```
 
 ### Quotes and orders (docs/MARKETS.md §6–§7)
@@ -255,8 +265,9 @@ interface PreparedOrder { action; marketId; ticker; actAs: string;              
 ### Catalog (public; docs/MARKETS.md §2–§3)
 - `GET /series?category=&status=active|archived|all&q=&page=&limit=` → `{ items: Series[], … }` (active only by default)
 - `GET /series/:ticker` → `{ series: Series, events: Event[] }` | `404 not_found`
-- `GET /events?series=&status=unopened|open|closed|settled|all&category=&q=&withNestedMarkets=&includeArchived=&page=&limit=` → `{ items: Event[], … }` (status derived from the member markets)
+- `GET /events?series=&status=unopened|open|closed|settled|all&category=&q=&sort=trending|newest|closing|volume&withNestedMarkets=&includeArchived=&page=&limit=` → `{ items: Event[], … }` (status derived from the member markets; `sort` ranks the whole catalog — `trending` = 24 h hourly-candle volume across the members then lifetime volume, `closing` = soonest still-open close time first, `newest` = created, `volume` = lifetime; default by strike date, newest first; nested markets likeliest outcome first)
 - `GET /events/:ticker` → `{ event: Event }` with `markets` nested | `404 not_found`
+- `GET /events/:ticker/trades?limit=&cursor=` → `{ items: MarketEvent[], limit, nextCursor }` — the pool trades of every member market, newest first, keyset-paginated (`cursor` = the previous `nextCursor`) | `404 not_found`
 
 ```ts
 interface Series { ticker; title; category: string; frequency: "one_off" | "daily" | "weekly" | "monthly" | "quarterly" | "annual" | "custom";
@@ -265,7 +276,9 @@ interface Series { ticker; title; category: string; frequency: "one_off" | "dail
 interface Event { ticker; seriesTicker; title; subTitle; category; imageUrl; description: string; mutuallyExclusive: boolean;
   strikeDate: string | null; strikePeriod: string | null; settlementSources: { name; url }[]; productMetadata; archived: boolean;
   status: "unopened" | "open" | "closed" | "settled"; marketCount: number; volumeCC: Decimal; closeTime: string | null;
-  markets?: Market[]; createdAt; updatedAt }
+  volume24hCC: Decimal /* Σ members' last 24 h */; openInterestCC: Decimal /* Σ outstanding shares */; liquidityCC: Decimal /* Σ pool value */;
+  topMarket: { marketId; ticker; yesSubTitle; currentPrice: Decimal } | null /* the likeliest outcome */;
+  markets?: Market[] /* likeliest first */; createdAt; updatedAt }
 ```
 
 ### Exchange (public; docs/MARKETS.md §8)
