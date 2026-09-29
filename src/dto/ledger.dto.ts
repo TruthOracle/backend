@@ -18,8 +18,10 @@ import {
 } from "class-validator";
 
 import {
+  CANDLE_PERIOD_MINUTES,
   MARKET_EVENT_KINDS,
   WALLET_ENTRY_KINDS,
+  type CandlePeriodMinutes,
   type MarketEventKind,
   type WalletEntryKind,
 } from "../types";
@@ -71,6 +73,47 @@ export class MarketsQueryDto extends PageQueryDto {
   @toBool()
   @IsBoolean()
   includeArchived?: boolean;
+
+  /** Members of one event. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/)
+  event?: string;
+
+  /** Members of every event of one series. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/)
+  series?: string;
+
+  /** Comma-separated tickers (at most 50). */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}(,[A-Za-z0-9][A-Za-z0-9._-]{1,63}){0,49}$/)
+  tickers?: string;
+}
+
+/** `GET /markets/:market/candlesticks?startTs=&endTs=&periodInterval=` (epoch seconds; period in minutes: 1, 60, 1440) */
+export class CandlesQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  startTs?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  endTs?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsIn(CANDLE_PERIOD_MINUTES)
+  periodInterval?: CandlePeriodMinutes;
 }
 
 /** `GET /markets/:id/activity?kind=` · `GET /me/activity` · `GET /me/trades` */

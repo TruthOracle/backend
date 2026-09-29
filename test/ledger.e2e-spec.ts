@@ -338,7 +338,9 @@ describe("markets", () => {
     expect(
       bodyOf<{ error: string }>(await ctx.agent.get("/api/v1/markets/999").expect(404)).error,
     ).toBe("not_found");
-    await ctx.agent.get("/api/v1/markets/abc").expect(400);
+    // `:market` is an id or a ticker (docs/MARKETS.md §2): an unknown ticker is a 404, a malformed one too.
+    await ctx.agent.get("/api/v1/markets/abc").expect(404);
+    await ctx.agent.get("/api/v1/markets/not%20a%20ticker").expect(404);
   });
 
   it("derives trades, activity and price history from the ledger effects", async () => {

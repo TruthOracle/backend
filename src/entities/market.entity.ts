@@ -1,6 +1,6 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColumn } from "typeorm";
 
-import type { MarketOutcome, MarketStatus } from "../types";
+import type { CatalogValueSource, MarketOutcome, MarketStatus } from "../types";
 import { bigintNumberTransformer } from "../util/ledger-values";
 import { moneyTransformer } from "../util/money";
 
@@ -33,6 +33,7 @@ export interface StoredProposal {
 @Index("ix_to_markets_status", ["status"])
 @Index("ix_to_markets_category", ["category"])
 @Index("ix_to_markets_expires_at", ["expiresAtSec"])
+@Index("ix_to_markets_event_ticker", ["eventTicker"])
 export class MarketEntity {
   @PrimaryColumn({ name: "market_id", type: "bigint", transformer: bigintNumberTransformer })
   marketId!: number;
@@ -58,6 +59,58 @@ export class MarketEntity {
 
   @Column({ type: "text", default: "" })
   category!: string;
+
+  // ── catalog identity (docs/MARKETS.md §2): the ledger value wins, a catalog assignment fills a None ──
+
+  /** Kalshi-style ticker: on-ledger (`PredictionMarket.ticker`), else catalog-assigned, else `MKT-<marketId>`. */
+  @Index("uq_to_markets_ticker", { unique: true })
+  @Column({ type: "text" })
+  ticker!: string;
+
+  @Column({ name: "ticker_source", type: "text", default: "synthetic" })
+  tickerSource!: CatalogValueSource;
+
+  /** The event this market belongs to (`to_events.ticker`); null until the ledger or an operator says. */
+  @Column({ name: "event_ticker", type: "text", nullable: true })
+  eventTicker!: string | null;
+
+  @Column({ name: "event_ticker_source", type: "text", nullable: true })
+  eventTickerSource!: Exclude<CatalogValueSource, "synthetic"> | null;
+
+  @Column({ name: "yes_sub_title", type: "text", default: "" })
+  yesSubTitle!: string;
+
+  @Column({ name: "no_sub_title", type: "text", default: "" })
+  noSubTitle!: string;
+
+  /** `true` once the ledger fixed the sub titles (an operator may only fill blanks). */
+  @Column({ name: "sub_titles_from_ledger", type: "boolean", default: false })
+  subTitlesFromLedger!: boolean;
+
+  /** Package-id template of the ACTIVE version — what a disclosed contract must name. */
+  @Column({ name: "template_id", type: "text", nullable: true })
+  templateId!: string | null;
+
+  /** Outstanding shares across the market's active positions, maintained by the projection (docs/INDEXER.md §5). */
+  @Column({
+    name: "open_interest_yes",
+    type: "numeric",
+    precision: 38,
+    scale: 10,
+    default: 0,
+    transformer: moneyTransformer,
+  })
+  openInterestYes!: bigint;
+
+  @Column({
+    name: "open_interest_no",
+    type: "numeric",
+    precision: 38,
+    scale: 10,
+    default: 0,
+    transformer: moneyTransformer,
+  })
+  openInterestNo!: bigint;
 
   @Column({ name: "created_at_sec", type: "bigint", transformer: bigintNumberTransformer })
   createdAtSec!: number;

@@ -1,6 +1,8 @@
 import { Injectable } from "@nestjs/common";
-import { DataSource, type SelectQueryBuilder } from "typeorm";
+import { DataSource, type EntityManager, type SelectQueryBuilder } from "typeorm";
 
+import { ammStateOf, numberToDecimal } from "../amm/market-state";
+import { impliedQuoteBook, marketEffectiveL, poolValue } from "../amm/pm-amm";
 import { AttestationEntity } from "../entities/attestation.entity";
 import { LiquidityPositionEntity } from "../entities/liquidity-position.entity";
 import { MarketEventEntity } from "../entities/market-event.entity";
@@ -8,6 +10,7 @@ import { MarketEntity } from "../entities/market.entity";
 import { ModelForecastEntity } from "../entities/model-forecast.entity";
 import { PositionEntity } from "../entities/position.entity";
 import {
+  TICKER_PATTERN,
   TRADE_KINDS,
   type ApiAttestation,
   type ApiLeaderboardEntry,
@@ -34,12 +37,31 @@ export type MarketSort = "newest" | "oldest" | "volume" | "expiry" | "activity";
 export interface MarketListQuery {
   status?: MarketStatusFilter;
   category?: string;
+  /** Members of one event (`to_markets.event_ticker`). */
+  event?: string;
+  /** Members of every event of one series. */
+  series?: string;
+  /** Explicit tickers (upper-cased). */
+  tickers?: string[];
   q?: string;
   sort?: MarketSort;
   includeArchived?: boolean;
   page: number;
   limit: number;
 }
+
+/** Per-market figures the API adds on top of the row (docs/MARKETS.md §3): batch-loaded by `extrasFor`. */
+export interface MarketExtras {
+  seriesTicker: string | null;
+  /** The price 24 h ago (the last hourly close before then), else the market's first price; null without candles. */
+  previousPrice: bigint | null;
+  /** Σ candle volume of the last 24 h. */
+  volume24h: bigint;
+}
+
+const NO_EXTRAS: MarketExtras = { seriesTicker: null, previousPrice: null, volume24h: 0n };
+/** Collateral of the reference buy behind `ApiMarket.book` (one CC — a retail-sized order). */
+const BOOK_REFERENCE_CC = 1;
 
 export interface ActivityQuery {
   kind?: MarketEventKind;
@@ -101,10 +123,22 @@ export class MarketsService {
         qb.andWhere("m.status = :status", { status: query.status });
     }
     if (query.category) qb.andWhere("m.category = :category", { category: query.category });
-    if (query.q)
-      qb.andWhere("(m.question ILIKE :q OR m.description ILIKE :q OR m.category ILIKE :q)", {
-        q: `%${escapeLike(query.q)}%`,
+    if (query.event)
+      qb.andWhere("m.event_ticker = :event", { event: query.event.trim().toUpperCase() });
+    if (query.series)
+      qb.andWhere(
+        "m.event_ticker IN (SELECT e.ticker FROM to_events e WHERE e.series_ticker = :series)",
+        { series: query.series.trim().toUpperCase() },
+      );
+    if (query.tickers && query.tickers.length > 0)
+      qb.andWhere("m.ticker IN (:...tickers)", {
+        tickers: query.tickers.map((t) => t.trim().toUpperCase()),
       });
+    if (query.q)
+      qb.andWhere(
+        "(m.question ILIKE :q OR m.description ILIKE :q OR m.category ILIKE :q OR m.ticker ILIKE :q OR m.event_ticker ILIKE :q)",
+        { q: `%${escapeLike(query.q)}%` },
+      );
     switch (query.sort ?? "newest") {
       case "oldest":
         qb.orderBy("m.market_id", "ASC");
@@ -126,7 +160,7 @@ export class MarketsService {
       .take(query.limit)
       .getManyAndCount();
     return {
-      items: rows.map((m) => this.toApi(m, false)),
+      items: await this.toApiMany(rows, false),
       page: query.page,
       limit: query.limit,
       total,
@@ -140,14 +174,98 @@ export class MarketsService {
     return rows.map((r) => ({ category: r.category, markets: Number(r.markets) }));
   }
 
-  async find(marketId: number): Promise<MarketEntity | null> {
-    return this.dataSource.getRepository(MarketEntity).findOneBy({ marketId });
+  /** By numeric `marketId` or by ticker (case-insensitive) — every `/markets/:market` route accepts both. */
+  async find(ref: number | string): Promise<MarketEntity | null> {
+    const repo = this.dataSource.getRepository(MarketEntity);
+    if (typeof ref === "number") return repo.findOneBy({ marketId: ref });
+    const raw = ref.trim();
+    if (/^\d+$/.test(raw)) return repo.findOneBy({ marketId: Number(raw) });
+    const ticker = raw.toUpperCase();
+    if (!TICKER_PATTERN.test(ticker)) return null;
+    return repo.findOneBy({ ticker });
   }
 
-  async get(marketId: number): Promise<ApiMarket> {
-    const market = await this.find(marketId);
-    if (!market) throw new ApiError(404, "not_found", `market ${marketId} is not indexed`);
-    return this.toApi(market, true);
+  /** `find` or `404 not_found`. */
+  async resolve(ref: number | string): Promise<MarketEntity> {
+    const market = await this.find(ref);
+    if (!market) throw new ApiError(404, "not_found", `market ${String(ref)} is not indexed`);
+    return market;
+  }
+
+  async get(ref: number | string): Promise<ApiMarket> {
+    const market = await this.resolve(ref);
+    return this.toApi(market, true, await this.extrasOf(market));
+  }
+
+  /** Shape many rows with one batch of extras (list, event members). */
+  async toApiMany(
+    rows: MarketEntity[],
+    withBlob: boolean,
+    manager: EntityManager = this.dataSource.manager,
+  ): Promise<ApiMarket[]> {
+    const extras = await this.extrasFor(rows, manager);
+    return rows.map((m) => this.toApi(m, withBlob, extras.get(m.marketId) ?? NO_EXTRAS));
+  }
+
+  async extrasOf(
+    market: MarketEntity,
+    manager: EntityManager = this.dataSource.manager,
+  ): Promise<MarketExtras> {
+    return (await this.extrasFor([market], manager)).get(market.marketId) ?? NO_EXTRAS;
+  }
+
+  /**
+   * Series membership (through the event) and the 24 h figures, from the hourly candles the
+   * projection maintains (docs/MARKETS.md §5) — two set queries however long the list is.
+   */
+  async extrasFor(
+    rows: MarketEntity[],
+    manager: EntityManager = this.dataSource.manager,
+  ): Promise<Map<number, MarketExtras>> {
+    const out = new Map<number, MarketExtras>();
+    if (rows.length === 0) return out;
+    const ids = rows.map((m) => String(m.marketId));
+    const eventTickers = [...new Set(rows.map((m) => m.eventTicker).filter((t): t is string => !!t))];
+    const seriesByEvent = new Map<string, string>();
+    if (eventTickers.length > 0) {
+      const events = await manager.query<{ ticker: string; series_ticker: string }[]>(
+        `SELECT ticker, series_ticker FROM to_events WHERE ticker = ANY($1::text[])`,
+        [eventTickers],
+      );
+      for (const e of events) seriesByEvent.set(e.ticker, e.series_ticker);
+    }
+    const since = new Date(Date.now() - 86_400_000).toISOString();
+    const [volumes, previous, firsts] = await Promise.all([
+      manager.query<{ market_id: string; v: string }[]>(
+        `SELECT market_id, COALESCE(SUM(volume_cc), 0)::text AS v FROM to_market_candles
+          WHERE period_secs = 3600 AND market_id = ANY($1::bigint[]) AND period_start >= $2
+          GROUP BY market_id`,
+        [ids, since],
+      ),
+      manager.query<{ market_id: string; close: string }[]>(
+        `SELECT DISTINCT ON (market_id) market_id, close::text FROM to_market_candles
+          WHERE period_secs = 3600 AND market_id = ANY($1::bigint[]) AND period_start < $2
+          ORDER BY market_id, period_start DESC`,
+        [ids, since],
+      ),
+      manager.query<{ market_id: string; open: string }[]>(
+        `SELECT DISTINCT ON (market_id) market_id, open::text FROM to_market_candles
+          WHERE period_secs = 3600 AND market_id = ANY($1::bigint[])
+          ORDER BY market_id, period_start ASC`,
+        [ids],
+      ),
+    ]);
+    const volumeById = new Map(volumes.map((r) => [Number(r.market_id), parseCC(r.v)]));
+    const prevById = new Map(previous.map((r) => [Number(r.market_id), parseCC(r.close)]));
+    const firstById = new Map(firsts.map((r) => [Number(r.market_id), parseCC(r.open)]));
+    for (const m of rows) {
+      out.set(m.marketId, {
+        seriesTicker: m.eventTicker ? (seriesByEvent.get(m.eventTicker) ?? null) : null,
+        previousPrice: prevById.get(m.marketId) ?? firstById.get(m.marketId) ?? null,
+        volume24h: volumeById.get(m.marketId) ?? 0n,
+      });
+    }
+    return out;
   }
 
   async summaries(marketIds: number[]): Promise<Map<number, ApiMarketSummary>> {
@@ -432,7 +550,13 @@ export class MarketsService {
     return "trading";
   }
 
-  toApi(m: MarketEntity, withBlob: boolean): ApiMarket {
+  toApi(m: MarketEntity, withBlob: boolean, extras: MarketExtras = NO_EXTRAS): ApiMarket {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const phase = this.phaseOf(m, nowSec);
+    const amm = ammStateOf(m);
+    const effectiveL = marketEffectiveL(amm, nowSec);
+    const liquidityCC = effectiveL > 0 ? poolValue(amm.currentPrice, effectiveL) : 0;
+    const book = phase === "trading" ? impliedQuoteBook(amm, nowSec, BOOK_REFERENCE_CC) : null;
     const proposal = m.proposal
       ? {
           proposer: m.proposal.proposer,
@@ -446,7 +570,16 @@ export class MarketsService {
       : null;
     const api: ApiMarket = {
       marketId: m.marketId,
+      ticker: m.ticker,
+      tickerSource: m.tickerSource,
+      eventTicker: m.eventTicker,
+      eventTickerSource: m.eventTickerSource,
+      seriesTicker: extras.seriesTicker,
+      yesSubTitle: m.yesSubTitle,
+      noSubTitle: m.noSubTitle,
+      subTitlesFromLedger: m.subTitlesFromLedger,
       contractId: m.contractId,
+      templateId: m.templateId,
       admin: m.admin,
       question: m.question,
       imageUrl: m.imageUrl,
@@ -483,10 +616,29 @@ export class MarketsService {
         bondCC: m.policy?.bondCC ?? formatCC(0n),
       },
       auditObservers: m.auditObservers ?? [],
-      phase: this.phaseOf(m),
+      phase,
       archived: m.archived,
       tradeCount: m.tradeCount,
       lastTradeAt: m.lastTradeAt ? m.lastTradeAt.toISOString() : null,
+      previousPrice: extras.previousPrice === null ? null : formatCC(extras.previousPrice),
+      priceChange24h:
+        extras.previousPrice === null ? null : formatCC(m.currentPrice - extras.previousPrice),
+      volume24hCC: formatCC(extras.volume24h),
+      openInterest: {
+        yes: formatCC(m.openInterestYes),
+        no: formatCC(m.openInterestNo),
+        total: formatCC(m.openInterestYes + m.openInterestNo),
+      },
+      liquidityCC: formatCC(numberToDecimal(liquidityCC)),
+      book: book
+        ? {
+            yesBid: formatCC(numberToDecimal(book.yesBid)),
+            yesAsk: formatCC(numberToDecimal(book.yesAsk)),
+            noBid: formatCC(numberToDecimal(book.noBid)),
+            noAsk: formatCC(numberToDecimal(book.noAsk)),
+            referenceCC: formatCC(numberToDecimal(BOOK_REFERENCE_CC)),
+          }
+        : null,
       updatedOffset: m.updatedOffset,
       createdOffset: m.createdOffset,
       synchronizerId: m.synchronizerId,
@@ -498,6 +650,10 @@ export class MarketsService {
   toSummary(m: MarketEntity): ApiMarketSummary {
     return {
       marketId: m.marketId,
+      ticker: m.ticker,
+      eventTicker: m.eventTicker,
+      yesSubTitle: m.yesSubTitle,
+      noSubTitle: m.noSubTitle,
       contractId: m.contractId,
       question: m.question,
       imageUrl: m.imageUrl,

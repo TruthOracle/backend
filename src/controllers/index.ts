@@ -15,3 +15,8 @@ export { LedgerController } from "./ledger.controller";
 export { PortfolioController } from "./portfolio.controller";
 export { LedgerWalletController } from "./ledger-wallet.controller";
 export { AdminLedgerController } from "./admin-ledger.controller";
+// market catalog, quotes / orders, exchange status (docs/MARKETS.md)
+export { CatalogController } from "./catalog.controller";
+export { OrdersController } from "./orders.controller";
+export { ExchangeController } from "./exchange.controller";
+export { AdminCatalogController } from "./admin-catalog.controller";

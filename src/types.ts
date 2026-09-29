@@ -42,6 +42,16 @@ export const ERROR_CODES = [
   "kyc_duplicate_identity",
   "kyc_provider_unavailable",
   "webhook_rejected",
+  // markets / orders (docs/MARKETS.md)
+  "trading_halted",
+  "market_not_tradable",
+  "no_in_app_wallet",
+  "no_position",
+  "insufficient_balance",
+  "insufficient_shares",
+  "quote_unavailable",
+  "catalog_conflict",
+  "ledger_value_fixed",
   // generic
   "validation_failed",
   "bad_request",
@@ -172,10 +182,32 @@ export interface KycSessionResult {
   applicantId?: string;
 }
 
+/** `GET /admin/kyc/provider` — the provider's wiring plus a live credential probe; never applicant data. */
+export interface KycProviderHealth {
+  ok: boolean;
+  message: string;
+  /** HTTP status the probe got from the provider (null when unreachable or not probed). */
+  upstreamStatus: number | null;
+  checkedAt: string;
+  details: Record<string, unknown>;
+}
+
+export interface ApiKycProviderStatus {
+  provider: KycProviderName;
+  configured: boolean;
+  levelName: string;
+  enforceWithdrawals: boolean;
+  /** Where the vendor must deliver webhooks (behind the app host's `/__backend` relay). */
+  webhookPath: string;
+  health: KycProviderHealth;
+}
+
 export interface KycProvider {
   readonly name: KycProviderName;
   /** false → `POST /kyc/sessions` answers 503 kyc_provider_unavailable and `GET /kyc.provider` is null. */
   isConfigured(): boolean;
+  /** Live probe of the credentials / reachability for operators (docs/KYC.md §6); must never return applicant data. */
+  healthCheck(): Promise<KycProviderHealth>;
   createSession(
     user: { id: string; email?: string | null },
     applicantId: string | null,
@@ -264,6 +296,13 @@ export const NatsSubjects = {
   transferSeen: "truthoracle.transfer.seen",
   /** The indexer resynced from an ACS snapshot and lost the updates in between: `{ fromOffset, toOffset, reason }`. */
   indexerGap: "truthoracle.indexer.gap",
+  // ── market catalog / exchange (docs/MARKETS.md) ──
+  /** A series or event row changed: `{ kind: "series" | "event" | "market", ticker }`. */
+  catalogChanged: "truthoracle.catalog.changed",
+  /** The operator halted or resumed trading: `{ active, reason }`. */
+  exchangeHaltChanged: "truthoracle.exchange.halt_changed",
+  /** An operator submitted a CreateMarket through the treasury: `{ commandId, ticker, eventTicker }`. */
+  marketCreateSubmitted: "truthoracle.market.create_submitted",
 } as const;
 export type NatsSubject = `truthoracle.${string}`;
 
@@ -308,7 +347,14 @@ export type AuditAction =
   | "kyc.person_transferred"
   | "kyc.webhook_received"
   | "kyc.webhook_replayed"
-  | "ledger.resync";
+  | "ledger.resync"
+  | "catalog.series_created"
+  | "catalog.series_updated"
+  | "catalog.event_created"
+  | "catalog.event_updated"
+  | "catalog.market_updated"
+  | "market.create_submitted"
+  | "exchange.halt_changed";
 
 // ---------------------------------------------------------------------------------------------
 // Wire shapes (docs/API.md) — money is a 10-dp string, timestamps ISO-8601
@@ -576,7 +622,20 @@ export interface ApiProposal {
 
 export interface ApiMarket {
   marketId: number;
+  /** Kalshi-style identifier (docs/MARKETS.md §2): on-ledger, catalog-assigned, or `MKT-<marketId>`. */
+  ticker: string;
+  tickerSource: CatalogValueSource;
+  eventTicker: string | null;
+  eventTickerSource: Exclude<CatalogValueSource, "synthetic"> | null;
+  /** Through the event (catalog); null while the market is not in an event. */
+  seriesTicker: string | null;
+  yesSubTitle: string;
+  noSubTitle: string;
+  /** The contract carries the sub titles (an operator may only fill blanks). */
+  subTitlesFromLedger: boolean;
   contractId: string;
+  /** Package-id template of the active version (what a disclosed contract names); null for rows indexed before MarketCatalog. */
+  templateId: string | null;
   admin: string;
   question: string;
   imageUrl: string;
@@ -611,6 +670,15 @@ export interface ApiMarket {
   archived: boolean;
   tradeCount: number;
   lastTradeAt: string | null;
+  /** Price 24 h ago (else the first price); null without candles. */
+  previousPrice: ApiDecimal | null;
+  priceChange24h: ApiDecimal | null;
+  volume24hCC: ApiDecimal;
+  openInterest: ApiOpenInterest;
+  /** Pool value V(P) at the current effective liquidity — the AMM's "liquidity" figure. */
+  liquidityCC: ApiDecimal;
+  /** Implied one-share bid / ask for a reference-sized order; null unless trading. */
+  book: ApiImpliedBook | null;
   /** Offset of the ledger transaction that produced this version. */
   updatedOffset: number;
   createdOffset: number;
@@ -622,6 +690,10 @@ export interface ApiMarket {
 /** The market fields a portfolio row is enriched with. */
 export interface ApiMarketSummary {
   marketId: number;
+  ticker: string;
+  eventTicker: string | null;
+  yesSubTitle: string;
+  noSubTitle: string;
   contractId: string;
   question: string;
   imageUrl: string;
@@ -866,4 +938,304 @@ export interface ReadinessResponse {
   checks: { postgres: CheckState; redis: CheckState; nats: CheckState };
   /** Present (true) only while the process is shutting down: the load balancer must stop routing here. */
   draining?: true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Market catalog, candles, quotes, orders, exchange status (docs/MARKETS.md; docs/API.md
+// "Catalog", "Candlesticks", "Quotes and orders", "Exchange")
+// ---------------------------------------------------------------------------------------------
+
+/** Tickers are Kalshi-style: upper-case letters, digits, `.`, `_` and `-`, 2–64 chars, starting alphanumeric. */
+export const TICKER_PATTERN = /^[A-Z0-9][A-Z0-9._-]{1,63}$/;
+/** Tickers the indexer synthesises for markets whose ledger contract carries none (`MKT-<marketId>`) — never assignable. */
+export const SYNTHETIC_TICKER_PATTERN = /^MKT-\d+$/;
+export const syntheticTickerFor = (marketId: number): string => `MKT-${marketId}`;
+
+export type SeriesStatus = "active" | "archived";
+export const SERIES_FREQUENCIES = [
+  "one_off",
+  "daily",
+  "weekly",
+  "monthly",
+  "quarterly",
+  "annual",
+  "custom",
+] as const;
+export type SeriesFrequency = (typeof SERIES_FREQUENCIES)[number];
+
+/** Where a market's ticker / event link came from — the ledger value always wins over a catalog assignment. */
+export type CatalogValueSource = "ledger" | "catalog" | "synthetic";
+
+/** Kalshi-style event lifecycle derived from the member markets (docs/MARKETS.md §3). */
+export type EventStatus = "unopened" | "open" | "closed" | "settled";
+export const EVENT_STATUS_FILTERS = ["unopened", "open", "closed", "settled", "all"] as const;
+
+export interface ApiSettlementSource {
+  name: string;
+  url: string;
+}
+
+export interface ApiSeries {
+  ticker: string;
+  title: string;
+  category: string;
+  frequency: SeriesFrequency;
+  tags: string[];
+  settlementSources: ApiSettlementSource[];
+  contractUrl: string | null;
+  description: string;
+  status: SeriesStatus;
+  productMetadata: Record<string, unknown>;
+  eventCount: number;
+  marketCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ApiEvent {
+  ticker: string;
+  seriesTicker: string;
+  title: string;
+  subTitle: string;
+  category: string;
+  imageUrl: string;
+  description: string;
+  /** At most one member market resolves Yes — informational for pm-AMM pools, enforced by the resolver (docs/MARKETS.md §2). */
+  mutuallyExclusive: boolean;
+  strikeDate: string | null;
+  strikePeriod: string | null;
+  settlementSources: ApiSettlementSource[];
+  productMetadata: Record<string, unknown>;
+  archived: boolean;
+  /** Derived from the member markets' phases. */
+  status: EventStatus;
+  marketCount: number;
+  /** Σ `totalVolumeCC` of the member markets. */
+  volumeCC: ApiDecimal;
+  /** Latest `expiresAt` among the member markets; null without markets. */
+  closeTime: string | null;
+  /** Only with `withNestedMarkets=true` (and always on `GET /events/:ticker`). */
+  markets?: ApiMarket[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The implied one-share bid / ask of an AMM pool for a reference-sized order (docs/MARKETS.md §6). */
+export interface ApiImpliedBook {
+  yesBid: ApiDecimal;
+  yesAsk: ApiDecimal;
+  noBid: ApiDecimal;
+  noAsk: ApiDecimal;
+  /** Collateral of the reference buy the book was quoted for. */
+  referenceCC: ApiDecimal;
+}
+
+export interface ApiOpenInterest {
+  yes: ApiDecimal;
+  no: ApiDecimal;
+  total: ApiDecimal;
+}
+
+/** Candle periods, in minutes, as Kalshi names them (`period_interval`): 1, 60, 1440. */
+export const CANDLE_PERIOD_MINUTES = [1, 60, 1440] as const;
+export type CandlePeriodMinutes = (typeof CANDLE_PERIOD_MINUTES)[number];
+export const CANDLE_PERIOD_SECS: readonly number[] = CANDLE_PERIOD_MINUTES.map((m) => m * 60);
+
+export interface ApiCandlePrice {
+  open: ApiDecimal;
+  high: ApiDecimal;
+  low: ApiDecimal;
+  close: ApiDecimal;
+  /** Volume-weighted mean of the post-trade prices in the period; equals `close` without volume. */
+  mean: ApiDecimal;
+  /** Close of the previous period (carried forward), null for the first candle. */
+  previous: ApiDecimal | null;
+}
+
+export interface ApiCandle {
+  /** Epoch seconds; `[startTs, endTs)`. */
+  startTs: number;
+  endTs: number;
+  price: ApiCandlePrice;
+  /** CC traded in the period (Δ `totalVolumeCC`). */
+  volumeCC: ApiDecimal;
+  /** Pool trades (Buy / Sell / SwapShares) in the period. */
+  trades: number;
+  /** Outstanding YES + NO shares at the end of the period. */
+  openInterest: ApiDecimal;
+  liquidityL: ApiDecimal | null;
+  /** No market version landed in this period: the candle is carried forward from the previous close. */
+  empty: boolean;
+}
+
+export interface ApiCandlesticks {
+  marketId: number;
+  ticker: string;
+  periodInterval: CandlePeriodMinutes;
+  startTs: number;
+  endTs: number;
+  candlesticks: ApiCandle[];
+}
+
+export const ORDER_ACTIONS = [
+  "buy",
+  "sell",
+  "swap",
+  "split",
+  "merge",
+  "provide_liquidity",
+  "withdraw_liquidity",
+  "redeem",
+] as const;
+export type OrderAction = (typeof ORDER_ACTIONS)[number];
+/** Actions a quote can be produced for (the others are exact: 1 CC ↔ 1 YES + 1 NO, or a settlement). */
+export const QUOTABLE_ACTIONS: readonly OrderAction[] = ["buy", "sell", "swap", "provide_liquidity"];
+
+export interface ApiQuoteBuy {
+  action: "buy";
+  side: TradeSide;
+  collateralCC: ApiDecimal;
+  feeCC: ApiDecimal;
+  netCC: ApiDecimal;
+  sharesOut: ApiDecimal;
+  avgPrice: ApiDecimal;
+  priceBefore: ApiDecimal;
+  priceAfter: ApiDecimal;
+  priceImpact: ApiDecimal;
+  /** Payout if the side wins: one CC per share. */
+  maxPayoutCC: ApiDecimal;
+}
+export interface ApiQuoteSell {
+  action: "sell";
+  side: TradeSide;
+  sharesIn: ApiDecimal;
+  grossCC: ApiDecimal;
+  feeCC: ApiDecimal;
+  netCC: ApiDecimal;
+  avgPrice: ApiDecimal;
+  priceBefore: ApiDecimal;
+  priceAfter: ApiDecimal;
+  priceImpact: ApiDecimal;
+}
+export interface ApiQuoteSwap {
+  action: "swap";
+  fromSide: TradeSide;
+  sharesIn: ApiDecimal;
+  feeShares: ApiDecimal;
+  sharesOut: ApiDecimal;
+  priceBefore: ApiDecimal;
+  priceAfter: ApiDecimal;
+  priceImpact: ApiDecimal;
+}
+export interface ApiQuoteLiquidity {
+  action: "provide_liquidity";
+  valueIncreaseCC: ApiDecimal;
+  costCC: ApiDecimal;
+  lpMinted: ApiDecimal;
+  poolShare: ApiDecimal;
+  newL: ApiDecimal;
+}
+export type ApiQuoteBody = ApiQuoteBuy | ApiQuoteSell | ApiQuoteSwap | ApiQuoteLiquidity;
+
+/** The slippage-protected bounds the choice argument must carry (docs/MARKETS.md §6). */
+export interface ApiQuoteBounds {
+  slippageBps: number;
+  minSharesOut?: ApiDecimal;
+  minProceedsCC?: ApiDecimal;
+  maxCostCC?: ApiDecimal;
+}
+
+export interface ApiQuote {
+  marketId: number;
+  ticker: string;
+  /** The market version the quote was computed against — a trade must exercise this contract. */
+  contractId: string;
+  updatedOffset: number;
+  /** Epoch seconds the quote assumes (`nowSeconds` of the choice). */
+  nowSeconds: number;
+  phase: MarketPhase;
+  effectiveL: ApiDecimal;
+  quote: ApiQuoteBody;
+  bounds: ApiQuoteBounds;
+}
+
+/** A JSON Ledger API v2 ExerciseCommand the user's wallet signs as-is. */
+export interface ApiExerciseCommand {
+  ExerciseCommand: {
+    templateId: string;
+    contractId: string;
+    choice: string;
+    choiceArgument: Record<string, unknown>;
+  };
+}
+
+export interface ApiDisclosedContract {
+  templateId: string;
+  contractId: string;
+  createdEventBlob: string;
+  synchronizerId: string | null;
+}
+
+/** `POST /markets/:id/orders/prepare` — everything a Cantor8 `signAndExecute` needs (docs/MARKETS.md §7). */
+export interface ApiPreparedOrder {
+  action: OrderAction;
+  marketId: number;
+  ticker: string;
+  /** The party that must sign (the account's primary wallet). */
+  actAs: string;
+  command: ApiExerciseCommand;
+  disclosedContracts: ApiDisclosedContract[];
+  quote: ApiQuote | null;
+  /** Contracts the command consumes / reads, so the client can show what it signs. */
+  inputs: {
+    marketContractId: string;
+    walletContractId: string | null;
+    positionContractId: string | null;
+    lpPositionContractId: string | null;
+  };
+  /** The index offset the inputs were read at; wait on `GET /ledger/wait?offset=` above it after submitting. */
+  ledgerOffset: number;
+  nowSeconds: number;
+  /** The prepared command is only meaningful until then (the choice itself re-checks every rule). */
+  expiresAt: string;
+}
+
+export interface ApiExchangeHalt {
+  active: boolean;
+  reason: string | null;
+  since: string | null;
+  estimatedResumeAt: string | null;
+}
+
+/** `GET /exchange/status` (Kalshi's `exchange_active` / `trading_active`, docs/MARKETS.md §8). */
+export interface ApiExchangeStatus {
+  /** The backend is up and its ledger index is enabled — state changes are being recorded. */
+  exchangeActive: boolean;
+  /** Trading is permitted: no operator halt. Trades are user-signed on-ledger, so this is what the UI and `orders/prepare` honour. */
+  tradingActive: boolean;
+  halt: ApiExchangeHalt;
+  ledger: {
+    indexEnabled: boolean;
+    indexRunning: boolean;
+    offset: number;
+    ledgerEnd: number | null;
+    lag: number | null;
+    lastRecordTime: string | null;
+    lastError: string | null;
+    /** The index has not applied anything for longer than `staleAfterSec`. */
+    stale: boolean;
+  };
+  network: AppNetwork;
+  packageName: string;
+  serverTime: string;
+}
+
+/** `POST /admin/markets` — the operator's request to create an on-ledger market inside an event. */
+export interface ApiCreateMarketResult {
+  commandId: string;
+  status: string;
+  ticker: string;
+  eventTicker: string;
+  /** `MarketCounter.value + 1` at submission — the id the market will carry once indexed. */
+  expectedMarketId: number | null;
 }

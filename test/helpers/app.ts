@@ -169,6 +169,8 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
     get: <T>(token: abstract new (...args: never[]) => T): T => app.get(token),
     reset: async () => {
       await dataSource.query(`TRUNCATE TABLE ${tables} RESTART IDENTITY CASCADE`);
+      // to_settings survives the truncate (boot facts); the operator halt must not leak between specs.
+      await dataSource.query(`DELETE FROM to_settings WHERE key = 'exchange_halt'`);
       await redis.flushDb();
       nats.reset();
       ledger.reset();

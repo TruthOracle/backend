@@ -255,3 +255,52 @@ after a projection fix. The account tables are never touched.
 **Operator resync.** `POST /admin/ledger/resync { reason }` re-snapshots the ACS at the ledger end
 and reconciles activeness (audited as `ledger.resync`). Use it after a manual ledger repair; it is
 not a rebuild.
+
+## 13. Markets: catalog, candles, trading halt (docs/MARKETS.md)
+
+- **Halt trading** (participant maintenance, a market under investigation): `POST /admin/exchange/halt
+  { active: true, reason, estimatedResumeAt? }` with an operator session. The UI shows the reason,
+  disables the trade controls and `orders/prepare` answers `409 trading_halted` (redemptions stay
+  available). Resume with `{ active: false, reason }`. Audited as `exchange.halt_changed`; the
+  state lives in `to_settings.exchange_halt` only while active.
+- **Create a market inside an event**: create the series (`POST /admin/series`) and the event
+  (`POST /admin/events`) once, then `POST /admin/markets { eventTicker, ticker, question, … }`.
+  The route needs the `MarketCounter` indexed (`503 not_ready` otherwise) and a participant
+  running truthoracle-v14 ≥ 1.1.0 (a 1.0.0 package rejects the identity fields as
+  `502 upstream_failed`). The market is readable once the indexer applies the transaction.
+- **Markets created before 1.1.0** carry the synthetic ticker `MKT-<id>`: assign their event,
+  ticker and side labels with `PATCH /admin/markets/:id/catalog`. A field the ledger fixed answers
+  `409 ledger_value_fixed`.
+- **Candles look wrong after a projection fix**: candles and open interest are derived in the
+  indexer's transaction; rebuild the index from scratch (§ "Rebuild from scratch" in
+  docs/INDEXER.md §9) — export the catalog assignments on `to_markets` first if any exist
+  (`SELECT market_id, ticker, event_ticker, yes_sub_title, no_sub_title FROM to_markets WHERE
+  ticker_source = 'catalog' OR event_ticker_source = 'catalog'`) and re-apply them afterwards.
+- **`GET /exchange/status.ledger.stale = true`**: the indexer has not touched its state row for
+  `EXCHANGE_STALE_AFTER_SEC`; check `GET /ledger/status.lastError` and the replica that holds
+  the lock (`running`).
+
+## 14. Sumsub (docs/KYC.md §5–§6)
+
+- **Is the wiring right?** `npm run kyc:check` on the host, or `GET /admin/kyc/provider` with an
+  operator session. `probe OK (HTTP 404)` = app token + signature accepted. `401`: wrong
+  `SUMSUB_APP_TOKEN` / `SUMSUB_SECRET_KEY`, or the host clock is more than a minute off UTC.
+  `403`: the token lacks *View applicants*. `webhookSecretConfigured: false`: every webhook is
+  being answered 401 — set `SUMSUB_WEBHOOK_SECRET` and restart.
+- **Webhooks answer 401 `webhook_rejected`.** Almost always the digest algorithm: the dashboard
+  webhook must use `HMAC_SHA256_HEX` (or `_SHA512_HEX`); Sumsub's default `HMAC_SHA1_HEX` is
+  refused unless `SUMSUB_ALLOW_SHA1=true`. Then the secret, then the URL (the relay forwards
+  `x-payload-digest` / `x-payload-digest-alg` and `api/v1/**` only).
+- **A review landed on Sumsub but the user still shows `pending`.** `SELECT id, type,
+  processed_at, attempts, error FROM to_kyc_webhook_events ORDER BY received_at DESC LIMIT 20`.
+  Unprocessed rows are re-published by the sweep; a row the consumer gave up on can be
+  replayed with `POST /admin/kyc/webhooks/:id/replay { reason }`. No row at all: resend the
+  webhook from the dashboard's webhook manager (idempotent on the body hash).
+- **Approved on Sumsub, `needs_review` here.** The applicant re-read had no identity document
+  the fingerprints accept (`PASSPORT`, `ID_CARD`, `DRIVERS`, `RESIDENCE_PERMIT`), the review is
+  not `completed`, the level differs from `KYC_REQUIRED_LEVEL`, or a sandbox event arrived on
+  mainnet. `GET /admin/kyc/needs-review` lists them; an operator override
+  (`POST /admin/users/:id/kyc/override`) settles it.
+- **Rotating the app token or the webhook secret.** Create the new one in the dashboard, set
+  the env, restart, run `npm run kyc:check`, then delete the old one. Webhooks signed with the
+  old secret during the switch are rejected and can be resent.

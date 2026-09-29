@@ -25,8 +25,8 @@ authority, state or a secret:
 2. **Wallets** — several Canton wallets (Cantor8 today) link to one account. One is the
    **primary** wallet: it owns the on-ledger `UserWallet` (in-app balance). Deposits from
    *any* linked wallet credit that balance, attributed per wallet.
-3. **KYC** — provider-agnostic verification (vendor not yet chosen; a mock adapter for dev and
-   a Sumsub adapter kept as the reference implementation of the provider interface — see docs/KYC.md),
+3. **KYC** — provider-agnostic verification (Sumsub is the production provider, a mock adapter
+   serves dev and tests — see docs/KYC.md),
    attached to the account and to the sign-in identity that started it, enforced at the
    point real CC leaves the platform (external withdrawal settlement). After an approved
    KYC, the verified natural person is bound to exactly one account, permanently, until an
@@ -724,7 +724,9 @@ Codes: `unauthenticated`, `forbidden`, `csrf_rejected`, `rate_limited`, `identit
 `no_primary_wallet`, `primary_wallet_in_use`, `deposit_in_progress`,
 `deposit_attribution_drift`, `payout_not_found`, `payout_blocked` (`details.status` names the
 blocking payout status), `kyc_required`, `kyc_duplicate_identity`, `kyc_provider_unavailable`,
-`webhook_rejected`, `invalid_credential`, `oidc_failed`, `user_suspended`, `validation_failed`,
+`webhook_rejected`, `invalid_credential`, `oidc_failed`, `user_suspended`, `trading_halted`,
+`market_not_tradable`, `no_in_app_wallet`, `no_position`, `insufficient_balance`, `insufficient_shares`,
+`quote_unavailable`, `catalog_conflict`, `ledger_value_fixed` (markets / orders, docs/MARKETS.md), `validation_failed`,
 `bad_request`, `not_found`, `payload_too_large`, `unsupported_media_type`, `upstream_failed`,
 `not_ready`, `internal_error`, `backend_unconfigured` and `backend_unreachable` (proxy only).
 The authoritative list is `ERROR_CODES` in `src/types.ts`; the frontend mirrors it in

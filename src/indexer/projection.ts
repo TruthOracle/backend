@@ -9,6 +9,7 @@
  * between two ledger states (the consumed contract and its successor) or a value the ledger
  * wrote into a choice argument / a child exercise (the UserWallet Debit / Credit amount).
  */
+import { Logger } from "@nestjs/common";
 import type { EntityManager } from "typeorm";
 import type { QueryDeepPartialEntity } from "typeorm/query-builder/QueryPartialEntity";
 
@@ -31,6 +32,9 @@ import { PositionEntity } from "../entities/position.entity";
 import { PredictionModelEntity } from "../entities/prediction-model.entity";
 import { WalletEntryEntity } from "../entities/wallet-entry.entity";
 import {
+  SYNTHETIC_TICKER_PATTERN,
+  syntheticTickerFor,
+  TICKER_PATTERN,
   TRADE_KINDS,
   type MarketEventKind,
   type MarketOutcome,
@@ -53,6 +57,13 @@ import {
   asTextList,
 } from "../util/ledger-values";
 import { formatCC } from "../util/money";
+import {
+  CANDLE_PERIOD_SECS,
+  CANDLE_TRADE_CHOICES,
+  candleUpsert,
+  OPEN_INTEREST_RECOMPUTE_SQL,
+  type CandleContribution,
+} from "./candles";
 import {
   acsEventIdOf,
   buildEventTree,
@@ -192,6 +203,8 @@ function jsonOrNull(value: unknown): never {
 }
 
 export class LedgerProjection {
+  private readonly logger = new Logger(LedgerProjection.name);
+
   constructor(private readonly cfg: ProjectionConfig) {}
 
   /** A TruthOracle event: the deployed package by name, or (when the participant omits the name) one of the package's modules. */
@@ -246,6 +259,9 @@ export class LedgerProjection {
       }
       for (const [marketId, cause] of ctx.marketCauses)
         summary.marketsUpdated.push({ marketId, cause });
+      // 4. candles: every market version of this transaction, with the open interest as it
+      //    stands now that every Position of the transaction is applied (docs/MARKETS.md §5)
+      await this.flushCandles(ctx);
     }
 
     if (this.cfg.trackTransfers) {
@@ -364,6 +380,11 @@ export class LedgerProjection {
   ): Promise<{ inserted: number; archived: number }> {
     let inserted = 0;
     const seen = new Set<string>();
+    const seeds: CandleContribution[] = [];
+    // A snapshot entry normally carries the contract's ledger time; one that does not is dated at
+    // the snapshot itself, never at the epoch: a candle seeded there would drag a flat line across
+    // decades of empty periods.
+    const snapshotTime = new Date();
     for (const entry of entries) {
       const e = entry.created;
       if (!this.isOurs(e)) continue;
@@ -395,7 +416,7 @@ export class LedgerProjection {
           parentNodeId: null,
           rootNodeId: null,
           lastDescendantNodeId: null,
-          effectiveAt: e.createdAt ?? new Date(0),
+          effectiveAt: e.createdAt ?? snapshotTime,
           recordTime: null,
           commandId: null,
           workflowId: null,
@@ -408,7 +429,7 @@ export class LedgerProjection {
       const pseudoTx: LedgerTransaction = {
         updateId: "acs",
         offset: e.offset,
-        effectiveAt: e.createdAt ?? new Date(0),
+        effectiveAt: e.createdAt ?? snapshotTime,
         recordTime: null,
         commandId: null,
         workflowId: null,
@@ -417,6 +438,7 @@ export class LedgerProjection {
       };
       const ctx = new TxContext(manager, pseudoTx);
       await this.applyCreated(ctx, e, null, acsEventIdOf(e.contractId));
+      seeds.push(...ctx.marketVersions);
     }
 
     let archived = 0;
@@ -458,7 +480,107 @@ export class LedgerProjection {
       ];
       for (const statement of statements) archived += (await statement.execute()).affected ?? 0;
     }
+    // Snapshot rows carry no history: open interest is recomputed from the active positions and
+    // every market gets one candle at its snapshot price, so a chart starts where the index does.
+    await manager.query(OPEN_INTEREST_RECOMPUTE_SQL);
+    const oiCache = new Map<number, bigint>();
+    for (const seed of seeds) {
+      seed.openInterest = await this.openInterestOf(manager, seed.marketId, oiCache);
+      for (const period of CANDLE_PERIOD_SECS) {
+        const { sql, params } = candleUpsert(seed, period);
+        await manager.query(sql, params);
+      }
+    }
     return { inserted, archived };
+  }
+
+  /** Step 4 of a transaction: fold the market versions into their candles (docs/MARKETS.md §5). */
+  private async flushCandles(ctx: TxContext): Promise<void> {
+    if (ctx.marketVersions.length === 0) return;
+    const oiCache = new Map<number, bigint>();
+    for (const version of ctx.marketVersions) {
+      version.openInterest = await this.openInterestOf(ctx.manager, version.marketId, oiCache);
+      for (const period of CANDLE_PERIOD_SECS) {
+        const { sql, params } = candleUpsert(version, period);
+        await ctx.manager.query(sql, params);
+      }
+    }
+  }
+
+  private async openInterestOf(
+    manager: EntityManager,
+    marketId: number,
+    cache: Map<number, bigint>,
+  ): Promise<bigint> {
+    const hit = cache.get(marketId);
+    if (hit !== undefined) return hit;
+    const rows = await manager.query<{ yes: string; no: string }[]>(
+      `SELECT open_interest_yes::text AS yes, open_interest_no::text AS no FROM to_markets WHERE market_id = $1`,
+      [String(marketId)],
+    );
+    const oi = rows.length > 0 ? asDecimal(rows[0].yes) + asDecimal(rows[0].no) : 0n;
+    cache.set(marketId, oi);
+    return oi;
+  }
+
+  /**
+   * The ledger fixes a market's catalog identity when the contract carries it (truthoracle-v14
+   * ≥ 1.1.0: `ticker`, `eventTicker`, the sub titles); an operator may only fill what the ledger
+   * left None (docs/MARKETS.md §2). A ledger ticker that collides with another market's keeps
+   * the synthetic one and is logged — the index never fails over catalog data.
+   */
+  private async applyLedgerCatalogFields(
+    m: EntityManager,
+    marketId: number,
+    fields: {
+      ticker: string | null;
+      eventTicker: string | null;
+      yesSubTitle: string | null;
+      noSubTitle: string | null;
+    },
+  ): Promise<void> {
+    if (fields.ticker) {
+      const ticker = fields.ticker.trim().toUpperCase();
+      if (TICKER_PATTERN.test(ticker) && !SYNTHETIC_TICKER_PATTERN.test(ticker)) {
+        const res = await m.query<unknown[]>(
+          `UPDATE to_markets SET ticker = $1, ticker_source = 'ledger'
+             WHERE market_id = $2 AND ticker <> $1
+               AND NOT EXISTS (SELECT 1 FROM to_markets o WHERE o.ticker = $1 AND o.market_id <> $2)
+           RETURNING market_id`,
+          [ticker, String(marketId)],
+        );
+        if (res.length === 0) {
+          const taken = await m.query<{ market_id: string }[]>(
+            `SELECT market_id FROM to_markets WHERE ticker = $1 AND market_id <> $2`,
+            [ticker, String(marketId)],
+          );
+          if (taken.length > 0) {
+            this.logger.warn(
+              `market ${marketId}: on-ledger ticker ${ticker} is already used by market ${taken[0].market_id}; keeping the current ticker`,
+            );
+          }
+        }
+      } else {
+        this.logger.warn(`market ${marketId}: on-ledger ticker "${fields.ticker}" is not a valid ticker; ignored`);
+      }
+    }
+    if (fields.eventTicker) {
+      const eventTicker = fields.eventTicker.trim().toUpperCase();
+      if (TICKER_PATTERN.test(eventTicker)) {
+        await m.query(
+          `UPDATE to_markets SET event_ticker = $1, event_ticker_source = 'ledger' WHERE market_id = $2`,
+          [eventTicker, String(marketId)],
+        );
+      } else {
+        this.logger.warn(`market ${marketId}: on-ledger eventTicker "${fields.eventTicker}" is not a valid ticker; ignored`);
+      }
+    }
+    if (fields.yesSubTitle !== null || fields.noSubTitle !== null) {
+      await m.query(
+        `UPDATE to_markets SET yes_sub_title = $1, no_sub_title = $2, sub_titles_from_ledger = true WHERE market_id = $3`,
+        [fields.yesSubTitle ?? "", fields.noSubTitle ?? "", String(marketId)],
+      );
+    }
   }
 
   // ───────────────────────────────────────────── creates ─────────────────────────────────────────────
@@ -487,9 +609,25 @@ export class LedgerProjection {
       case "Truthoracle:PredictionMarket": {
         const marketId = asInt(p.marketId);
         const cause = node ? nearestChoice(node) : null;
+        const predecessorCid = node ? nearestMarketExerciseCid(node) : null;
+        const before = predecessorCid ? await ctx.payloadOf(predecessorCid) : null;
         const row: Partial<MarketEntity> = {
           marketId,
           contractId: e.contractId,
+          templateId: e.templateId,
+          // catalog identity: written on the FIRST version only (excluded from the overwrite
+          // list below); the ledger's own values are applied right after, when present
+          ticker: syntheticTickerFor(marketId),
+          tickerSource: "synthetic",
+          eventTicker: null,
+          eventTickerSource: null,
+          yesSubTitle: "",
+          noSubTitle: "",
+          subTitlesFromLedger: false,
+          // open interest is maintained per Position event (bumpOpenInterest); a successor
+          // version must not reset it, so both columns are excluded from the overwrite list too
+          openInterestYes: 0n,
+          openInterestNo: 0n,
           admin: asText(p.admin),
           question: asText(p.question),
           imageUrl: asText(p.imageUrl),
@@ -526,10 +664,27 @@ export class LedgerProjection {
           archived: false,
           archivedOffset: null,
         };
-        // Every column but the identity and the first-version facts is overwritten by a successor.
+        // Every column but the identity, the first-version facts and the catalog columns (which
+        // the ledger or an operator own — see applyLedgerCatalogFields) is overwritten by a successor.
         const meta = m.connection.getMetadata(MarketEntity);
         const overwrite = Object.keys(row)
-          .filter((k) => !["marketId", "createdOffset", "createdAtLedger"].includes(k))
+          .filter(
+            (k) =>
+              ![
+                "marketId",
+                "createdOffset",
+                "createdAtLedger",
+                "ticker",
+                "tickerSource",
+                "eventTicker",
+                "eventTickerSource",
+                "yesSubTitle",
+                "noSubTitle",
+                "subTitlesFromLedger",
+                "openInterestYes",
+                "openInterestNo",
+              ].includes(k),
+          )
           .map((k) => meta.findColumnWithPropertyName(k)?.databaseName ?? k);
         await m
           .createQueryBuilder()
@@ -565,12 +720,36 @@ export class LedgerProjection {
           })
           .orIgnore()
           .execute();
+        await this.applyLedgerCatalogFields(m, marketId, {
+          ticker: asOptionalText(p.ticker),
+          eventTicker: asOptionalText(p.eventTicker),
+          yesSubTitle: asOptionalText(p.yesSubTitle),
+          noSubTitle: asOptionalText(p.noSubTitle),
+        });
+        const atLedger = e.createdAt ?? ctx.tx.effectiveAt;
+        ctx.marketVersions.push({
+          marketId,
+          atSec: Math.floor(atLedger.getTime() / 1000),
+          price: row.currentPrice ?? 0n,
+          liquidityL: row.liquidityL ?? 0n,
+          // A snapshot entry (node === null) is a state, not a trade: its lifetime volume must
+          // not land in one candle. A first version created by CreateMarket has volume 0 anyway.
+          volumeDelta: !node
+            ? 0n
+            : before
+              ? (row.totalVolumeCC ?? 0n) - asDecimal(before.totalVolumeCC)
+              : (row.totalVolumeCC ?? 0n),
+          trades: node && cause && CANDLE_TRADE_CHOICES.has(cause) ? 1 : 0,
+          openInterest: 0n,
+          offset: ctx.tx.offset,
+          nodeId: e.nodeId,
+        });
         ctx.createdMarketIds.add(marketId);
         ctx.marketCauses.set(marketId, cause);
         return;
       }
-      case "Truthoracle:Position":
-        await m
+      case "Truthoracle:Position": {
+        const res = await m
           .createQueryBuilder()
           .insert()
           .into(PositionEntity)
@@ -587,8 +766,12 @@ export class LedgerProjection {
             ...common,
           })
           .orIgnore()
+          .returning("contract_id")
           .execute();
+        if ((res.raw as unknown[]).length > 0)
+          await bumpOpenInterest(m, asInt(p.marketId), asDecimal(p.yesShares), asDecimal(p.noShares));
         return;
+      }
       case "Truthoracle:LiquidityPosition":
         await m
           .createQueryBuilder()
@@ -760,14 +943,25 @@ export class LedgerProjection {
         if (marketId !== null) ctx.consumedMarkets.set(e.contractId, marketId);
         return;
       }
-      case "Truthoracle:Position":
-        await m
+      case "Truthoracle:Position": {
+        const res = await m
           .createQueryBuilder()
           .update(PositionEntity)
           .set(archive)
           .where("contract_id = :cid AND active = true", { cid: e.contractId })
           .execute();
+        if ((res.affected ?? 0) > 0) {
+          const before = await ctx.payloadOf(e.contractId);
+          if (before)
+            await bumpOpenInterest(
+              m,
+              asInt(before.marketId),
+              -asDecimal(before.yesShares),
+              -asDecimal(before.noShares),
+            );
+        }
         return;
+      }
       case "Truthoracle:LiquidityPosition":
         await m
           .createQueryBuilder()
@@ -1212,6 +1406,8 @@ class TxContext {
   readonly marketCauses = new Map<number, string | null>();
   readonly createdPayouts: string[] = [];
   readonly settledPayouts: string[] = [];
+  /** Market versions created in this transaction, folded into the candles once every Position is applied. */
+  readonly marketVersions: CandleContribution[] = [];
   private readonly payloadCache = new Map<string, Record<string, unknown> | null>();
 
   constructor(
@@ -1269,6 +1465,35 @@ function exercisedUnder(
         e.entity === entity &&
         (choice === undefined || e.choice === choice),
     );
+}
+
+/** The contract id of the nearest consuming PredictionMarket exercise above a market version — its predecessor. */
+function nearestMarketExerciseCid(node: EventNode): string | null {
+  let p = node.parent;
+  while (p) {
+    const ev = p.event;
+    if (ev.kind === "exercised") {
+      return ev.module === "Truthoracle" && ev.entity === "PredictionMarket" && ev.consuming
+        ? ev.contractId
+        : null;
+    }
+    p = p.parent;
+  }
+  return null;
+}
+
+/** `to_markets.open_interest_*` += (yes, no) — the market row may not exist yet (a Position indexed before its market on a resync); then the recompute after the snapshot settles it. */
+async function bumpOpenInterest(
+  manager: EntityManager,
+  marketId: number,
+  yes: bigint,
+  no: bigint,
+): Promise<void> {
+  if (yes === 0n && no === 0n) return;
+  await manager.query(
+    `UPDATE to_markets SET open_interest_yes = open_interest_yes + $1, open_interest_no = open_interest_no + $2 WHERE market_id = $3`,
+    [formatCC(yes), formatCC(no), String(marketId)],
+  );
 }
 
 /** The choice of the nearest exercised ancestor (what caused this create), or null for a top-level create. */

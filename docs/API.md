@@ -148,6 +148,7 @@ credits a `UserWallet` presupposes one exists — i.e. an account that deposited
 - `POST /admin/users/:id/kyc/override` `{ status: "approved" | "rejected_final" | "expired", reason }` → `{ verification }` | `409 kyc_duplicate_identity`
 - `GET /admin/kyc/duplicates` · `GET /admin/kyc/needs-review` → `{ items: (KycVerification & { userId })[] }`
 - `POST /admin/kyc/persons/:fingerprint/transfer` `{ toUserId, reason }` → `{ ok: true }`
+- `GET /admin/kyc/provider` → `{ provider: "mock" | "sumsub", configured: boolean, levelName, enforceWithdrawals: boolean, webhookPath, health: { ok, message, upstreamStatus: number | null, checkedAt, details } }` — a live credential probe of the KYC provider (docs/KYC.md §6); never applicant data
 - `GET /admin/payouts?status=` → `{ items: Payout[] }`
 - `POST /admin/payouts/:cid/settle` `{ force?: boolean, reason }` → `{ payout, mode }`
 - `GET /admin/audit?subjectType=&subjectId=&actorUserId=&page=` → `{ items: AuditEvent[], page, limit, total }`
@@ -173,17 +174,22 @@ type MarketEventKind = "market_created" | "buy" | "sell" | "swap" | "split" | "m
   "resolve_t0" | "resolve" | "propose" | "challenge" | "finalize" | "void" | "redeem" | "commit_forecast" | "score_and_distribute" | "archive";
 
 interface Market {
-  marketId: number; contractId: string; admin: string; question; imageUrl; description; resolutionDescription; category: string;
+  marketId: number; ticker: string; tickerSource: "ledger" | "catalog" | "synthetic"; eventTicker: string | null; eventTickerSource: "ledger" | "catalog" | null;
+  seriesTicker: string | null; yesSubTitle; noSubTitle: string; subTitlesFromLedger: boolean;   // catalog identity (docs/MARKETS.md §2)
+  contractId: string; templateId: string | null; admin: string; question; imageUrl; description; resolutionDescription; category: string;
   createdAt; expiresAt; tradingStartsAt: string; gracePeriodSecs; liquidityPeriodSecs: number; isDynamic: boolean;
   reserveYes; reserveNo; liquidityL; lpTokenSupply; currentPrice: Decimal; feeBps; prizeFeeShareBps: number;
   accumulatedFeesCC; prizePoolCC; totalVolumeCC: Decimal; status: MarketStatus; outcome: Outcome | null; resolvedAt: string | null;
   proposal: { proposer; proposedOutcome: Outcome; proposedAt; bondCC; challenger: string | null; challengerOutcome: Outcome | null; challengeEndsAt } | null;
   policy: { operatorResolution: boolean; sources: string[]; sourceKeys: { sourceUri; publicKey }[]; reporters: string[]; quorum; challengeSecs: number; bondCC: Decimal };
   auditObservers: string[]; phase: Phase; archived: boolean; tradeCount: number; lastTradeAt: string | null;
+  previousPrice: Decimal | null; priceChange24h: Decimal | null; volume24hCC: Decimal;   // from the hourly candles
+  openInterest: { yes; no; total: Decimal }; liquidityCC: Decimal;                        // outstanding shares; pool value V(P)
+  book: { yesBid; yesAsk; noBid; noAsk; referenceCC: Decimal } | null;                    // AMM-implied for a 1 CC order, trading only
   updatedOffset; createdOffset: number; synchronizerId: string | null;
   createdEventBlob?: string | null;        // GET /markets/:id only — the disclosed contract a user-signed trade needs
 }
-interface MarketSummary { marketId; contractId; question; imageUrl; category; status; outcome; currentPrice; expiresAt; resolvedAt; phase; archived }
+interface MarketSummary { marketId; ticker; eventTicker; yesSubTitle; noSubTitle; contractId; question; imageUrl; category; status; outcome; currentPrice; expiresAt; resolvedAt; phase; archived }
 interface MarketEvent {
   id: string; eventId: string; marketId: number; kind: MarketEventKind; actor: string; side: "Yes" | "No" | null;
   amountCC; netCC; shares; sharesOut; feeCC; priceBefore; priceAfter; lpTokens: Decimal | null; outcome: Outcome | null;
@@ -206,13 +212,62 @@ interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt
 ```
 
 ### Markets (public)
-- `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked)
+`:market` is a numeric `marketId` or a ticker (case-insensitive) on every route below (docs/MARKETS.md §2).
+- `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&event=&series=&tickers=A,B&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked; `event` / `series` filter by catalog membership)
 - `GET /markets/categories` → `{ category, markets }[]`
-- `GET /markets/:marketId` → `{ market: Market }` (with `createdEventBlob`) | `404 not_found`
-- `GET /markets/:marketId/activity?kind=&page=&limit=` → `{ items: MarketEvent[], … }` newest first
-- `GET /markets/:marketId/trades?kind=&page=&limit=` → the `buy sell swap split merge` subset
-- `GET /markets/:marketId/price-history?from=&to=&resolution=raw|1m|5m|15m|1h|4h|1d&limit=` → `{ marketId, resolution, points: PricePoint[] }` oldest first (one point per market version, or the last per bucket; the latest `limit` win)
-- `GET /markets/:marketId/forecasts` → `{ forecasts: ModelForecast[] }` · `GET /markets/:marketId/attestations` → `{ attestations: Attestation[] }`
+- `GET /markets/:market` → `{ market: Market }` (with `createdEventBlob`) | `404 not_found`
+- `GET /markets/:market/activity?kind=&page=&limit=` → `{ items: MarketEvent[], … }` newest first
+- `GET /markets/:market/trades?kind=&page=&limit=` → the `buy sell swap split merge` subset
+- `GET /markets/:market/price-history?from=&to=&resolution=raw|1m|5m|15m|1h|4h|1d&limit=` → `{ marketId, resolution, points: PricePoint[] }` oldest first (one point per market version, or the last per bucket; the latest `limit` win)
+- `GET /markets/:market/forecasts` → `{ forecasts: ModelForecast[] }` · `GET /markets/:market/attestations` → `{ attestations: Attestation[] }`
+
+### Candlesticks (public; docs/MARKETS.md §5)
+- `GET /markets/:market/candlesticks?startTs=&endTs=&periodInterval=1|60|1440` → `Candlesticks` — epoch seconds; `periodInterval` in minutes (default 60); defaults to the last 200 periods ending now; dense (every period from the market's first candle on, quiet periods carried forward with `empty: true`); at most 5 000 candles (`400 validation_failed`)
+
+```ts
+interface Candle { startTs: number; endTs: number;   // [startTs, endTs) epoch seconds
+  price: { open; high; low; close; mean: Decimal; previous: Decimal | null };   // mean = volume-weighted post-trade price
+  volumeCC: Decimal; trades: number; openInterest: Decimal; liquidityL: Decimal | null; empty: boolean }
+interface Candlesticks { marketId: number; ticker: string; periodInterval: 1 | 60 | 1440; startTs; endTs: number; candlesticks: Candle[] }
+```
+
+### Quotes and orders (docs/MARKETS.md §6–§7)
+- `GET /markets/:market/quote?action=buy|sell|swap|provide_liquidity&side=Yes|No&amountCC=&shares=&slippageBps=` (public) → `Quote` | `409 market_not_tradable` (`details.phase`) | `409 quote_unavailable` | `400 validation_failed` — `amountCC` for buy / provide_liquidity, `shares` for sell / swap; slippage 0..2000 bps (default 100)
+- `POST /markets/:market/orders/prepare` (user session) `{ action: buy|sell|swap|split|merge|provide_liquidity|withdraw_liquidity|redeem, side?, amountCC?, shares?, lpTokens?, slippageBps? }` → `PreparedOrder` | `409 no_primary_wallet` | `409 no_in_app_wallet` | `409 no_position` | `409 insufficient_balance` (`details.balanceCC`, `details.requiredCC`) | `409 insufficient_shares` (`details.heldShares`, `details.requestedShares`) | `409 market_not_tradable` | `409 trading_halted` (`details.estimatedResumeAt`; never for `redeem`) | `409 quote_unavailable`
+
+```ts
+interface Quote { marketId; ticker; contractId; updatedOffset; nowSeconds: number; phase: Phase; effectiveL: Decimal;
+  quote: QuoteBuy | QuoteSell | QuoteSwap | QuoteLiquidity;
+  bounds: { slippageBps: number; minSharesOut?: Decimal; minProceedsCC?: Decimal; maxCostCC?: Decimal } }
+interface QuoteBuy { action: "buy"; side; collateralCC; feeCC; netCC; sharesOut; avgPrice; priceBefore; priceAfter; priceImpact; maxPayoutCC: Decimal }
+interface QuoteSell { action: "sell"; side; sharesIn; grossCC; feeCC; netCC; avgPrice; priceBefore; priceAfter; priceImpact: Decimal }
+interface QuoteSwap { action: "swap"; fromSide; sharesIn; feeShares; sharesOut; priceBefore; priceAfter; priceImpact: Decimal }
+interface QuoteLiquidity { action: "provide_liquidity"; valueIncreaseCC; costCC; lpMinted; poolShare; newL: Decimal }
+interface PreparedOrder { action; marketId; ticker; actAs: string;                       // the account's primary party signs
+  command: { ExerciseCommand: { templateId; contractId; choice; choiceArgument } };      // JSON Ledger API v2, sign as-is
+  disclosedContracts: { templateId; contractId; createdEventBlob; synchronizerId }[];   // the market version
+  quote: Quote | null; inputs: { marketContractId; walletContractId; positionContractId; lpPositionContractId: string | null };
+  ledgerOffset: number; nowSeconds: number; expiresAt: string }
+```
+
+### Catalog (public; docs/MARKETS.md §2–§3)
+- `GET /series?category=&status=active|archived|all&q=&page=&limit=` → `{ items: Series[], … }` (active only by default)
+- `GET /series/:ticker` → `{ series: Series, events: Event[] }` | `404 not_found`
+- `GET /events?series=&status=unopened|open|closed|settled|all&category=&q=&withNestedMarkets=&includeArchived=&page=&limit=` → `{ items: Event[], … }` (status derived from the member markets)
+- `GET /events/:ticker` → `{ event: Event }` with `markets` nested | `404 not_found`
+
+```ts
+interface Series { ticker; title; category: string; frequency: "one_off" | "daily" | "weekly" | "monthly" | "quarterly" | "annual" | "custom";
+  tags: string[]; settlementSources: { name; url }[]; contractUrl: string | null; description: string; status: "active" | "archived";
+  productMetadata: Record<string, unknown>; eventCount; marketCount: number; createdAt; updatedAt }
+interface Event { ticker; seriesTicker; title; subTitle; category; imageUrl; description: string; mutuallyExclusive: boolean;
+  strikeDate: string | null; strikePeriod: string | null; settlementSources: { name; url }[]; productMetadata; archived: boolean;
+  status: "unopened" | "open" | "closed" | "settled"; marketCount: number; volumeCC: Decimal; closeTime: string | null;
+  markets?: Market[]; createdAt; updatedAt }
+```
+
+### Exchange (public; docs/MARKETS.md §8)
+- `GET /exchange/status` → `{ exchangeActive, tradingActive: boolean, halt: { active, reason, since, estimatedResumeAt }, ledger: { indexEnabled, indexRunning, offset, ledgerEnd, lag, lastRecordTime, lastError, stale }, network, packageName, serverTime }`
 
 ### Ledger (public)
 - `GET /ledger/status` → `LedgerStatus`
@@ -237,3 +292,13 @@ The account's parties = the primary party + every active linked wallet.
 - `GET /admin/ledger/events?updateId=&contractId=&marketId=&entity=&choice=&fromOffset=&page=` → raw created / exercised events (`{ id, eventId, offset, nodeId, updateId, kind, template, contractId, choice, consuming, actingParties, payload, result, parentNodeId, effectiveAt, commandId }`)
 - `GET /admin/ledger/wallets?owner=` · `GET /admin/ledger/payouts?active=&user=` · `GET /admin/ledger/transfers?direction=&counterparty=`
 - `GET /admin/ledger/markets/:marketId/positions` · `/liquidity` → holders / providers, largest first
+
+### Admin — catalog and exchange (admin session; docs/MARKETS.md §2–§4, §8)
+`reason` is optional on the catalog routes (presentational data) and recorded on the audit row when given.
+- `POST /admin/series` `{ ticker, title, category?, frequency?, tags?, settlementSources?, contractUrl?, description?, productMetadata?, reason? }` → `{ series }` | `409 catalog_conflict`
+- `PATCH /admin/series/:ticker` `{ …any of the above, status?: active | archived }` → `{ series }`
+- `POST /admin/events` `{ ticker, seriesTicker, title, subTitle?, imageUrl?, description?, mutuallyExclusive?, strikeDate?, strikePeriod?, settlementSources?, productMetadata?, reason? }` → `{ event }` | `404 not_found` (series) | `409 catalog_conflict`
+- `PATCH /admin/events/:ticker` `{ …, archived? }` → `{ event }`
+- `PATCH /admin/markets/:marketId/catalog` `{ ticker?, eventTicker?: string | null, yesSubTitle?, noSubTitle?, reason? }` → `{ market }` | `409 ledger_value_fixed` (`details.field`) | `409 catalog_conflict` | `404 not_found`
+- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, category?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id)
+- `POST /admin/exchange/halt` `{ active: boolean, reason, estimatedResumeAt? }` → `{ halt }`

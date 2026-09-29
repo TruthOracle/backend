@@ -167,8 +167,27 @@ export class LedgerFixture {
     prizeFeeShareBps?: number;
     category?: string;
     policy?: Partial<Payload>;
+    /** truthoracle-v14 ≥ 1.1.0 catalog fields (Optional Text; absent = a 1.0.0 contract). */
+    ticker?: string | null;
+    eventTicker?: string | null;
+    yesSubTitle?: string | null;
+    noSubTitle?: string | null;
+    isDynamic?: boolean;
+    liquidityL?: string;
   }): Payload {
     const createdAt = input.createdAt ?? 1_760_000_000;
+    const catalog: Payload =
+      input.ticker !== undefined ||
+      input.eventTicker !== undefined ||
+      input.yesSubTitle !== undefined ||
+      input.noSubTitle !== undefined
+        ? {
+            ticker: input.ticker ?? null,
+            eventTicker: input.eventTicker ?? null,
+            yesSubTitle: input.yesSubTitle ?? null,
+            noSubTitle: input.noSubTitle ?? null,
+          }
+        : {};
     return {
       admin: this.admin,
       marketId: String(input.marketId),
@@ -180,12 +199,12 @@ export class LedgerFixture {
       createdAt: String(createdAt),
       expiresAt: String(input.expiresAt ?? createdAt + 7 * 86_400),
       gracePeriodSecs: "86400",
-      isDynamic: false,
+      isDynamic: input.isDynamic ?? false,
       liquidityPeriodSecs: String(input.liquidityPeriodSecs ?? 0),
       reserveYes: dec("100"),
       reserveNo: dec("100"),
-      liquidityL: dec("250.66"),
-      lpTokenSupply: dec("250.66"),
+      liquidityL: dec(input.liquidityL ?? "250.66"),
+      lpTokenSupply: dec(input.liquidityL ?? "250.66"),
       currentPrice: dec(input.price ?? "0.5"),
       feeBps: String(input.feeBps ?? 100),
       prizeFeeShareBps: String(input.prizeFeeShareBps ?? 1000),
@@ -207,6 +226,7 @@ export class LedgerFixture {
         ...(input.policy ?? {}),
       },
       auditObservers: [],
+      ...catalog,
     };
   }
 
@@ -222,6 +242,14 @@ export class LedgerFixture {
     feeBps?: number;
     category?: string;
     policy?: Partial<Payload>;
+    ticker?: string | null;
+    eventTicker?: string | null;
+    yesSubTitle?: string | null;
+    noSubTitle?: string | null;
+    isDynamic?: boolean;
+    liquidityL?: string;
+    /** Ledger time of the creating transaction. */
+    at?: Date;
   }): { tx: LedgerTransaction; market: MarketFixtureState; counterCid: string; lpCid: string } {
     const payload = this.marketPayload(input);
     const marketCid = this.cid("mk");
@@ -248,6 +276,14 @@ export class LedgerFixture {
         prizeFeeShareBps: payload.prizeFeeShareBps,
         policy: payload.policy,
         auditObservers: [],
+        ...(input.ticker !== undefined || input.eventTicker !== undefined
+          ? {
+              ticker: payload.ticker,
+              eventTicker: payload.eventTicker,
+              yesSubTitle: payload.yesSubTitle,
+              noSubTitle: payload.noSubTitle,
+            }
+          : {}),
       },
       { children: 3, result: { _1: counterCid, _2: marketCid, _3: lpCid } },
     );
@@ -271,6 +307,7 @@ export class LedgerFixture {
     );
     const tx = this.tx([root, counter, market, lp], {
       commandId: `create-market-${input.marketId}`,
+      at: input.at,
     });
     return { tx, market: { cid: marketCid, payload }, counterCid, lpCid };
   }
@@ -375,6 +412,8 @@ export class LedgerFixture {
     sharesOut?: string;
     newPrice?: string;
     nowSeconds?: number;
+    /** Ledger time of the transaction. */
+    at?: Date;
   }): {
     tx: LedgerTransaction;
     market: MarketFixtureState;
@@ -484,7 +523,10 @@ export class LedgerFixture {
       }),
     );
     events.push(this.created("PredictionMarket", nextMarket.cid, nextMarket.payload));
-    const tx = this.tx(events, { commandId: `buy-${input.buyer.slice(0, 6)}-${this.offset + 1}` });
+    const tx = this.tx(events, {
+      commandId: `buy-${input.buyer.slice(0, 6)}-${this.offset + 1}`,
+      at: input.at,
+    });
     return { tx, market: nextMarket, wallet: nextWallet, position: nextPosition };
   }
 
@@ -498,6 +540,7 @@ export class LedgerFixture {
     sharesIn: string;
     grossCC: string;
     newPrice?: string;
+    at?: Date;
   }): {
     tx: LedgerTransaction;
     market: MarketFixtureState;
@@ -577,7 +620,7 @@ export class LedgerFixture {
       this.created("UserWallet", nextWallet.cid, nextWallet.payload, { observers: [input.seller] }),
       this.created("PredictionMarket", nextMarket.cid, nextMarket.payload),
     ];
-    const tx = this.tx(events);
+    const tx = this.tx(events, { at: input.at });
     return { tx, market: nextMarket, wallet: nextWallet, position: nextPosition };
   }
 

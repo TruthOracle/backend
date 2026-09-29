@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Inject, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { AdminGuard } from "../auth/admin.guard";
@@ -24,13 +24,17 @@ import {
   AdminService,
   type AdminUserDetail,
 } from "../services/admin.service";
-import type {
-  ApiAuditEvent,
-  ApiIdentity,
-  ApiKycVerification,
-  ApiPage,
-  ApiPayout,
-  ApiUser,
+import { Config } from "../config";
+import {
+  type ApiAuditEvent,
+  type ApiIdentity,
+  type ApiKycProviderStatus,
+  type ApiKycVerification,
+  type ApiPage,
+  type ApiPayout,
+  type ApiUser,
+  KYC_PROVIDER,
+  type KycProvider,
 } from "../types";
 import { ApiError } from "../util/errors";
 
@@ -56,7 +60,24 @@ export function adminActorOf(req: AuthedRequest): AdminActor {
 @AllowAdminSession()
 @UseGuards(AdminGuard)
 export class AdminController {
-  constructor(private readonly admin: AdminService) {}
+  constructor(
+    private readonly admin: AdminService,
+    private readonly config: Config,
+    @Inject(KYC_PROVIDER) private readonly kycProvider: KycProvider,
+  ) {}
+
+  /** The KYC provider's wiring plus a live credential probe (docs/KYC.md §6) — never applicant data. */
+  @Get("kyc/provider")
+  async kycProviderStatus(): Promise<ApiKycProviderStatus> {
+    return {
+      provider: this.kycProvider.name,
+      configured: this.kycProvider.isConfigured(),
+      levelName: this.config.kycRequiredLevel,
+      enforceWithdrawals: this.config.kycEnforceWithdrawals,
+      webhookPath: `/api/v1/webhooks/kyc/${this.kycProvider.name}`,
+      health: await this.kycProvider.healthCheck(),
+    };
+  }
 
   // ─────────────────────────────────────────── users ───────────────────────────────────────────
 

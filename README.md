@@ -8,8 +8,9 @@ like `risk-monitor-backend`.
 
 The behavioural contract is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (v2), the HTTP
 shapes are [`docs/API.md`](docs/API.md), the internal file/class/method seams are
-[`docs/INTERNALS.md`](docs/INTERNALS.md), the ledger indexer is [`docs/INDEXER.md`](docs/INDEXER.md)
-and operator procedures live in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+[`docs/INTERNALS.md`](docs/INTERNALS.md), the ledger indexer is [`docs/INDEXER.md`](docs/INDEXER.md),
+the market catalog (series → events → markets), candles, quotes and orders are
+[`docs/MARKETS.md`](docs/MARKETS.md), and operator procedures live in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 ## Quick start
 
@@ -45,9 +46,10 @@ src/
 ├── controllers/           # one per resource; index.ts exports controller classes only
 ├── services/              # index.ts exports service classes only
 ├── processors/            # scheduled / NATS-driven loops (incl. the ledger indexer loop)
-├── indexer/               # ledger event normalisation, tree building, the projection, Splice transfer extraction (pure)
-├── entities/              # 11 account `to_*` tables (ARCHITECTURE §5) + 14 ledger-index tables (INDEXER.md §3)
-├── migrations/            # checked-in migrations (Init, LedgerIndex); synchronize is hard-coded false
+├── indexer/               # ledger event normalisation, tree building, the projection, candles, Splice transfer extraction (pure)
+├── amm/                   # the pm-AMM math port (quotes) — mirrors truthoracle-contracts PmAmmMath.daml
+├── entities/              # 11 account `to_*` tables (ARCHITECTURE §5) + 14 ledger-index tables (INDEXER.md §3) + catalog / candles (MARKETS.md)
+├── migrations/            # checked-in migrations (Init, LedgerIndex, MarketCatalog); synchronize is hard-coded false
 ├── dto/                   # class-validator request DTOs
 └── util/                  # money (bigint fixed point), canton-crypto, telegram, cookies, errors, …
 test/
@@ -78,9 +80,11 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (against a migrated database it must print "No changes in database schema") |
 | `npm run migration:run` · `migration:revert` | apply / roll back |
 
-Two migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
-an earlier layout is dropped and recreated, never upgraded) and `LedgerIndex` (the fourteen
-ledger-index tables, additive). Regenerating against a migrated database proposes only the
+Three migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
+an earlier layout is dropped and recreated, never upgraded), `LedgerIndex` (the fourteen
+ledger-index tables, additive) and `MarketCatalog` (series / events / candles tables plus the
+catalog identity and open-interest columns on `to_markets`, additive; existing markets get the
+synthetic ticker `MKT-<marketId>`). Regenerating against a migrated database proposes only the
 cosmetic `'{}'` vs `'{}'::jsonb` default rewrites, which are not drift.
 
 Jest runs in CommonJS with `test/esm-to-cjs.transformer.cjs` converting the ESM-only packages
@@ -111,7 +115,7 @@ and `/admin/ledger/*` read it. Design, tables, derivations and operations: `docs
 ## Status
 
 Every package has landed and been reconciled: F (foundation) plus P1–P5 (auth + me, wallets +
-deposits, payouts, KYC with the mock provider and the Sumsub reference adapter, admin). No route
+deposits, payouts, KYC with the mock provider and the Sumsub adapter, admin). No route
 answers `501 not_implemented`; every route in `docs/API.md` is implemented and covered by an
 e2e spec (`test/{session,app,auth,wallets,payouts,kyc,admin}.e2e-spec.ts`).
 
@@ -131,6 +135,23 @@ admin API with their wallet on `POST /auth/admin`. Admin sessions are refused on
 **Ledger index (2026-09-28, docs/INDEXER.md):** indexer + read API landed; `test/ledger.e2e-spec.ts`
 covers replay, bootstrap from an ACS snapshot, resync with a recorded gap, the derivations and every
 new route. Not yet exercised against a live participant (RUNBOOK §12).
+
+**Sumsub is the KYC provider (2026-09-29, docs/KYC.md §5–§6):** the adapter matches Sumsub's
+current API (SDK tokens with `applicantIdentifiers`, signed requests, SHA-256/512 webhook
+digests over the raw body, every documented `applicant*` webhook type, applicant re-reads);
+`GET /admin/kyc/provider` and `npm run kyc:check` probe the credentials and print what the
+dashboard must be set to. Verified with locally computed vectors and a stubbed HTTP layer only —
+the first Sumsub sandbox session is still to be watched.
+
+**Markets like an exchange (2026-09-29, docs/MARKETS.md):** Kalshi-style series → event → market
+catalog (events group N binary pm-AMM markets; a market's `ticker` / `eventTicker` / side labels come
+from truthoracle-v14 1.1.0 contracts when present, else from an operator assignment, else
+`MKT-<id>`), candlesticks folded by the projection in the ledger transaction's own DB transaction
+(1 min / 1 h / 1 d, dense reads), open interest, 24 h figures and an AMM-implied book on every
+market, `GET /markets/:market/quote` (the PmAmmMath port) and `POST /markets/:market/orders/prepare`
+(the exact ExerciseCommand + disclosed contract the Cantor8 wallet signs, assembled from the index),
+`GET /exchange/status` with an operator trading halt, and `POST /admin/markets` (treasury-signed
+`CreateMarket` for an event). `test/{catalog,candles,orders}.e2e-spec.ts`.
 
 Verified on 2026-09-10: `npm run typecheck`, `npm run lint`, `npm run build` exit 0;
 `npm test` 21 suites / 150 tests; `npm run test:e2e` 7 suites / 161 tests against real
