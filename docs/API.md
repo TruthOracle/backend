@@ -174,8 +174,8 @@ type MarketEventKind = "market_created" | "buy" | "sell" | "swap" | "split" | "m
   "resolve_t0" | "resolve" | "propose" | "challenge" | "finalize" | "void" | "redeem" | "commit_forecast" | "score_and_distribute" | "archive";
 
 interface Market {
-  marketId: number; ticker: string; tickerSource: "ledger" | "catalog" | "synthetic"; eventTicker: string | null; eventTickerSource: "ledger" | "catalog" | null;
-  seriesTicker: string | null; yesSubTitle; noSubTitle: string; subTitlesFromLedger: boolean;   // catalog identity (docs/MARKETS.md §2)
+  marketId: number; ticker: string; eventTicker: string; yesSubTitle; noSubTitle: string;   // the contract's own identity (docs/MARKETS.md §2)
+  seriesTicker: string | null;                                                               // through the event's catalog row (null only for a placeholder event without a series)
   contractId: string; templateId: string | null; admin: string; question; imageUrl; description; resolutionDescription; category: string;
   createdAt; expiresAt; tradingStartsAt: string; gracePeriodSecs; liquidityPeriodSecs: number; isDynamic: boolean;
   reserveYes; reserveNo; liquidityL; lpTokenSupply; currentPrice: Decimal; feeBps; prizeFeeShareBps: number;
@@ -299,6 +299,5 @@ The account's parties = the primary party + every active linked wallet.
 - `PATCH /admin/series/:ticker` `{ …any of the above, status?: active | archived }` → `{ series }`
 - `POST /admin/events` `{ ticker, seriesTicker, title, subTitle?, imageUrl?, description?, mutuallyExclusive?, strikeDate?, strikePeriod?, settlementSources?, productMetadata?, reason? }` → `{ event }` | `404 not_found` (series) | `409 catalog_conflict`
 - `PATCH /admin/events/:ticker` `{ …, archived? }` → `{ event }`
-- `PATCH /admin/markets/:marketId/catalog` `{ ticker?, eventTicker?: string | null, yesSubTitle?, noSubTitle?, reason? }` → `{ market }` | `409 ledger_value_fixed` (`details.field`) | `409 catalog_conflict` | `404 not_found`
-- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, category?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id)
+- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, category?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars) | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract.
 - `POST /admin/exchange/halt` `{ active: boolean, reason, estimatedResumeAt? }` → `{ halt }`

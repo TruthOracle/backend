@@ -112,11 +112,10 @@ account's view is resolved at read time through `to_users.party_id` and `to_wall
 | `to_attestations` · `to_model_forecasts` · `to_prediction_models` | contract | |
 | `to_ledger_transfers` | Canton Coin transfer involving the treasury | §6 |
 | `to_market_candles` | (market, period ∈ 1 min / 1 h / 1 d, period start) | OHLC of the pool price, Σ Δvolume, Σ price × Δvolume, trade count, open interest and L after the period's last version — folded per market version in the same transaction (docs/MARKETS.md §5) |
-| `to_series` · `to_events` | operator catalog rows (not ledger data) | the series → event hierarchy markets are grouped into; membership is `to_markets.event_ticker` (docs/MARKETS.md §2) |
+| `to_series` · `to_events` | operator catalog rows (not ledger data; the projection writes placeholder rows when a market names an event that has none) | the series → event hierarchy markets are grouped into; membership is `to_markets.event_ticker` (docs/MARKETS.md §2) |
 
-`to_markets` also carries the market's catalog identity (`ticker`, `ticker_source`, `event_ticker`,
-`event_ticker_source`, `yes_sub_title`, `no_sub_title`, `sub_titles_from_ledger` — the ledger's
-values win, an operator fills what the contract left `None`, `MKT-<marketId>` otherwise), the
+`to_markets` also carries the market's identity (`ticker`, `event_ticker`, `yes_sub_title`,
+`no_sub_title` — the contract's own, mandatory on truthoracle-v15, NOT NULL in the index), the
 active version's `template_id`, and `open_interest_yes / _no` (outstanding shares across the
 active positions, ± per Position create / archive, recomputed after a snapshot).
 
@@ -178,9 +177,10 @@ version; `volume_cc` += Δ `totalVolumeCC` against the consumed predecessor; `tr
 Buy / Sell / SwapShares), after every Position of the transaction has moved
 `to_markets.open_interest_*`. A snapshot entry (bootstrap / resync) seeds one candle at its
 snapshot price with volume 0 and never counts as a trade; open interest is then recomputed from
-`to_positions`. The market's on-ledger `ticker` / `eventTicker` / sub titles (truthoracle-v14
-≥ 1.1.0) are applied on every version with source `ledger`; a ticker that collides with another
-market's is logged and the current ticker kept.
+`to_positions`. The market's on-ledger `ticker` / `eventTicker` / sub titles are written on every
+version (trimmed, upper-cased); a ticker another market already holds is stored as
+`<ticker>~<marketId>` and logged, a malformed one is kept and logged, and an event ticker with
+no catalog row gets a placeholder event and series in the same transaction (docs/MARKETS.md §2).
 
 ## 6. Treasury transfers (`src/indexer/splice.ts`)
 

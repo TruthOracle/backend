@@ -292,6 +292,6 @@ describe("orders/prepare", () => {
     // A user session cannot halt.
     await ctx.agent.post("/api/v1/admin/exchange/halt").set({ Cookie: user.cookie, ...ctx.csrf }).send({ active: true, reason: "x" }).expect(403);
     const m = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/1").expect(200)).market;
-    expect(m).toMatchObject({ yesSubTitle: "Above", noSubTitle: "Below", tickerSource: "ledger", eventTickerSource: "ledger" });
+    expect(m).toMatchObject({ ticker: "LIVE-1", eventTicker: "LIVE", yesSubTitle: "Above", noSubTitle: "Below" });
   });
 });

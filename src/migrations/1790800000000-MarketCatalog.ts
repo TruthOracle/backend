@@ -3,11 +3,16 @@ import type { MigrationInterface, QueryRunner } from "typeorm";
 /**
  * The market catalog and candles (docs/MARKETS.md): `to_series` and `to_events` (operator-managed
  * Kalshi-style series → event hierarchy), `to_market_candles` (OHLC per 1 min / 1 h / 1 d,
- * maintained by the projection), and the catalog identity + open-interest columns on
- * `to_markets` (`ticker`, `event_ticker`, the Yes / No sub titles, the active version's template
- * id). Additive over LedgerIndex; existing market rows get the synthetic ticker `MKT-<marketId>`
- * (the projection overwrites it with the on-ledger value on the next version). Hand-written so
- * the backfill runs before the unique index; `migration:generate` against the migrated database
+ * maintained by the projection), and the identity + open-interest columns on `to_markets`
+ * (`ticker`, `event_ticker`, the Yes / No sub titles — mandatory `Text` on every truthoracle-v15
+ * `PredictionMarket` — and the active version's template id). Additive over LedgerIndex.
+ *
+ * The four identity columns are NOT NULL with no default: the v15 index never produces a row
+ * without them, and a from-scratch deployment starts with an empty index. Rows that predate this
+ * migration in a development index can only come from a v14 package, which the v15 deployment
+ * abandons; they are backfilled deterministically (`MKT-<marketId>`, `Yes` / `No`) rather than
+ * deleted so the migration never destroys data. Hand-written so the backfill runs before the
+ * NOT NULL constraints and the unique index; `migration:generate` against the migrated database
  * proposes nothing but the cosmetic jsonb-default rewrites Init.ts documents.
  */
 export class MarketCatalog1790800000000 implements MigrationInterface {
@@ -30,19 +35,19 @@ export class MarketCatalog1790800000000 implements MigrationInterface {
     await queryRunner.query(
       `CREATE INDEX "ix_to_market_candles_period_start" ON "to_market_candles" ("period_secs", "period_start")`,
     );
+    // Identity columns: added nullable, backfilled for any pre-v15 rows (see the header), then
+    // constrained. A v15 index never writes a row without all four.
     await queryRunner.query(`ALTER TABLE "to_markets" ADD "ticker" text`);
-    await queryRunner.query(`UPDATE "to_markets" SET "ticker" = 'MKT-' || "market_id"::text`);
-    await queryRunner.query(`ALTER TABLE "to_markets" ALTER COLUMN "ticker" SET NOT NULL`);
-    await queryRunner.query(
-      `ALTER TABLE "to_markets" ADD "ticker_source" text NOT NULL DEFAULT 'synthetic'`,
-    );
     await queryRunner.query(`ALTER TABLE "to_markets" ADD "event_ticker" text`);
-    await queryRunner.query(`ALTER TABLE "to_markets" ADD "event_ticker_source" text`);
-    await queryRunner.query(`ALTER TABLE "to_markets" ADD "yes_sub_title" text NOT NULL DEFAULT ''`);
-    await queryRunner.query(`ALTER TABLE "to_markets" ADD "no_sub_title" text NOT NULL DEFAULT ''`);
+    await queryRunner.query(`ALTER TABLE "to_markets" ADD "yes_sub_title" text`);
+    await queryRunner.query(`ALTER TABLE "to_markets" ADD "no_sub_title" text`);
     await queryRunner.query(
-      `ALTER TABLE "to_markets" ADD "sub_titles_from_ledger" boolean NOT NULL DEFAULT false`,
+      `UPDATE "to_markets" SET "ticker" = 'MKT-' || "market_id"::text, "event_ticker" = 'MKT-' || "market_id"::text, "yes_sub_title" = 'Yes', "no_sub_title" = 'No'`,
     );
+    await queryRunner.query(`ALTER TABLE "to_markets" ALTER COLUMN "ticker" SET NOT NULL`);
+    await queryRunner.query(`ALTER TABLE "to_markets" ALTER COLUMN "event_ticker" SET NOT NULL`);
+    await queryRunner.query(`ALTER TABLE "to_markets" ALTER COLUMN "yes_sub_title" SET NOT NULL`);
+    await queryRunner.query(`ALTER TABLE "to_markets" ALTER COLUMN "no_sub_title" SET NOT NULL`);
     await queryRunner.query(`ALTER TABLE "to_markets" ADD "template_id" text`);
     await queryRunner.query(
       `ALTER TABLE "to_markets" ADD "open_interest_yes" numeric(38,10) NOT NULL DEFAULT '0'`,
@@ -60,12 +65,9 @@ export class MarketCatalog1790800000000 implements MigrationInterface {
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "open_interest_no"`);
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "open_interest_yes"`);
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "template_id"`);
-    await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "sub_titles_from_ledger"`);
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "no_sub_title"`);
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "yes_sub_title"`);
-    await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "event_ticker_source"`);
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "event_ticker"`);
-    await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "ticker_source"`);
     await queryRunner.query(`ALTER TABLE "to_markets" DROP COLUMN "ticker"`);
     await queryRunner.query(`DROP INDEX "public"."ix_to_market_candles_period_start"`);
     await queryRunner.query(`DROP TABLE "to_market_candles"`);

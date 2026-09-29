@@ -53,11 +53,19 @@ export function createMarketCommandIdFor(ticker: string): string {
   return `create-market-${createHash("sha256").update(ticker).digest("hex").slice(0, 40)}`;
 }
 
+/** A side label: trimmed, defaulting to the plain side name — the contract refuses an empty one. */
+export function sideLabel(raw: string | undefined, fallback: "Yes" | "No"): string {
+  const label = (raw ?? "").trim();
+  if (label.length > 80)
+    throw new ApiError(400, "validation_failed", "yesSubTitle / noSubTitle are at most 80 characters");
+  return label || fallback;
+}
+
 /**
  * The operator's market factory (docs/MARKETS.md §4): `POST /admin/markets` builds the
  * `MarketCounter.CreateMarket` exercise for an event of the catalog and submits it treasury-signed
  * through the Enterprise Wallet — the same rail the frontend's admin console used from the
- * browser, now with the ticker / event / sub-title fields truthoracle-v14 ≥ 1.1.0 carries and a
+ * browser, with the identity the contract requires (ticker, event, the two side labels) and a
  * deterministic command id so a retried request collides on ledger command-dedup instead of
  * creating a second market. The market appears in the read API once the indexer sees it.
  */
@@ -74,7 +82,9 @@ export class MarketOperatorService {
 
   async createMarket(input: CreateMarketInput, actor: Actor, reason?: string): Promise<ApiCreateMarketResult> {
     const ticker = normalizeTicker(input.ticker);
-    const eventTicker = input.eventTicker.trim().toUpperCase();
+    const eventTicker = normalizeTicker(input.eventTicker);
+    const yesSubTitle = sideLabel(input.yesSubTitle, "Yes");
+    const noSubTitle = sideLabel(input.noSubTitle, "No");
     const event = await this.dataSource.getRepository(CatalogEventEntity).findOneBy({ ticker: eventTicker });
     if (!event) throw new ApiError(404, "not_found", `event ${eventTicker} does not exist`);
     if (event.archived) throw new ApiError(409, "catalog_conflict", `event ${eventTicker} is archived`);
@@ -133,11 +143,11 @@ export class MarketOperatorService {
         bondCC: formatDecimalString(policy.bondCC ?? "0"),
       },
       auditObservers: input.auditObservers ?? [],
-      // truthoracle-v14 ≥ 1.1.0 (Optional Text, appended): the market's catalog identity
+      // the market's identity — mandatory Text on PredictionMarket / CreateMarket (docs/MARKETS.md §2)
       ticker,
       eventTicker,
-      yesSubTitle: input.yesSubTitle ?? null,
-      noSubTitle: input.noSubTitle ?? null,
+      yesSubTitle,
+      noSubTitle,
     };
     const commandId = createMarketCommandIdFor(ticker);
     const res = await this.wallet.externalSubmit({

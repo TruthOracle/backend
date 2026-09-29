@@ -51,7 +51,6 @@ export const ERROR_CODES = [
   "insufficient_shares",
   "quote_unavailable",
   "catalog_conflict",
-  "ledger_value_fixed",
   // generic
   "validation_failed",
   "bad_request",
@@ -297,7 +296,7 @@ export const NatsSubjects = {
   /** The indexer resynced from an ACS snapshot and lost the updates in between: `{ fromOffset, toOffset, reason }`. */
   indexerGap: "truthoracle.indexer.gap",
   // ── market catalog / exchange (docs/MARKETS.md) ──
-  /** A series or event row changed: `{ kind: "series" | "event" | "market", ticker }`. */
+  /** A series or event row changed: `{ kind: "series" | "event", ticker }`. */
   catalogChanged: "truthoracle.catalog.changed",
   /** The operator halted or resumed trading: `{ active, reason }`. */
   exchangeHaltChanged: "truthoracle.exchange.halt_changed",
@@ -352,7 +351,6 @@ export type AuditAction =
   | "catalog.series_updated"
   | "catalog.event_created"
   | "catalog.event_updated"
-  | "catalog.market_updated"
   | "market.create_submitted"
   | "exchange.halt_changed";
 
@@ -622,17 +620,15 @@ export interface ApiProposal {
 
 export interface ApiMarket {
   marketId: number;
-  /** Kalshi-style identifier (docs/MARKETS.md §2): on-ledger, catalog-assigned, or `MKT-<marketId>`. */
+  /** Kalshi-style identifier, the contract's own (docs/MARKETS.md §2). */
   ticker: string;
-  tickerSource: CatalogValueSource;
-  eventTicker: string | null;
-  eventTickerSource: Exclude<CatalogValueSource, "synthetic"> | null;
-  /** Through the event (catalog); null while the market is not in an event. */
+  /** The event this market is one leg of, the contract's own; the catalog row always exists (a placeholder when the operator has not written it yet). */
+  eventTicker: string;
+  /** Through the event's catalog row; null only while that row is a placeholder without a series. */
   seriesTicker: string | null;
+  /** The two sides a trader signs for, the contract's own. */
   yesSubTitle: string;
   noSubTitle: string;
-  /** The contract carries the sub titles (an operator may only fill blanks). */
-  subTitlesFromLedger: boolean;
   contractId: string;
   /** Package-id template of the active version (what a disclosed contract names); null for rows indexed before MarketCatalog. */
   templateId: string | null;
@@ -691,7 +687,7 @@ export interface ApiMarket {
 export interface ApiMarketSummary {
   marketId: number;
   ticker: string;
-  eventTicker: string | null;
+  eventTicker: string;
   yesSubTitle: string;
   noSubTitle: string;
   contractId: string;
@@ -947,9 +943,6 @@ export interface ReadinessResponse {
 
 /** Tickers are Kalshi-style: upper-case letters, digits, `.`, `_` and `-`, 2–64 chars, starting alphanumeric. */
 export const TICKER_PATTERN = /^[A-Z0-9][A-Z0-9._-]{1,63}$/;
-/** Tickers the indexer synthesises for markets whose ledger contract carries none (`MKT-<marketId>`) — never assignable. */
-export const SYNTHETIC_TICKER_PATTERN = /^MKT-\d+$/;
-export const syntheticTickerFor = (marketId: number): string => `MKT-${marketId}`;
 
 export type SeriesStatus = "active" | "archived";
 export const SERIES_FREQUENCIES = [
@@ -962,9 +955,6 @@ export const SERIES_FREQUENCIES = [
   "custom",
 ] as const;
 export type SeriesFrequency = (typeof SERIES_FREQUENCIES)[number];
-
-/** Where a market's ticker / event link came from — the ledger value always wins over a catalog assignment. */
-export type CatalogValueSource = "ledger" | "catalog" | "synthetic";
 
 /** Kalshi-style event lifecycle derived from the member markets (docs/MARKETS.md §3). */
 export type EventStatus = "unopened" | "open" | "closed" | "settled";

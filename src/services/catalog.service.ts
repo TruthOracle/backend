@@ -6,7 +6,6 @@ import { MarketEntity } from "../entities/market.entity";
 import { SeriesEntity } from "../entities/series.entity";
 import {
   NatsSubjects,
-  SYNTHETIC_TICKER_PATTERN,
   TICKER_PATTERN,
   type Actor,
   type ApiEvent,
@@ -53,13 +52,6 @@ export interface EventInput {
 }
 export type EventPatch = Partial<Omit<EventInput, "ticker">> & { archived?: boolean };
 
-export interface MarketCatalogPatch {
-  eventTicker?: string | null;
-  ticker?: string;
-  yesSubTitle?: string;
-  noSubTitle?: string;
-}
-
 export interface SeriesListQuery {
   category?: string;
   status?: SeriesStatus | "all";
@@ -96,17 +88,15 @@ export function normalizeTicker(raw: string): string {
   const ticker = raw.trim().toUpperCase();
   if (!TICKER_PATTERN.test(ticker))
     throw new ApiError(400, "validation_failed", `"${raw}" is not a valid ticker`);
-  if (SYNTHETIC_TICKER_PATTERN.test(ticker))
-    throw new ApiError(400, "validation_failed", "MKT-<n> tickers are reserved for the indexer");
   return ticker;
 }
 
 /**
  * The market catalog (docs/MARKETS.md §2–§3; docs/API.md "Catalog"): series and events are
- * operator-managed Postgres rows, markets are the ledger's. Membership follows the market's
- * on-ledger `eventTicker` when the contract carries one and the catalog assignment otherwise;
- * every derived event figure (status, volume, close time) is computed from the indexed markets
- * at read time, so nothing here can disagree with the ledger.
+ * operator-managed Postgres rows, markets are the ledger's. Membership is the market's on-ledger
+ * `eventTicker`, nothing else (the projection creates a placeholder event row when the operator
+ * has not written it yet); every derived event figure (status, volume, close time) is computed
+ * from the indexed markets at read time, so nothing here can disagree with the ledger.
  */
 @Injectable()
 export class CatalogService {
@@ -345,65 +335,6 @@ export class CatalogService {
     });
   }
 
-  // ───────────────────────────────────────────── markets ─────────────────────────────────────────────
-
-  /**
-   * Operator assignment of what the ledger left open on a market: its ticker, event and Yes /
-   * No labels. Anything the contract fixed answers `409 ledger_value_fixed` — the ledger is the
-   * source of truth for a market's identity, the catalog only fills blanks (docs/MARKETS.md §2).
-   */
-  async updateMarketCatalog(
-    marketId: number,
-    patch: MarketCatalogPatch,
-    actor: Actor,
-    reason?: string,
-  ): Promise<ApiMarket> {
-    return this.dataSource.transaction(async (manager) => {
-      const repo = manager.getRepository(MarketEntity);
-      const market = await repo.findOneBy({ marketId });
-      if (!market) throw new ApiError(404, "not_found", `market ${marketId} is not indexed`);
-      const fixed = (field: string): never => {
-        throw new ApiError(409, "ledger_value_fixed", `${field} of market ${marketId} is fixed by the ledger`, {
-          field,
-        });
-      };
-      if (patch.ticker !== undefined) {
-        if (market.tickerSource === "ledger") fixed("ticker");
-        const ticker = normalizeTicker(patch.ticker);
-        const taken = await repo.findOneBy({ ticker });
-        if (taken && taken.marketId !== marketId)
-          throw new ApiError(409, "catalog_conflict", `ticker ${ticker} is used by market ${taken.marketId}`);
-        market.ticker = ticker;
-        market.tickerSource = "catalog";
-      }
-      if (patch.eventTicker !== undefined) {
-        if (market.eventTickerSource === "ledger") fixed("eventTicker");
-        if (patch.eventTicker === null) {
-          market.eventTicker = null;
-          market.eventTickerSource = null;
-        } else {
-          const eventTicker = patch.eventTicker.trim().toUpperCase();
-          const event = await manager.getRepository(CatalogEventEntity).findOneBy({ ticker: eventTicker });
-          if (!event) throw new ApiError(404, "not_found", `event ${eventTicker} does not exist`);
-          market.eventTicker = eventTicker;
-          market.eventTickerSource = "catalog";
-        }
-      }
-      if (patch.yesSubTitle !== undefined || patch.noSubTitle !== undefined) {
-        if (market.subTitlesFromLedger) fixed("subTitles");
-        if (patch.yesSubTitle !== undefined) market.yesSubTitle = patch.yesSubTitle;
-        if (patch.noSubTitle !== undefined) market.noSubTitle = patch.noSubTitle;
-      }
-      await repo.save(market);
-      await this.record(manager, actor, "catalog.market_updated", "market", String(marketId), {
-        reason,
-        fields: Object.keys(patch),
-      });
-      await this.announce("market", market.ticker);
-      return this.markets.toApi(market, false, await this.markets.extrasOf(market, manager));
-    });
-  }
-
   // ───────────────────────────────────────────── shaping ─────────────────────────────────────────────
 
   private async toApiEvents(
@@ -427,18 +358,18 @@ export class CatalogService {
       .getMany();
     const byEvent = new Map<string, MarketEntity[]>();
     for (const m of marketRows) {
-      const list = byEvent.get(m.eventTicker ?? "") ?? [];
+      const list = byEvent.get(m.eventTicker) ?? [];
       list.push(m);
-      byEvent.set(m.eventTicker ?? "", list);
+      byEvent.set(m.eventTicker, list);
     }
     const shapedMarkets = withMarkets
       ? await this.markets.toApiMany(marketRows, false, manager)
       : [];
     const shapedByEvent = new Map<string, ApiMarket[]>();
     for (const m of shapedMarkets) {
-      const list = shapedByEvent.get(m.eventTicker ?? "") ?? [];
+      const list = shapedByEvent.get(m.eventTicker) ?? [];
       list.push(m);
-      shapedByEvent.set(m.eventTicker ?? "", list);
+      shapedByEvent.set(m.eventTicker, list);
     }
     return rows.map((e) => {
       const members = byEvent.get(e.ticker) ?? [];
@@ -527,8 +458,7 @@ export class CatalogService {
       | "catalog.series_created"
       | "catalog.series_updated"
       | "catalog.event_created"
-      | "catalog.event_updated"
-      | "catalog.market_updated",
+      | "catalog.event_updated",
     subjectType: string,
     subjectId: string,
     metadata: Record<string, unknown>,
@@ -548,7 +478,7 @@ export class CatalogService {
     );
   }
 
-  private async announce(kind: "series" | "event" | "market", ticker: string): Promise<void> {
+  private async announce(kind: "series" | "event", ticker: string): Promise<void> {
     await this.nats.publishSafe(NatsSubjects.catalogChanged, { kind, ticker });
   }
 }

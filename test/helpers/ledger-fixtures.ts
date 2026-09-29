@@ -167,27 +167,15 @@ export class LedgerFixture {
     prizeFeeShareBps?: number;
     category?: string;
     policy?: Partial<Payload>;
-    /** truthoracle-v14 ≥ 1.1.0 catalog fields (Optional Text; absent = a 1.0.0 contract). */
-    ticker?: string | null;
-    eventTicker?: string | null;
-    yesSubTitle?: string | null;
-    noSubTitle?: string | null;
+    /** The market's identity (mandatory Text on truthoracle-v15); defaults are `TEST-<marketId>` in event `TEST`, `Yes` / `No`. */
+    ticker?: string;
+    eventTicker?: string;
+    yesSubTitle?: string;
+    noSubTitle?: string;
     isDynamic?: boolean;
     liquidityL?: string;
   }): Payload {
     const createdAt = input.createdAt ?? 1_760_000_000;
-    const catalog: Payload =
-      input.ticker !== undefined ||
-      input.eventTicker !== undefined ||
-      input.yesSubTitle !== undefined ||
-      input.noSubTitle !== undefined
-        ? {
-            ticker: input.ticker ?? null,
-            eventTicker: input.eventTicker ?? null,
-            yesSubTitle: input.yesSubTitle ?? null,
-            noSubTitle: input.noSubTitle ?? null,
-          }
-        : {};
     return {
       admin: this.admin,
       marketId: String(input.marketId),
@@ -226,7 +214,10 @@ export class LedgerFixture {
         ...(input.policy ?? {}),
       },
       auditObservers: [],
-      ...catalog,
+      ticker: input.ticker ?? `TEST-${input.marketId}`,
+      eventTicker: input.eventTicker ?? "TEST",
+      yesSubTitle: input.yesSubTitle ?? "Yes",
+      noSubTitle: input.noSubTitle ?? "No",
     };
   }
 
@@ -242,10 +233,10 @@ export class LedgerFixture {
     feeBps?: number;
     category?: string;
     policy?: Partial<Payload>;
-    ticker?: string | null;
-    eventTicker?: string | null;
-    yesSubTitle?: string | null;
-    noSubTitle?: string | null;
+    ticker?: string;
+    eventTicker?: string;
+    yesSubTitle?: string;
+    noSubTitle?: string;
     isDynamic?: boolean;
     liquidityL?: string;
     /** Ledger time of the creating transaction. */
@@ -276,14 +267,10 @@ export class LedgerFixture {
         prizeFeeShareBps: payload.prizeFeeShareBps,
         policy: payload.policy,
         auditObservers: [],
-        ...(input.ticker !== undefined || input.eventTicker !== undefined
-          ? {
-              ticker: payload.ticker,
-              eventTicker: payload.eventTicker,
-              yesSubTitle: payload.yesSubTitle,
-              noSubTitle: payload.noSubTitle,
-            }
-          : {}),
+        ticker: payload.ticker,
+        eventTicker: payload.eventTicker,
+        yesSubTitle: payload.yesSubTitle,
+        noSubTitle: payload.noSubTitle,
       },
       { children: 3, result: { _1: counterCid, _2: marketCid, _3: lpCid } },
     );

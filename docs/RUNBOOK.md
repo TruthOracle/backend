@@ -47,17 +47,19 @@ To rotate:
 
 The pepper itself is never stored; only its hash is.
 
-## 3. Daml package (truthoracle-v14) and deposit drift
+## 3. Daml package (truthoracle-v15) and deposit drift
 
-The backend is built against **truthoracle-v14 1.0.0**
-(`TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a`,
-`TRUTHORACLE_PACKAGE_NAME=truthoracle-v14`), whose `UserWallet.depositRefs : [Text]` is
-mandatory and is the deposit confirm pass's only confirmation rule. There is no Daml feature
-flag and no upgrade path from an older package (ARCHITECTURE §18).
+The backend is built against **truthoracle-v15 1.0.0**
+(`TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload in truthoracle-contracts>`,
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v15`), a fresh lineage deployed from scratch: its
+`UserWallet.depositRefs : [Text]` is mandatory and is the deposit confirm pass's only
+confirmation rule, and every `PredictionMarket` carries its identity (`ticker`, `eventTicker`,
+the side labels). There is no Daml feature flag and no upgrade path from an older package
+(ARCHITECTURE §18); a v15 deployment starts with an empty index and a fresh database.
 
 - `502 upstream_failed "ledger returned a UserWallet without depositRefs"` on any money route,
   with `UserWallet <cid> (owner …): UserWallet.depositRefs is missing; is TRUTHORACLE_PACKAGE_ID
-  the deployed truthoracle-v14?` in the log: the configured package id / name does not match
+  the deployed truthoracle-v15?` in the log: the configured package id / name does not match
   what is deployed. Fix the env; nothing was written.
 - `409 deposit_attribution_drift` (audit `deposit.attribution_drift`, Sentry, NATS
   `truthoracle.deposit.drift`): the primary's on-ledger `depositedCC` differs from
@@ -265,17 +267,23 @@ not a rebuild.
   state lives in `to_settings.exchange_halt` only while active.
 - **Create a market inside an event**: create the series (`POST /admin/series`) and the event
   (`POST /admin/events`) once, then `POST /admin/markets { eventTicker, ticker, question, … }`.
-  The route needs the `MarketCounter` indexed (`503 not_ready` otherwise) and a participant
-  running truthoracle-v14 ≥ 1.1.0 (a 1.0.0 package rejects the identity fields as
-  `502 upstream_failed`). The market is readable once the indexer applies the transaction.
-- **Markets created before 1.1.0** carry the synthetic ticker `MKT-<id>`: assign their event,
-  ticker and side labels with `PATCH /admin/markets/:id/catalog`. A field the ledger fixed answers
-  `409 ledger_value_fixed`.
+  The route needs the `MarketCounter` indexed (`503 not_ready` otherwise); `ticker` and
+  `eventTicker` are required, `yesSubTitle` / `noSubTitle` default to `Yes` / `No`. The market
+  is readable once the indexer applies the transaction.
+- **An event you never created shows up** (title = its ticker, series = the ticker's first
+  segment): a market named it on-ledger before the catalog had it (created from the frontend's
+  admin console, or the event row was never written) and the projection created a placeholder.
+  Fill it in with `PATCH /admin/events/:ticker` (title, `seriesTicker`, strike, …) and the
+  series with `PATCH /admin/series/:ticker`; `POST` answers `409 catalog_conflict` for a ticker
+  that already exists. A market's own identity has no operator route — it is the contract's.
+- **Two markets with the same ticker** (`… on-ledger ticker X is already used by market N` at
+  error level): the later one is indexed as `X~<marketId>`. Void or archive the duplicate
+  on-ledger; the index never edits identity.
 - **Candles look wrong after a projection fix**: candles and open interest are derived in the
   indexer's transaction; rebuild the index from scratch (§ "Rebuild from scratch" in
-  docs/INDEXER.md §9) — export the catalog assignments on `to_markets` first if any exist
-  (`SELECT market_id, ticker, event_ticker, yes_sub_title, no_sub_title FROM to_markets WHERE
-  ticker_source = 'catalog' OR event_ticker_source = 'catalog'`) and re-apply them afterwards.
+  docs/INDEXER.md §9). A market's identity is re-read from the ledger, and placeholder catalog
+  rows are re-created where the operator never wrote the event; operator-written series and
+  events are not ledger data and survive the rebuild.
 - **`GET /exchange/status.ledger.stale = true`**: the indexer has not touched its state row for
   `EXCHANGE_STALE_AFTER_SEC`; check `GET /ledger/status.lastError` and the replica that holds
   the lock (`running`).

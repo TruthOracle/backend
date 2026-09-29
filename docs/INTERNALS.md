@@ -16,7 +16,7 @@ internal surface that other packages call.
 | **P4 — KYC** | services `kyc`, `kyc-provider-mock`, `kyc-provider-sumsub`; controllers `kyc`, `kyc-mock` (not in the barrel), `webhooks`; processor `kyc-webhook`; `src/dto/kyc.dto.ts`; `docs/KYC.md`; specs + `test/kyc.e2e-spec.ts` |
 | **P5 — admin** | service `admin`; controller `admin`; `src/dto/admin.dto.ts`; specs + `test/admin.e2e-spec.ts` |
 | **P6 — ledger index** (docs/INDEXER.md) | `src/indexer/*` (pure: `events`, `splice`, `projection`), `src/util/ledger-values.ts`, `src/util/ledger-offset.interceptor.ts`; services `ledger-stream`, `indexer`, `markets`, `portfolio`; processor `ledger-indexer`; controllers `markets`, `ledger`, `portfolio`, `ledger-wallet`, `admin-ledger`; `src/dto/ledger.dto.ts`; 14 entities + migration `LedgerIndex`; `test/helpers/ledger-fixtures.ts`, `FakeLedgerStream`; specs + `test/ledger.e2e-spec.ts` |
-| **P7 — market catalog, candles, quotes / orders, exchange** (docs/MARKETS.md) | `src/amm/*` (pure: `pm-amm` port of PmAmmMath, `market-state`), `src/indexer/candles.ts`; services `catalog`, `candles`, `quote`, `exchange`, `market-operator`; controllers `catalog`, `orders`, `exchange`, `admin-catalog` (+ `markets` gains candlesticks / quote and id-or-ticker params); `src/dto/catalog.dto.ts`, `src/dto/orders.dto.ts`; entities `SeriesEntity` (to_series), `CatalogEventEntity` (to_events), `MarketCandleEntity` (to_market_candles) + the catalog / open-interest columns on `MarketEntity`; migration `MarketCatalog`; fixtures gain the 1.1.0 catalog fields and `at:`; specs + `test/{catalog,candles,orders}.e2e-spec.ts` |
+| **P7 — market catalog, candles, quotes / orders, exchange** (docs/MARKETS.md) | `src/amm/*` (pure: `pm-amm` port of PmAmmMath, `market-state`), `src/indexer/candles.ts`; services `catalog`, `candles`, `quote`, `exchange`, `market-operator`; controllers `catalog`, `orders`, `exchange`, `admin-catalog` (+ `markets` gains candlesticks / quote and id-or-ticker params); `src/dto/catalog.dto.ts`, `src/dto/orders.dto.ts`; entities `SeriesEntity` (to_series), `CatalogEventEntity` (to_events), `MarketCandleEntity` (to_market_candles) + the catalog / open-interest columns on `MarketEntity`; migration `MarketCatalog`; fixtures carry the four identity fields and `at:`; specs + `test/{catalog,candles,orders}.e2e-spec.ts` |
 
 Nobody edits another package's files. Barrels are written once by F and not touched again
 (F lists every class below; a package that needs an extra injectable keeps it private to its
@@ -108,7 +108,7 @@ src/dto/common.dto.ts       PageQueryDto { page?: number }
 `telegramOidcClientId`, `telegramOidcClientSecret`, `telegramOidcIssuer`,
 `adminOperators (Map<partyId, pinnedPublicKey | "">)`,
 `ledgerApiUrl`, `enterpriseWalletUrl`, `treasuryPartyId`, `enterpriseWalletAppName`,
-`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v14 — `UserWallet.depositRefs` is mandatory, no feature flag),
+`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v15 — `UserWallet.depositRefs` and the market identity fields are mandatory, no feature flag),
 `keycloak: { url, realm, clientId, clientSecret }`, `ledgerKeycloak`, `walletKeycloak` (same shape, optional overrides),
 `zkpc: { ledgerApiUrl, keycloakUrl, keycloakRealm, clientId, clientSecret }`,
 `kycProvider ('mock'|'sumsub')`, `kycEnforceWithdrawals` (plain flag), `kycRequiredLevel`, `kycFingerprintPepper`, `kycPepperRotationAck`,
@@ -255,7 +255,6 @@ candleUpsert(contribution, periodSecs): { sql, params } · periodStartSec(sec, p
 listSeries(q) · getSeries(ticker) → { series, events } · createSeries(input, actor, reason?) · updateSeries(ticker, patch, actor, reason?)
 listEvents(q { series?, status?, category?, q?, withNestedMarkets, includeArchived, page, limit }) · getEvent(ticker) (markets nested)
 createEvent(input, actor, reason?) · updateEvent(ticker, patch, actor, reason?)
-updateMarketCatalog(marketId, { ticker?, eventTicker?: string | null, yesSubTitle?, noSubTitle? }, actor, reason?)   // 409 ledger_value_fixed for a ledger-fixed field
 deriveEventStatus(phases): EventStatus · normalizeTicker(raw)   // exported pure helpers
 
 // CandlesService
@@ -270,11 +269,14 @@ assertTradable(market, action, phase, nowSec)                                   
 status(): Promise<ApiExchangeStatus> · halt(): Promise<ApiExchangeHalt> · setHalt({ active, reason, estimatedResumeAt? }, actor)   // to_settings 'exchange_halt'
 
 // MarketOperatorService
-createMarket(input, actor, reason?): Promise<ApiCreateMarketResult>   // MarketCounter.CreateMarket via EnterpriseWalletService.externalSubmit, commandId create-market-<sha256(ticker)[:40]>
+createMarket(input, actor, reason?): Promise<ApiCreateMarketResult>   // MarketCounter.CreateMarket via EnterpriseWalletService.externalSubmit, commandId create-market-<sha256(ticker)[:40]>; sideLabel(raw, "Yes" | "No") defaults the labels
+
+// src/indexer/projection.ts (identity, docs/MARKETS.md §2)
+marketIdentityOf(manager, marketId, payload) · ensureCatalogEvent(manager, marketId, eventTicker, market) · placeholderSeriesTickerOf(eventTicker)   // exported pure helper
 ```
 
 Fixtures: `LedgerFixture.createMarket` / `marketPayload` accept `ticker`, `eventTicker`,
-`yesSubTitle`, `noSubTitle` (omitted = a 1.0.0 contract without the fields), `isDynamic`,
+`yesSubTitle`, `noSubTitle` (defaults `TEST-<marketId>`, `TEST`, `Yes`, `No` — every fixture market carries them), `isDynamic`,
 `liquidityL` and `at:` (the transaction's ledger time — what the candle buckets are drawn from);
 `buy` / `sell` accept `at:` too. `FakeEnterpriseWallet.externalSubmit` records a `CreateMarket`
 exercise without applying it (the market reaches the index through `FakeLedgerStream`).

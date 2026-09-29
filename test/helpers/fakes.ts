@@ -420,7 +420,7 @@ export class FakeEnterpriseWallet {
       if (!templateId.endsWith(":UserWallet")) throw new Error(`fake ledger: cannot create ${templateId}`);
       const owner = asString(a.owner);
       if (this.ledger.wallets.has(owner)) throw new Error(`fake ledger: UserWallet already exists for ${owner}`);
-      // `depositRefs : [Text]` is mandatory on truthoracle-v14: the real ledger rejects a Create without it.
+      // `depositRefs : [Text]` is mandatory on truthoracle-v15: the real ledger rejects a Create without it.
       if (!Array.isArray(a.depositRefs)) throw new Error("fake ledger: UserWallet.depositRefs is mandatory (missing or not a list)");
       this.ledger.seedUserWallet(owner, {
         balanceCC: asString(a.balanceCC, "0"),

@@ -342,34 +342,6 @@ export class UpdateEventDto extends CatalogReasonDto {
   archived?: boolean;
 }
 
-/** `PATCH /admin/markets/:marketId/catalog` — only what the ledger left open (409 ledger_value_fixed otherwise). */
-export class MarketCatalogPatchDto extends CatalogReasonDto {
-  @IsOptional()
-  @trimmed()
-  @IsString()
-  @Matches(TICKER_INPUT)
-  ticker?: string;
-
-  /** `null` detaches the market from its event. */
-  @IsOptional()
-  @trimmed()
-  @IsString()
-  @Matches(TICKER_INPUT)
-  eventTicker?: string | null;
-
-  @IsOptional()
-  @trimmed()
-  @IsString()
-  @MaxLength(120)
-  yesSubTitle?: string;
-
-  @IsOptional()
-  @trimmed()
-  @IsString()
-  @MaxLength(120)
-  noSubTitle?: string;
-}
-
 export class ResolutionPolicyDto {
   @IsOptional()
   @IsBoolean()
@@ -409,7 +381,10 @@ export class ResolutionPolicyDto {
   bondCC?: string;
 }
 
-/** `POST /admin/markets` — a market inside an event, created on-ledger through the treasury. */
+/**
+ * `POST /admin/markets` — a market inside an event, created on-ledger through the treasury. The
+ * contract requires all four identity fields; the side labels default to "Yes" / "No" when omitted.
+ */
 export class CreateMarketDto extends CatalogReasonDto {
   @trimmed()
   @IsString()
@@ -430,13 +405,13 @@ export class CreateMarketDto extends CatalogReasonDto {
   @IsOptional()
   @trimmed()
   @IsString()
-  @MaxLength(120)
+  @MaxLength(80)
   yesSubTitle?: string;
 
   @IsOptional()
   @trimmed()
   @IsString()
-  @MaxLength(120)
+  @MaxLength(80)
   noSubTitle?: string;
 
   @IsOptional()

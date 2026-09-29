@@ -17,7 +17,7 @@ const created = (nodeId: number, extra: Record<string, unknown> = {}): Record<st
   nodeId,
   contractId: `cid-${nodeId}`,
   templateId: "pkg:Truthoracle:Position",
-  packageName: "truthoracle-v14",
+  packageName: "truthoracle-v15",
   createArgument: { holder: "alice::1220aa", marketId: "1" },
   witnessParties: ["treasury::1220ff"],
   signatories: ["alice::1220aa"],
@@ -36,7 +36,7 @@ const exercised = (
   nodeId,
   contractId: `cid-m`,
   templateId: "pkg:Truthoracle:PredictionMarket",
-  packageName: "truthoracle-v14",
+  packageName: "truthoracle-v15",
   choice: "Buy",
   choiceArgument: { buyer: "alice::1220aa", side: "Yes", collateralCC: "10.0000000000" },
   actingParties: ["alice::1220aa"],
@@ -55,8 +55,8 @@ describe("splitTemplateId", () => {
       module: "Truthoracle",
       entity: "PredictionMarket",
     });
-    expect(splitTemplateId("#truthoracle-v14:Splice.Amulet:Amulet")).toEqual({
-      packageRef: "#truthoracle-v14",
+    expect(splitTemplateId("#truthoracle-v15:Splice.Amulet:Amulet")).toEqual({
+      packageRef: "#truthoracle-v15",
       module: "Splice.Amulet",
       entity: "Amulet",
     });

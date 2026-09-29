@@ -225,7 +225,7 @@ export class MarketsService {
     const out = new Map<number, MarketExtras>();
     if (rows.length === 0) return out;
     const ids = rows.map((m) => String(m.marketId));
-    const eventTickers = [...new Set(rows.map((m) => m.eventTicker).filter((t): t is string => !!t))];
+    const eventTickers = [...new Set(rows.map((m) => m.eventTicker))];
     const seriesByEvent = new Map<string, string>();
     if (eventTickers.length > 0) {
       const events = await manager.query<{ ticker: string; series_ticker: string }[]>(
@@ -260,7 +260,7 @@ export class MarketsService {
     const firstById = new Map(firsts.map((r) => [Number(r.market_id), parseCC(r.open)]));
     for (const m of rows) {
       out.set(m.marketId, {
-        seriesTicker: m.eventTicker ? (seriesByEvent.get(m.eventTicker) ?? null) : null,
+        seriesTicker: seriesByEvent.get(m.eventTicker) ?? null,
         previousPrice: prevById.get(m.marketId) ?? firstById.get(m.marketId) ?? null,
         volume24h: volumeById.get(m.marketId) ?? 0n,
       });
@@ -571,13 +571,10 @@ export class MarketsService {
     const api: ApiMarket = {
       marketId: m.marketId,
       ticker: m.ticker,
-      tickerSource: m.tickerSource,
       eventTicker: m.eventTicker,
-      eventTickerSource: m.eventTickerSource,
       seriesTicker: extras.seriesTicker,
       yesSubTitle: m.yesSubTitle,
       noSubTitle: m.noSubTitle,
-      subTitlesFromLedger: m.subTitlesFromLedger,
       contractId: m.contractId,
       templateId: m.templateId,
       admin: m.admin,

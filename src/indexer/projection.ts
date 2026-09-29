@@ -32,8 +32,6 @@ import { PositionEntity } from "../entities/position.entity";
 import { PredictionModelEntity } from "../entities/prediction-model.entity";
 import { WalletEntryEntity } from "../entities/wallet-entry.entity";
 import {
-  SYNTHETIC_TICKER_PATTERN,
-  syntheticTickerFor,
   TICKER_PATTERN,
   TRADE_KINDS,
   type MarketEventKind,
@@ -80,7 +78,7 @@ import {
 import { extractTreasuryTransfers } from "./splice";
 
 export interface ProjectionConfig {
-  /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v14`). */
+  /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v15`). */
   packageName: string;
   splicePackageName: string;
   treasury: string;
@@ -524,63 +522,69 @@ export class LedgerProjection {
   }
 
   /**
-   * The ledger fixes a market's catalog identity when the contract carries it (truthoracle-v14
-   * ≥ 1.1.0: `ticker`, `eventTicker`, the sub titles); an operator may only fill what the ledger
-   * left None (docs/MARKETS.md §2). A ledger ticker that collides with another market's keeps
-   * the synthetic one and is logged — the index never fails over catalog data.
+   * A market's identity is the contract's own (`ticker`, `eventTicker`, `yesSubTitle`,
+   * `noSubTitle` — mandatory Text on truthoracle-v15, docs/MARKETS.md §2), normalised the way
+   * every ticker input is (trimmed, upper-cased). The index takes it as it is and only protects
+   * itself: a ticker another market already holds is stored as `<ticker>~<marketId>` because
+   * the column is unique and the index must never stall on operator data, and a malformed
+   * ticker is kept but logged (the market stays addressable by id).
    */
-  private async applyLedgerCatalogFields(
+  private async marketIdentityOf(
     m: EntityManager,
     marketId: number,
-    fields: {
-      ticker: string | null;
-      eventTicker: string | null;
-      yesSubTitle: string | null;
-      noSubTitle: string | null;
-    },
-  ): Promise<void> {
-    if (fields.ticker) {
-      const ticker = fields.ticker.trim().toUpperCase();
-      if (TICKER_PATTERN.test(ticker) && !SYNTHETIC_TICKER_PATTERN.test(ticker)) {
-        const res = await m.query<unknown[]>(
-          `UPDATE to_markets SET ticker = $1, ticker_source = 'ledger'
-             WHERE market_id = $2 AND ticker <> $1
-               AND NOT EXISTS (SELECT 1 FROM to_markets o WHERE o.ticker = $1 AND o.market_id <> $2)
-           RETURNING market_id`,
-          [ticker, String(marketId)],
-        );
-        if (res.length === 0) {
-          const taken = await m.query<{ market_id: string }[]>(
-            `SELECT market_id FROM to_markets WHERE ticker = $1 AND market_id <> $2`,
-            [ticker, String(marketId)],
-          );
-          if (taken.length > 0) {
-            this.logger.warn(
-              `market ${marketId}: on-ledger ticker ${ticker} is already used by market ${taken[0].market_id}; keeping the current ticker`,
-            );
-          }
-        }
-      } else {
-        this.logger.warn(`market ${marketId}: on-ledger ticker "${fields.ticker}" is not a valid ticker; ignored`);
-      }
-    }
-    if (fields.eventTicker) {
-      const eventTicker = fields.eventTicker.trim().toUpperCase();
-      if (TICKER_PATTERN.test(eventTicker)) {
-        await m.query(
-          `UPDATE to_markets SET event_ticker = $1, event_ticker_source = 'ledger' WHERE market_id = $2`,
-          [eventTicker, String(marketId)],
-        );
-      } else {
-        this.logger.warn(`market ${marketId}: on-ledger eventTicker "${fields.eventTicker}" is not a valid ticker; ignored`);
-      }
-    }
-    if (fields.yesSubTitle !== null || fields.noSubTitle !== null) {
-      await m.query(
-        `UPDATE to_markets SET yes_sub_title = $1, no_sub_title = $2, sub_titles_from_ledger = true WHERE market_id = $3`,
-        [fields.yesSubTitle ?? "", fields.noSubTitle ?? "", String(marketId)],
+    p: Record<string, unknown>,
+  ): Promise<{ ticker: string; eventTicker: string; yesSubTitle: string; noSubTitle: string }> {
+    let ticker = asText(p.ticker).trim().toUpperCase();
+    if (!TICKER_PATTERN.test(ticker))
+      this.logger.warn(`market ${marketId}: on-ledger ticker "${asText(p.ticker)}" is not a valid ticker; kept as-is`);
+    const taken = await m.query<{ market_id: string }[]>(
+      `SELECT market_id FROM to_markets WHERE ticker = $1 AND market_id <> $2`,
+      [ticker, String(marketId)],
+    );
+    if (taken.length > 0) {
+      this.logger.error(
+        `market ${marketId}: on-ledger ticker ${ticker} is already used by market ${taken[0].market_id}; indexed as ${ticker}~${marketId} — void or archive the duplicate on-ledger`,
       );
+      ticker = `${ticker}~${marketId}`;
     }
+    const eventTicker = asText(p.eventTicker).trim().toUpperCase();
+    if (!TICKER_PATTERN.test(eventTicker))
+      this.logger.warn(
+        `market ${marketId}: on-ledger eventTicker "${asText(p.eventTicker)}" is not a valid ticker; kept as-is`,
+      );
+    return { ticker, eventTicker, yesSubTitle: asText(p.yesSubTitle), noSubTitle: asText(p.noSubTitle) };
+  }
+
+  /**
+   * The contract may name an event the operator has not written to the catalog yet (the market
+   * was created first, or straight from the frontend's admin console). The catalog must never
+   * dangle, so the projection creates a placeholder event — and a placeholder series named after
+   * the event ticker's first segment — in the same transaction; an operator then edits them
+   * through `/admin/events` and `/admin/series` (docs/MARKETS.md §2). Ledger-derived rows are
+   * not audited.
+   */
+  private async ensureCatalogEvent(
+    m: EntityManager,
+    marketId: number,
+    eventTicker: string,
+    market: { category: string; imageUrl: string; expiresAtSec: number },
+  ): Promise<void> {
+    const exists = await m.query<unknown[]>(`SELECT 1 FROM to_events WHERE ticker = $1`, [eventTicker]);
+    if (exists.length > 0) return;
+    const seriesTicker = placeholderSeriesTickerOf(eventTicker);
+    await m.query(
+      `INSERT INTO to_series (ticker, title, category) VALUES ($1, $1, $2) ON CONFLICT (ticker) DO NOTHING`,
+      [seriesTicker, market.category],
+    );
+    await m.query(
+      `INSERT INTO to_events (ticker, series_ticker, title, image_url, strike_date)
+         VALUES ($1, $2, $1, $3, to_timestamp($4))
+       ON CONFLICT (ticker) DO NOTHING`,
+      [eventTicker, seriesTicker, market.imageUrl, market.expiresAtSec],
+    );
+    this.logger.log(
+      `market ${marketId}: event ${eventTicker} was not in the catalog — placeholder event (series ${seriesTicker}) created; edit it through /admin/events`,
+    );
   }
 
   // ───────────────────────────────────────────── creates ─────────────────────────────────────────────
@@ -611,19 +615,13 @@ export class LedgerProjection {
         const cause = node ? nearestChoice(node) : null;
         const predecessorCid = node ? nearestMarketExerciseCid(node) : null;
         const before = predecessorCid ? await ctx.payloadOf(predecessorCid) : null;
+        // the contract's identity, re-read on every version (successors copy it, the ledger owns it)
+        const identity = await this.marketIdentityOf(m, marketId, p);
         const row: Partial<MarketEntity> = {
           marketId,
           contractId: e.contractId,
           templateId: e.templateId,
-          // catalog identity: written on the FIRST version only (excluded from the overwrite
-          // list below); the ledger's own values are applied right after, when present
-          ticker: syntheticTickerFor(marketId),
-          tickerSource: "synthetic",
-          eventTicker: null,
-          eventTickerSource: null,
-          yesSubTitle: "",
-          noSubTitle: "",
-          subTitlesFromLedger: false,
+          ...identity,
           // open interest is maintained per Position event (bumpOpenInterest); a successor
           // version must not reset it, so both columns are excluded from the overwrite list too
           openInterestYes: 0n,
@@ -664,26 +662,13 @@ export class LedgerProjection {
           archived: false,
           archivedOffset: null,
         };
-        // Every column but the identity, the first-version facts and the catalog columns (which
-        // the ledger or an operator own — see applyLedgerCatalogFields) is overwritten by a successor.
+        // Every column but the key, the first-version facts and the open-interest counters is
+        // overwritten by a successor version (the identity included: the ledger owns it).
         const meta = m.connection.getMetadata(MarketEntity);
         const overwrite = Object.keys(row)
           .filter(
             (k) =>
-              ![
-                "marketId",
-                "createdOffset",
-                "createdAtLedger",
-                "ticker",
-                "tickerSource",
-                "eventTicker",
-                "eventTickerSource",
-                "yesSubTitle",
-                "noSubTitle",
-                "subTitlesFromLedger",
-                "openInterestYes",
-                "openInterestNo",
-              ].includes(k),
+              !["marketId", "createdOffset", "createdAtLedger", "openInterestYes", "openInterestNo"].includes(k),
           )
           .map((k) => meta.findColumnWithPropertyName(k)?.databaseName ?? k);
         await m
@@ -720,11 +705,10 @@ export class LedgerProjection {
           })
           .orIgnore()
           .execute();
-        await this.applyLedgerCatalogFields(m, marketId, {
-          ticker: asOptionalText(p.ticker),
-          eventTicker: asOptionalText(p.eventTicker),
-          yesSubTitle: asOptionalText(p.yesSubTitle),
-          noSubTitle: asOptionalText(p.noSubTitle),
+        await this.ensureCatalogEvent(m, marketId, identity.eventTicker, {
+          category: row.category ?? "",
+          imageUrl: row.imageUrl ?? "",
+          expiresAtSec: row.expiresAtSec ?? 0,
         });
         const atLedger = e.createdAt ?? ctx.tx.effectiveAt;
         ctx.marketVersions.push({
@@ -1534,4 +1518,14 @@ function maxBig(a: bigint, b: bigint): bigint {
 /** Choice arguments for `details`: contract ids are kept (they are ids), everything else verbatim. */
 function stripCids(args: Record<string, unknown>): Record<string, unknown> {
   return args;
+}
+
+/**
+ * The series a placeholder event is filed under: the event ticker's first segment (Kalshi's
+ * `SERIES-EVENT` convention, `FED-26MAR` → `FED`), the whole ticker when there is no usable
+ * segment. An operator moves the event to the right series with `PATCH /admin/events/:ticker`.
+ */
+export function placeholderSeriesTickerOf(eventTicker: string): string {
+  const head = eventTicker.split("-")[0];
+  return head.length >= 2 ? head : eventTicker;
 }

@@ -11,8 +11,8 @@ status; the wire shapes are in `docs/API.md` ("Catalog", "Candlesticks", "Quotes
 
 | Layer | Lives | Owner | Why |
 |---|---|---|---|
-| **Market** (`PredictionMarket`) — the pool, its price, fees, resolution, and since truthoracle-v14 1.1.0 its identity: `ticker`, `eventTicker`, `yesSubTitle`, `noSubTitle` | Daml, indexed into `to_markets` | the treasury creates it, the ledger owns it | what a trader signs must name what it is: the ticker, the event it is one leg of, the two sides |
-| **Event** — one dated instance of a series that groups N binary markets ("Fed decision, March 2026" → "cut ≥ 25 bps", "cut ≥ 50 bps", "hold") | Postgres `to_events` | operator (`/admin/events`) | presentation and grouping; a market's membership is the ledger's `eventTicker` when it has one, else an operator assignment |
+| **Market** (`PredictionMarket`) — the pool, its price, fees, resolution, and its identity: `ticker`, `eventTicker`, `yesSubTitle`, `noSubTitle` (mandatory `Text` on truthoracle-v15) | Daml, indexed into `to_markets` | the treasury creates it, the ledger owns it | what a trader signs must name what it is: the ticker, the event it is one leg of, the two sides |
+| **Event** — one dated instance of a series that groups N binary markets ("Fed decision, March 2026" → "cut ≥ 25 bps", "cut ≥ 50 bps", "hold") | Postgres `to_events` | operator (`/admin/events`); the projection writes a placeholder row when a market names an event the operator has not created yet | presentation and grouping; a market's membership is its on-ledger `eventTicker`, nothing else |
 | **Series** — the recurring template ("Fed rate decisions", monthly, Economics) | Postgres `to_series` | operator (`/admin/series`) | catalog only |
 | **Candles**, open interest, 24 h figures | Postgres `to_market_candles`, `to_markets.open_interest_*` | the projection, in the ledger transaction's own DB transaction | derived data: rebuildable from the raw event log |
 | **Quotes**, prepared orders | computed on request | backend, from the index | a pm-AMM has no order book; the quote is the AMM formula over the indexed market version |
@@ -26,26 +26,32 @@ Kalshi-style tickers (`^[A-Z0-9][A-Z0-9._-]{1,63}$`, upper case): a series `FED`
 `FED-26MAR`, its markets `FED-26MAR-CUT25`, `FED-26MAR-CUT50`, `FED-26MAR-HOLD`. Every
 `/markets/:market` route accepts a ticker or the numeric `marketId`.
 
-Where a market's identity comes from, in order of authority:
+A market's identity is **the contract's, and only the contract's**. truthoracle-v15 carries
+`ticker`, `eventTicker`, `yesSubTitle` and `noSubTitle` as mandatory `Text` on
+`PredictionMarket` and on `MarketCounter.CreateMarket` (the contract refuses an empty one); the
+indexer writes them on every version, normalised the way every ticker input is (trimmed,
+upper-cased), and there is no operator route that edits them — what a trader signs is what the
+catalog shows. Nothing is synthesised and nothing is filled in off-ledger: a from-scratch v15
+deployment never has a market without its identity.
 
-1. **The ledger.** truthoracle-v14 1.1.0 appends `ticker`, `eventTicker`, `yesSubTitle`,
-   `noSubTitle` (all `Optional Text`) to `PredictionMarket` and to `CreateMarket`. When the
-   contract carries a value, the indexer writes it with `tickerSource` / `eventTickerSource` =
-   `ledger` (`subTitlesFromLedger = true`) and **no operator can change it**
-   (`409 ledger_value_fixed`). Every successor version re-applies it.
-2. **The catalog.** For what the contract left `None` (every 1.0.0 market, and a 1.1.0 market
-   created without labels), an operator assigns the value with
-   `PATCH /admin/markets/:marketId/catalog` — source `catalog`. Successor versions never touch a
-   catalog assignment.
-3. **Synthetic.** A market with no ticker from either is `MKT-<marketId>` (source `synthetic`);
-   that pattern is reserved and refused as an input everywhere.
+The index only protects itself, never the data:
 
-An on-ledger ticker that collides with another market's, or is malformed, is logged and the
-market keeps its current ticker — the index never fails over catalog data.
+- an on-ledger ticker another market already holds is stored as `<ticker>~<marketId>` (the
+  column is unique and the projection must not stall on an operator's mistake) and logged at
+  error level — void or archive the duplicate on-ledger;
+- a malformed ticker (outside the pattern) is kept as-is and logged; the market stays
+  addressable by id.
 
-`eventTicker` may name an event that does not exist in the catalog yet (the operator created the
-market first, or the event row was deleted); the market then lists with `eventTicker` set and
-`seriesTicker: null`, and `GET /events/:ticker` answers 404 until the row exists.
+`eventTicker` may name an event the operator has not written to the catalog yet (the market was
+created first, or straight from the frontend's admin console). The projection then creates a
+**placeholder event** in the same transaction — `title` = the ticker, `imageUrl` and
+`strikeDate` from the market — filed under a **placeholder series** named after the event
+ticker's first segment (`FED-26MAR` → `FED`, the whole ticker when there is no usable segment;
+`category` from the market). The catalog therefore never dangles: `GET /events/:ticker` answers
+at once, and the operator fills the rows in with `PATCH /admin/events/:ticker` (title, series,
+strike, …) and `PATCH /admin/series/:ticker`. Placeholders are not audited (they are
+ledger-derived); the operator's edits are. Creating a series or event the placeholder already
+exists for answers `409 catalog_conflict` — patch it instead.
 
 ## 3. Events and series
 
@@ -73,8 +79,10 @@ Series carry `frequency`, `category`, `tags`, `settlementSources`, `contractUrl`
 `POST /admin/markets` (admin session) builds `MarketCounter.CreateMarket` for an event of the
 catalog and submits it treasury-signed through the Enterprise Wallet (`/api/v1/external/submit`):
 
-- the event must exist and not be archived; the ticker must be valid, non-synthetic and unused
-  by any indexed market (`409 catalog_conflict`);
+- the event must exist and not be archived; `ticker` and `eventTicker` are required and must be
+  valid tickers (`400 validation_failed`), the ticker unused by any indexed market
+  (`409 catalog_conflict`); `yesSubTitle` / `noSubTitle` are trimmed, at most 80 characters and
+  default to `Yes` / `No` — the contract refuses an empty label;
 - the `MarketCounter` contract id comes from the index (`to_indexer_state.market_counter_cid`;
   `503 not_ready` before the indexer has seen it);
 - the command id is `create-market-<sha256(ticker)[:40]>`, so a retried request collides on
@@ -87,9 +95,9 @@ catalog and submits it treasury-signed through the Enterprise Wallet (`/api/v1/e
   `GET /ledger/wait?offset=`.
 
 The frontend's admin console may keep submitting `CreateMarket` from the browser through the
-`/__proxy/wallet` relay; it must then send the four identity fields itself (it needs
-`VITE_TRUTHORACLE_PACKAGE_ID` at 1.1.0). Requires truthoracle-v14 ≥ 1.1.0 on the participant; a
-1.0.0 package rejects the extra fields and the route surfaces that as `502 upstream_failed`.
+`/__proxy/wallet` relay; it must then send the four identity fields itself — `CreateMarket`
+requires them on truthoracle-v15, and the participant rejects a submission without them (the
+backend route would surface that as `502 upstream_failed`).
 
 ## 5. Candles and open interest
 
@@ -251,8 +259,9 @@ stop a party that crafts its own command. The ledger-level lever remains the mar
 (`src/amm/pm-amm.spec.ts`, the Daml suite's invariants) and the candle helpers;
 `test/catalog.e2e-spec.ts`, `test/candles.e2e-spec.ts`, `test/orders.e2e-spec.ts` and the
 existing `test/ledger.e2e-spec.ts` against real Postgres + Redis with the fixture ledger
-(catalog CRUD and derived status, ledger-fixed vs catalog identity, the ticker collision rule,
-the treasury-signed CreateMarket with its deterministic command id, hourly / minute / daily
+(catalog CRUD and derived status, placeholder catalog rows for an event the ledger names first,
+the ticker collision rule, the treasury-signed CreateMarket with its identity validation and
+deterministic command id, hourly / minute / daily
 candles with volume, mean and open interest, snapshot seeding, quotes and their bounds,
 prepared orders for every action and every refusal, the halt). `migration:generate` against the
 migrated database proposes only the cosmetic jsonb-default rewrites Init.ts documents. Not yet

@@ -1,7 +1,8 @@
 /**
  * The market catalog (docs/MARKETS.md §2–§4; docs/API.md "Catalog", "Admin — catalog"): series →
- * events → markets, with the ledger fixing a market's identity when the contract carries it and the
- * operator filling what it left open; derived event status; the treasury-signed market factory.
+ * events → markets, a market's identity being the contract's own (placeholder catalog rows when
+ * the operator has not written the event yet); derived event status; the treasury-signed market
+ * factory with its identity validation.
  */
 import { IndexerService } from "../src/services/indexer.service";
 import type {
@@ -85,7 +86,7 @@ describe("catalog", () => {
     });
     expect(empty.settlementSources).toEqual([{ name: "FOMC statement", url: "https://www.federalreserve.gov" }]);
 
-    // Two on-ledger markets name the event; one older contract carries no catalog fields at all.
+    // Two on-ledger markets name the event.
     const nowSec = Math.floor(Date.now() / 1000);
     const f = new LedgerFixture(TEST_TREASURY);
     const cut25 = f.createMarket({
@@ -106,21 +107,18 @@ describe("catalog", () => {
       createdAt: nowSec - 600,
       expiresAt: nowSec + 2 * 86_400,
     });
-    f.createMarket({ marketId: 3, question: "Legacy market?" });
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
 
     const event = bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/FED-26MAR").expect(200)).event;
     expect(event).toMatchObject({ status: "open", marketCount: 2 });
     expect(event.closeTime).toBe(new Date((nowSec + 2 * 86_400) * 1000).toISOString());
-    expect(event.markets?.map((m) => [m.ticker, m.tickerSource, m.eventTickerSource, m.yesSubTitle, m.seriesTicker])).toEqual([
-      ["FED-26MAR-CUT25", "ledger", "ledger", "Cut ≥ 25 bps", "FED"],
-      ["FED-26MAR-CUT50", "ledger", "ledger", "", "FED"],
+    expect(event.markets?.map((m) => [m.ticker, m.eventTicker, m.yesSubTitle, m.noSubTitle, m.seriesTicker])).toEqual([
+      ["FED-26MAR-CUT25", "FED-26MAR", "Cut ≥ 25 bps", "Smaller or none", "FED"],
+      ["FED-26MAR-CUT50", "FED-26MAR", "Yes", "No", "FED"],
     ]);
     expect(event.markets?.[0].contractId).toBe(cut25.market.cid);
-
-    const legacy = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/3").expect(200)).market;
-    expect(legacy).toMatchObject({ ticker: "MKT-3", tickerSource: "synthetic", eventTicker: null, seriesTicker: null });
+    expect(Object.keys(event.markets![0])).not.toEqual(expect.arrayContaining(["tickerSource"]));
 
     const bySeries = bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets?series=fed&sort=oldest").expect(200));
     expect(bySeries.items.map((m) => m.marketId)).toEqual([1, 2]);
@@ -158,7 +156,6 @@ describe("catalog", () => {
       ).error,
     ).toBe("not_found");
     await ctx.agent.post("/api/v1/admin/series").set(headers).send({ ticker: "bad ticker!", title: "x" }).expect(400);
-    await ctx.agent.post("/api/v1/admin/series").set(headers).send({ ticker: "MKT-7", title: "reserved" }).expect(400);
     await ctx.agent.post("/api/v1/admin/series").set(headers).send({ ticker: "OK-1", title: "x", frequency: "hourly" }).expect(400);
     await ctx.agent.post("/api/v1/admin/series").set(headers).send({ ticker: "OK-1", title: "x", nope: 1 }).expect(400);
 
@@ -192,79 +189,102 @@ describe("catalog", () => {
     await ctx.agent.post("/api/v1/admin/series").set({ Cookie: user.cookie, ...ctx.csrf }).send({ ticker: "A-1", title: "x" }).expect(403);
   });
 
-  it("an operator fills what the ledger left open on a market, never what it fixed", async () => {
+  it("creates placeholder catalog rows for an event the operator has not written, which the operator then edits", async () => {
     const headers = await adminHeaders();
-    await seedCatalog(headers);
+    const nowSec = Math.floor(Date.now() / 1000);
     const f = new LedgerFixture(TEST_TREASURY);
-    f.createMarket({ marketId: 1, question: "Legacy?" });
-    f.createMarket({ marketId: 2, question: "Fixed?", ticker: "FED-26MAR-HOLD", eventTicker: "FED-26MAR", yesSubTitle: "Hold", noSubTitle: "Move" });
+    // The contract's eventTicker is normalised like every ticker input; the series is the first segment.
+    const cut25 = f.createMarket({
+      marketId: 1,
+      question: "Cut of at least 25 bps?",
+      ticker: "fed-26mar-cut25",
+      eventTicker: "fed-26mar",
+      category: "Economics",
+      createdAt: nowSec - 600,
+      expiresAt: nowSec + 86_400,
+    });
+    f.createMarket({ marketId: 2, ticker: "FED-26MAR-CUT50", eventTicker: "FED-26MAR", createdAt: nowSec - 600, expiresAt: nowSec + 2 * 86_400 });
+    f.createMarket({ marketId: 3, ticker: "NODASH-1", eventTicker: "NODASH", category: "Misc" });
+    f.createMarket({ marketId: 4, ticker: "X-9-1", eventTicker: "X-9" });
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
 
-    const assigned = bodyOf<{ market: ApiMarket }>(
-      await ctx.agent
-        .patch("/api/v1/admin/markets/1/catalog")
-        .set(headers)
-        .send({ eventTicker: "fed-26mar", ticker: "fed-26mar-legacy", yesSubTitle: "Yes!", noSubTitle: "No!", reason: "backfill" })
-        .expect(200),
-    ).market;
-    expect(assigned).toMatchObject({
-      ticker: "FED-26MAR-LEGACY",
-      tickerSource: "catalog",
-      eventTicker: "FED-26MAR",
-      eventTickerSource: "catalog",
+    const event = bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/FED-26MAR").expect(200)).event;
+    expect(event).toMatchObject({
+      ticker: "FED-26MAR",
       seriesTicker: "FED",
-      yesSubTitle: "Yes!",
-      noSubTitle: "No!",
+      title: "FED-26MAR",
+      category: "Economics",
+      imageUrl: "https://img.test/m.png",
+      strikeDate: new Date((nowSec + 86_400) * 1000).toISOString(),
+      status: "open",
+      marketCount: 2,
+      archived: false,
     });
-    expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/FED-26MAR").expect(200)).event.marketCount).toBe(2);
-    expect(bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/FED-26MAR-LEGACY").expect(200)).market.marketId).toBe(1);
+    expect(event.markets?.map((m) => [m.ticker, m.seriesTicker])).toEqual([
+      ["FED-26MAR-CUT25", "FED"],
+      ["FED-26MAR-CUT50", "FED"],
+    ]);
+    const series = bodyOf<{ series: ApiSeries; events: ApiEvent[] }>(await ctx.agent.get("/api/v1/series/FED").expect(200));
+    expect(series.series).toMatchObject({ ticker: "FED", title: "FED", category: "Economics", status: "active", eventCount: 1, marketCount: 2 });
+    expect(series.events.map((e) => e.ticker)).toEqual(["FED-26MAR"]);
+    // No usable first segment: the series is the event ticker itself.
+    expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/NODASH").expect(200)).event).toMatchObject({ seriesTicker: "NODASH", category: "Misc" });
+    expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/X-9").expect(200)).event).toMatchObject({ seriesTicker: "X-9" });
+    expect(bodyOf<ApiPage<ApiSeries>>(await ctx.agent.get("/api/v1/series").expect(200)).items.map((s) => s.ticker)).toEqual(["FED", "NODASH", "X-9"]);
+    // Ledger-derived rows are not audited; the operator's edits are.
+    expect(await ctx.dataSource.query<unknown[]>(`SELECT 1 FROM to_audit_events WHERE action LIKE 'catalog.%'`)).toHaveLength(0);
 
-    // The ledger-fixed market refuses every field it carries.
-    for (const body of [{ ticker: "OTHER-1" }, { eventTicker: null }, { yesSubTitle: "x" }]) {
-      expect(
-        bodyOf<{ error: string }>(await ctx.agent.patch("/api/v1/admin/markets/2/catalog").set(headers).send(body).expect(409)).error,
-      ).toBe("ledger_value_fixed");
-    }
-    // A catalog ticker cannot collide with another market's, nor point at an unknown event.
+    // The placeholder is a real row: the operator edits it in place (and cannot create it twice).
     expect(
       bodyOf<{ error: string }>(
-        await ctx.agent.patch("/api/v1/admin/markets/1/catalog").set(headers).send({ ticker: "FED-26MAR-HOLD" }).expect(409),
+        await ctx.agent.post("/api/v1/admin/series").set(headers).send({ ticker: "FED", title: "Fed rate decisions" }).expect(409),
       ).error,
     ).toBe("catalog_conflict");
-    await ctx.agent.patch("/api/v1/admin/markets/1/catalog").set(headers).send({ eventTicker: "NOPE-1" }).expect(404);
-    await ctx.agent.patch("/api/v1/admin/markets/1/catalog").set(headers).send({ ticker: "MKT-9" }).expect(400);
-    await ctx.agent.patch("/api/v1/admin/markets/99/catalog").set(headers).send({ ticker: "A-1" }).expect(404);
+    await ctx.agent.patch("/api/v1/admin/series/FED").set(headers).send({ title: "Fed rate decisions", frequency: "monthly" }).expect(200);
+    const edited = bodyOf<{ event: ApiEvent }>(
+      await ctx.agent
+        .patch("/api/v1/admin/events/FED-26MAR")
+        .set(headers)
+        .send({ title: "Fed decision, March 2026", subTitle: "March meeting", mutuallyExclusive: true, reason: "fill in" })
+        .expect(200),
+    ).event;
+    expect(edited).toMatchObject({ title: "Fed decision, March 2026", subTitle: "March meeting", mutuallyExclusive: true, marketCount: 2 });
 
-    // A later ledger version of the legacy market keeps the catalog assignment (nothing on-ledger overrides it) …
+    // A later version of a market keeps its identity (the contract carries it; nothing off-ledger can change it).
     const w = f.createWallet(alice);
     const d = f.deposit(w.wallet, "10", "r");
-    const legacyState = { cid: f.txs[0].events.find((e) => e.kind === "created" && e.entity === "PredictionMarket")!.contractId, payload: f.marketPayload({ marketId: 1, question: "Legacy?" }) };
-    const b = f.buy({ market: legacyState, wallet: d.wallet, buyer: alice, side: "Yes", collateralCC: "1", sharesOut: "1.5" });
+    const b = f.buy({ market: cut25.market, wallet: d.wallet, buyer: alice, side: "Yes", collateralCC: "1", sharesOut: "1.5" });
     ctx.stream.push(w.tx, d.tx, b.tx);
     await ctx.get(IndexerService).runOnce();
     const after = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/1").expect(200)).market;
-    expect(after).toMatchObject({ ticker: "FED-26MAR-LEGACY", eventTicker: "FED-26MAR", yesSubTitle: "Yes!", contractId: b.market.cid });
-    // … while detaching is allowed for a catalog-assigned event.
-    const detached = bodyOf<{ market: ApiMarket }>(
-      await ctx.agent.patch("/api/v1/admin/markets/1/catalog").set(headers).send({ eventTicker: null }).expect(200),
-    ).market;
-    expect(detached).toMatchObject({ eventTicker: null, eventTickerSource: null, seriesTicker: null });
+    expect(after).toMatchObject({ ticker: "FED-26MAR-CUT25", eventTicker: "FED-26MAR", seriesTicker: "FED", yesSubTitle: "Yes", contractId: b.market.cid });
+    expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/FED-26MAR").expect(200)).event.title).toBe("Fed decision, March 2026");
+    // The market's own identity has no operator route.
+    await ctx.agent.patch("/api/v1/admin/markets/1/catalog").set(headers).send({ ticker: "OTHER-1" }).expect(404);
   });
 
-  it("an on-ledger ticker that collides with another market is logged and the synthetic one kept", async () => {
+  it("an on-ledger ticker that collides with another market's is indexed disambiguated; a malformed one is kept", async () => {
     const f = new LedgerFixture(TEST_TREASURY);
     f.createMarket({ marketId: 1, ticker: "DUP-1" });
-    f.createMarket({ marketId: 2, ticker: "DUP-1" });
+    const dup = f.createMarket({ marketId: 2, ticker: "DUP-1" });
     f.createMarket({ marketId: 3, ticker: "bad ticker" });
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
     const page = bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets?sort=oldest").expect(200));
-    expect(page.items.map((m) => [m.marketId, m.ticker, m.tickerSource])).toEqual([
-      [1, "DUP-1", "ledger"],
-      [2, "MKT-2", "synthetic"],
-      [3, "MKT-3", "synthetic"],
+    expect(page.items.map((m) => [m.marketId, m.ticker])).toEqual([
+      [1, "DUP-1"],
+      [2, "DUP-1~2"],
+      [3, "BAD TICKER"],
     ]);
+    expect(bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/DUP-1").expect(200)).market.marketId).toBe(1);
+    // The disambiguation is deterministic across versions.
+    const w = f.createWallet(alice);
+    const d = f.deposit(w.wallet, "10", "r");
+    const b = f.buy({ market: dup.market, wallet: d.wallet, buyer: alice, side: "Yes", collateralCC: "1", sharesOut: "1.5" });
+    ctx.stream.push(w.tx, d.tx, b.tx);
+    await ctx.get(IndexerService).runOnce();
+    expect(bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/2").expect(200)).market).toMatchObject({ ticker: "DUP-1~2", contractId: b.market.cid });
   });
 
   it("creates a market on-ledger through the treasury for an event, with a deterministic command id", async () => {
@@ -331,6 +351,30 @@ describe("catalog", () => {
     expect(submitted.ExerciseCommand.choiceArgument.expiresAt).toBe(String(Math.floor(Date.parse(expiresAt) / 1000)));
     expect((submitted.ExerciseCommand.choiceArgument.policy as { operatorResolution: boolean }).operatorResolution).toBe(true);
 
+    // The side labels default to the plain side names — the contract refuses an empty one.
+    await ctx.agent
+      .post("/api/v1/admin/markets")
+      .set(headers)
+      .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT50", question: "Cut of at least 50 bps?", yesSubTitle: "  ", expiresAt, initialProbability: "0.1", initialValueCC: "200" })
+      .expect(200);
+    expect(ctx.wallet.submits).toHaveLength(2);
+    const second = ctx.wallet.submits[1].commands[0] as { ExerciseCommand: { choiceArgument: Record<string, unknown> } };
+    expect(second.ExerciseCommand.choiceArgument).toMatchObject({ ticker: "FED-26MAR-CUT50", eventTicker: "FED-26MAR", yesSubTitle: "Yes", noSubTitle: "No" });
+    // The identity is required: no ticker, no event, an over-long label — nothing is submitted.
+    for (const body of [
+      { eventTicker: "FED-26MAR", question: "x" },
+      { ticker: "FED-26MAR-HOLD2", question: "x" },
+      { eventTicker: "FED-26MAR", ticker: "FED-26MAR-HOLD2", question: "x", yesSubTitle: "y".repeat(81) },
+      { eventTicker: "bad event!", ticker: "FED-26MAR-HOLD2", question: "x" },
+    ]) {
+      expect(
+        bodyOf<{ error: string }>(
+          await ctx.agent.post("/api/v1/admin/markets").set(headers).send({ ...body, expiresAt, initialProbability: "0.5", initialValueCC: "100" }).expect(400),
+        ).error,
+      ).toBe("validation_failed");
+    }
+    expect(ctx.wallet.submits).toHaveLength(2);
+
     // Same ticker again: the deterministic command id collides on the wallet's command dedup.
     expect(
       bodyOf<{ error: string }>(
@@ -366,12 +410,12 @@ describe("catalog", () => {
       .set(headers)
       .send({ eventTicker: "FED-26MAR", ticker: "N-1", question: "x", expiresAt: "2020-01-01T00:00:00.000Z", initialProbability: "0.5", initialValueCC: "100" })
       .expect(400);
-    expect(ctx.wallet.submits).toHaveLength(1);
+    expect(ctx.wallet.submits).toHaveLength(2);
 
     const audit = await ctx.dataSource.query<{ action: string; metadata: { commandId: string; expectedMarketId: number } }[]>(
-      `SELECT action, metadata FROM to_audit_events WHERE action = 'market.create_submitted'`,
+      `SELECT action, metadata FROM to_audit_events WHERE action = 'market.create_submitted' ORDER BY id`,
     );
-    expect(audit).toHaveLength(1);
+    expect(audit).toHaveLength(2);
     expect(audit[0].metadata).toMatchObject({ commandId: res.commandId, expectedMarketId: 2 });
   });
 });

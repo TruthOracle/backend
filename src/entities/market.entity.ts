@@ -1,6 +1,6 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColumn } from "typeorm";
 
-import type { CatalogValueSource, MarketOutcome, MarketStatus } from "../types";
+import type { MarketOutcome, MarketStatus } from "../types";
 import { bigintNumberTransformer } from "../util/ledger-values";
 import { moneyTransformer } from "../util/money";
 
@@ -60,32 +60,25 @@ export class MarketEntity {
   @Column({ type: "text", default: "" })
   category!: string;
 
-  // ── catalog identity (docs/MARKETS.md §2): the ledger value wins, a catalog assignment fills a None ──
+  // ── identity (docs/MARKETS.md §2): the contract's own ticker, event and side labels, nothing else ──
 
-  /** Kalshi-style ticker: on-ledger (`PredictionMarket.ticker`), else catalog-assigned, else `MKT-<marketId>`. */
+  /**
+   * Kalshi-style ticker from `PredictionMarket.ticker` (trimmed, upper-cased). Unique: a later
+   * contract naming a ticker the index already holds is stored as `<ticker>~<marketId>` and logged.
+   */
   @Index("uq_to_markets_ticker", { unique: true })
   @Column({ type: "text" })
   ticker!: string;
 
-  @Column({ name: "ticker_source", type: "text", default: "synthetic" })
-  tickerSource!: CatalogValueSource;
+  /** The event this market is one leg of (`to_events.ticker`); the projection creates a placeholder row when none exists. */
+  @Column({ name: "event_ticker", type: "text" })
+  eventTicker!: string;
 
-  /** The event this market belongs to (`to_events.ticker`); null until the ledger or an operator says. */
-  @Column({ name: "event_ticker", type: "text", nullable: true })
-  eventTicker!: string | null;
-
-  @Column({ name: "event_ticker_source", type: "text", nullable: true })
-  eventTickerSource!: Exclude<CatalogValueSource, "synthetic"> | null;
-
-  @Column({ name: "yes_sub_title", type: "text", default: "" })
+  @Column({ name: "yes_sub_title", type: "text" })
   yesSubTitle!: string;
 
-  @Column({ name: "no_sub_title", type: "text", default: "" })
+  @Column({ name: "no_sub_title", type: "text" })
   noSubTitle!: string;
-
-  /** `true` once the ledger fixed the sub titles (an operator may only fill blanks). */
-  @Column({ name: "sub_titles_from_ledger", type: "boolean", default: false })
-  subTitlesFromLedger!: boolean;
 
   /** Package-id template of the ACTIVE version — what a disclosed contract must name. */
   @Column({ name: "template_id", type: "text", nullable: true })
