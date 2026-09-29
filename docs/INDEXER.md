@@ -111,6 +111,14 @@ account's view is resolved at read time through `to_users.party_id` and `to_wall
 | `to_ledger_payouts` | `PendingPayout` | and how it ended: `mark_paid` (+ `tx_hash`), `settle_to_wallet`, `cancelled` (+ `refunded`), `archived`; joins `to_payouts.pending_payout_cid` |
 | `to_attestations` · `to_model_forecasts` · `to_prediction_models` | contract | |
 | `to_ledger_transfers` | Canton Coin transfer involving the treasury | §6 |
+| `to_market_candles` | (market, period ∈ 1 min / 1 h / 1 d, period start) | OHLC of the pool price, Σ Δvolume, Σ price × Δvolume, trade count, open interest and L after the period's last version — folded per market version in the same transaction (docs/MARKETS.md §5) |
+| `to_series` · `to_events` | operator catalog rows (not ledger data; the projection writes placeholder rows when a market names an event that has none) | the series → event hierarchy markets are grouped into; membership is `to_markets.event_ticker` (docs/MARKETS.md §2) |
+| `to_market_metadata` | operator row per market ticker (not ledger data; the projection never writes it) | the market's image and description — v16 contracts carry no presentation (docs/MARKETS.md §1) |
+
+`to_markets` also carries the market's identity (`ticker`, `event_ticker`, `yes_sub_title`,
+`no_sub_title` — the contract's own, mandatory on truthoracle-v16, NOT NULL in the index), the
+active version's `template_id`, and `open_interest_yes / _no` (outstanding shares across the
+active positions, ± per Position create / archive, recomputed after a snapshot).
 
 ## 4. Bootstrap, pruning, gaps
 
@@ -162,6 +170,18 @@ every exercised event yields activity:
 Trade kinds (`buy sell swap split merge`) bump `to_markets.trade_count` / `last_trade_at`. A
 transaction that batches several choices on one market is handled: a contract created earlier
 in the same transaction is the "before" state of a later consuming exercise.
+
+Two more derivations run inside the same transaction (docs/MARKETS.md §5): every
+`PredictionMarket` version is folded into the three period rows of `to_market_candles` (`open`
+on insert only; `high` / `low` fold; `close` / `liquidity_l` / `open_interest` follow the newest
+version; `volume_cc` += Δ `totalVolumeCC` against the consumed predecessor; `trades` += 1 for
+Buy / Sell / SwapShares), after every Position of the transaction has moved
+`to_markets.open_interest_*`. A snapshot entry (bootstrap / resync) seeds one candle at its
+snapshot price with volume 0 and never counts as a trade; open interest is then recomputed from
+`to_positions`. The market's on-ledger `ticker` / `eventTicker` / sub titles are written on every
+version (trimmed, upper-cased); a ticker another market already holds is stored as
+`<ticker>~<marketId>` and logged, a malformed one is kept and logged, and an event ticker with
+no catalog row gets a placeholder event and series in the same transaction (docs/MARKETS.md §2).
 
 ## 6. Treasury transfers (`src/indexer/splice.ts`)
 
@@ -215,7 +235,10 @@ Keycloak) the processor logs once and stays idle; the read API still answers.
   `to_*` ledger tables (`to_indexer_state` included), start it again — it re-bootstraps. The
   account tables are untouched.
 - **Rebuild the projections only** (after a projection fix): the raw `to_ledger_events` rows
-  are the source; a replay tool is not part of this change — a full rebuild is.
+  are the source; a replay tool is not part of this change — a full rebuild is. The full rebuild
+  also rebuilds `to_market_candles` and `open_interest_*`; the catalog rows (`to_series`,
+  `to_events`) and the catalog assignments on `to_markets` (`ticker_source = 'catalog'`) are
+  operator data and must be exported / re-applied around a `TRUNCATE` of `to_markets`.
 - **Switching participants** (offsets are participant-local): a full rebuild is required.
 - **Package upgrade**: `packageName` is matched against `TRUTHORACLE_PACKAGE_NAME`; contracts of
   an older package name are ignored (greenfield, ARCHITECTURE §18).

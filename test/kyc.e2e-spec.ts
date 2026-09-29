@@ -25,13 +25,13 @@ import { KycWebhookEventEntity } from "../src/entities/kyc-webhook-event.entity"
 import { UserEntity } from "../src/entities/user.entity";
 import { KycWebhookProcessor, kycWebhookNakDelayMs } from "../src/processors/kyc-webhook.processor";
 import { IdentityService } from "../src/services/identity.service";
-import { KycProviderSumsubService, redactSumsubPayload } from "../src/services/kyc-provider-sumsub.service";
+import { KycProviderSumsubService, redactSumsubPayload, signSumsubRequest } from "../src/services/kyc-provider-sumsub.service";
 import { KycService, type KycSessionStart } from "../src/services/kyc.service";
 import { type ApiKycSummary, type ApiKycVerification, type ApiMe, KYC_PROVIDER, type UserKycStatus } from "../src/types";
 import type { ErrorBody } from "../src/util/errors";
 import { type TestApp, testEnv, useTestApp } from "./helpers/app";
 import { FakeKycProvider, subjectMatches } from "./helpers/fakes";
-import { bodyOf, linkWallet, signInAsAdmin } from "./helpers/session";
+import { bodyOf, issueSessionDirect, linkWallet, signInAsAdmin } from "./helpers/session";
 import { nextTelegramUser, signInWithTelegram, type TelegramTestUser } from "./helpers/telegram";
 import { makeTestWallet } from "./helpers/wallet";
 
@@ -217,7 +217,15 @@ const postWebhook = (ctx: TestApp, raw: Buffer, headers: Record<string, string>)
 describe("KYC (e2e)", () => {
   // ───────────────────────────────── default configuration (enforce off) ─────────────────────────
   describe("default configuration — KYC_PROVIDER=mock, KYC_ENFORCE_WITHDRAWALS=false", () => {
-    const ctx = useTestApp();
+    const ctx = useTestApp({ env: { ADMIN_OPERATORS: operator.partyId } });
+
+    it("GET /admin/kyc/provider reports the mock provider as configured with no upstream probe", async () => {
+      const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
+      const status = ok<{ provider: string; configured: boolean; health: { ok: boolean; upstreamStatus: number | null } }>(
+        await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200),
+      );
+      expect(status).toMatchObject({ provider: "mock", configured: true, health: { ok: true, upstreamStatus: null } });
+    });
 
     it("GET /kyc → provider mock, status none, requiredForWithdrawal false; the §9.4 gate lets an unverified account through", async () => {
       const u = await newUser(ctx, "def");
@@ -540,6 +548,43 @@ describe("KYC (e2e)", () => {
       },
     });
     const webhookRows = (): Promise<KycWebhookEventEntity[]> => ctx.dataSource.getRepository(KycWebhookEventEntity).find({ order: { receivedAt: "ASC" } });
+
+    it("GET /admin/kyc/provider probes Sumsub with a signed request and reports the wiring; 401 from Sumsub is named (docs/KYC.md §6)", async () => {
+      const calls: { url: string; headers: Record<string, string> }[] = [];
+      let answer = { status: 404, body: { description: "Applicant not found", code: 404 } };
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        calls.push({ url, headers: (init?.headers ?? {}) as Record<string, string> });
+        return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { "content-type": "application/json" } });
+      };
+      try {
+        const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
+        const status = ok<{ provider: string; configured: boolean; levelName: string; enforceWithdrawals: boolean; webhookPath: string; health: { ok: boolean; upstreamStatus: number | null; message: string; details: Record<string, unknown> } }>(
+          await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200),
+        );
+        expect(status).toMatchObject({ provider: "sumsub", configured: true, levelName: "basic-kyc-level", enforceWithdrawals: false, webhookPath: "/api/v1/webhooks/kyc/sumsub" });
+        expect(status.health).toMatchObject({ ok: true, upstreamStatus: 404 });
+        expect(status.health.details).toMatchObject({ baseUrl: "https://api.sumsub.com", sandboxToken: true, webhookSecretConfigured: true, acceptedDigestAlgorithms: ["HMAC_SHA256_HEX", "HMAC_SHA512_HEX"] });
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toMatch(/^https:\/\/api\.sumsub\.com\/resources\/applicants\/-;externalUserId=health-[0-9a-f-]+\/one$/);
+        const h = calls[0].headers;
+        expect(h["X-App-Token"]).toBe("sbx:e2e-app-token");
+        expect(h["X-App-Access-Ts"]).toMatch(/^\d{10}$/);
+        const path = calls[0].url.slice("https://api.sumsub.com".length);
+        expect(h["X-App-Access-Sig"]).toBe(signSumsubRequest("e2e-secret-key-not-used-by-these-tests", h["X-App-Access-Ts"], "GET", path));
+
+        answer = { status: 401, body: { description: "Invalid signature", code: 401 } };
+        const bad = ok<{ health: { ok: boolean; upstreamStatus: number | null; message: string } }>(await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200));
+        expect(bad.health).toMatchObject({ ok: false, upstreamStatus: 401 });
+        expect(bad.health.message).toContain("SUMSUB_APP_TOKEN / SUMSUB_SECRET_KEY");
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+      // A user session is refused; the route sits behind AdminGuard like the rest of /admin.
+      const u = await newUser(ctx, "probe");
+      await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", u.cookie).expect(403);
+    });
 
     it("the mock controller is absent: POST /kyc/mock/submit → 404 not_found envelope; GET /kyc reports provider sumsub", async () => {
       const u = await newUser(ctx, "sumsub");

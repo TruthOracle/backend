@@ -47,17 +47,19 @@ To rotate:
 
 The pepper itself is never stored; only its hash is.
 
-## 3. Daml package (truthoracle-v14) and deposit drift
+## 3. Daml package (truthoracle-v16) and deposit drift
 
-The backend is built against **truthoracle-v14 1.0.0**
-(`TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a`,
-`TRUTHORACLE_PACKAGE_NAME=truthoracle-v14`), whose `UserWallet.depositRefs : [Text]` is
-mandatory and is the deposit confirm pass's only confirmation rule. There is no Daml feature
-flag and no upgrade path from an older package (ARCHITECTURE §18).
+The backend is built against **truthoracle-v16 1.0.0**
+(`TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload in truthoracle-contracts>`,
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v16`), a fresh lineage deployed from scratch: its
+`UserWallet.depositRefs : [Text]` is mandatory and is the deposit confirm pass's only
+confirmation rule, and every `PredictionMarket` carries its identity (`ticker`, `eventTicker`,
+the side labels). There is no Daml feature flag and no upgrade path from an older package
+(ARCHITECTURE §18); a v16 deployment starts with an empty index and a fresh database.
 
 - `502 upstream_failed "ledger returned a UserWallet without depositRefs"` on any money route,
   with `UserWallet <cid> (owner …): UserWallet.depositRefs is missing; is TRUTHORACLE_PACKAGE_ID
-  the deployed truthoracle-v14?` in the log: the configured package id / name does not match
+  the deployed truthoracle-v16?` in the log: the configured package id / name does not match
   what is deployed. Fix the env; nothing was written.
 - `409 deposit_attribution_drift` (audit `deposit.attribution_drift`, Sentry, NATS
   `truthoracle.deposit.drift`): the primary's on-ledger `depositedCC` differs from
@@ -255,3 +257,68 @@ after a projection fix. The account tables are never touched.
 **Operator resync.** `POST /admin/ledger/resync { reason }` re-snapshots the ACS at the ledger end
 and reconciles activeness (audited as `ledger.resync`). Use it after a manual ledger repair; it is
 not a rebuild.
+
+## 13. Markets: catalog, candles, trading halt (docs/MARKETS.md)
+
+- **Demo data for local UI work**: `npm run seed:dev` writes a demo catalog straight into the
+  index of `DATABASE_URL` — series `DEMO-FED` / `DEMO-EPL` / `DEMO-BTC`, three events, seven
+  markets (negative `market_id`s, `demo-` contract ids, `DEMO-` tickers), thirty days of candles
+  from a seeded random walk and a matching trade feed — so charts, cards and feeds have something
+  to draw. It refuses outside `APP_ENV=dev`, never touches the test database, replaces its own
+  rows when re-run, and `npm run seed:dev -- --clear` removes exactly them. The rows are local
+  only: nothing is on the ledger, so trading on a demo market fails at `orders/prepare`, and a
+  rebuild of the index does not bring them back. Run it while the dev server is up (it uses
+  ts-node, so `dist/` is left alone).
+
+- **Halt trading** (participant maintenance, a market under investigation): `POST /admin/exchange/halt
+  { active: true, reason, estimatedResumeAt? }` with an operator session. The UI shows the reason,
+  disables the trade controls and `orders/prepare` answers `409 trading_halted` (redemptions stay
+  available). Resume with `{ active: false, reason }`. Audited as `exchange.halt_changed`; the
+  state lives in `to_settings.exchange_halt` only while active.
+- **Create a market inside an event**: create the series (`POST /admin/series`) and the event
+  (`POST /admin/events`) once, then `POST /admin/markets { eventTicker, ticker, question, … }`.
+  The route needs the `MarketCounter` indexed (`503 not_ready` otherwise); `ticker` and
+  `eventTicker` are required, `yesSubTitle` / `noSubTitle` default to `Yes` / `No`. The market
+  is readable once the indexer applies the transaction.
+- **An event you never created shows up** (title = its ticker, series = the ticker's first
+  segment): a market named it on-ledger before the catalog had it (created from the frontend's
+  admin console, or the event row was never written) and the projection created a placeholder.
+  Fill it in with `PATCH /admin/events/:ticker` (title, `seriesTicker`, strike, …) and the
+  series with `PATCH /admin/series/:ticker`; `POST` answers `409 catalog_conflict` for a ticker
+  that already exists. A market's own identity has no operator route — it is the contract's.
+- **Two markets with the same ticker** (`… on-ledger ticker X is already used by market N` at
+  error level): the later one is indexed as `X~<marketId>`. Void or archive the duplicate
+  on-ledger; the index never edits identity.
+- **Candles look wrong after a projection fix**: candles and open interest are derived in the
+  indexer's transaction; rebuild the index from scratch (§ "Rebuild from scratch" in
+  docs/INDEXER.md §9). A market's identity is re-read from the ledger, and placeholder catalog
+  rows are re-created where the operator never wrote the event; operator-written series and
+  events are not ledger data and survive the rebuild.
+- **`GET /exchange/status.ledger.stale = true`**: the indexer has not touched its state row for
+  `EXCHANGE_STALE_AFTER_SEC`; check `GET /ledger/status.lastError` and the replica that holds
+  the lock (`running`).
+
+## 14. Sumsub (docs/KYC.md §5–§6)
+
+- **Is the wiring right?** `npm run kyc:check` on the host, or `GET /admin/kyc/provider` with an
+  operator session. `probe OK (HTTP 404)` = app token + signature accepted. `401`: wrong
+  `SUMSUB_APP_TOKEN` / `SUMSUB_SECRET_KEY`, or the host clock is more than a minute off UTC.
+  `403`: the token lacks *View applicants*. `webhookSecretConfigured: false`: every webhook is
+  being answered 401 — set `SUMSUB_WEBHOOK_SECRET` and restart.
+- **Webhooks answer 401 `webhook_rejected`.** Almost always the digest algorithm: the dashboard
+  webhook must use `HMAC_SHA256_HEX` (or `_SHA512_HEX`); Sumsub's default `HMAC_SHA1_HEX` is
+  refused unless `SUMSUB_ALLOW_SHA1=true`. Then the secret, then the URL (the relay forwards
+  `x-payload-digest` / `x-payload-digest-alg` and `api/v1/**` only).
+- **A review landed on Sumsub but the user still shows `pending`.** `SELECT id, type,
+  processed_at, attempts, error FROM to_kyc_webhook_events ORDER BY received_at DESC LIMIT 20`.
+  Unprocessed rows are re-published by the sweep; a row the consumer gave up on can be
+  replayed with `POST /admin/kyc/webhooks/:id/replay { reason }`. No row at all: resend the
+  webhook from the dashboard's webhook manager (idempotent on the body hash).
+- **Approved on Sumsub, `needs_review` here.** The applicant re-read had no identity document
+  the fingerprints accept (`PASSPORT`, `ID_CARD`, `DRIVERS`, `RESIDENCE_PERMIT`), the review is
+  not `completed`, the level differs from `KYC_REQUIRED_LEVEL`, or a sandbox event arrived on
+  mainnet. `GET /admin/kyc/needs-review` lists them; an operator override
+  (`POST /admin/users/:id/kyc/override`) settles it.
+- **Rotating the app token or the webhook secret.** Create the new one in the dashboard, set
+  the env, restart, run `npm run kyc:check`, then delete the old one. Webhooks signed with the
+  old secret during the switch are rejected and can be resent.

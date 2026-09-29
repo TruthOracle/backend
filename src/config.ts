@@ -247,6 +247,17 @@ export class Config {
   @Min(1000)
   readonly sessionCleanupMs!: number;
 
+  // ── exchange / orders (docs/MARKETS.md §7–§8) ──────────────────────────────
+  /** `GET /exchange/status.ledger.stale`: the index row was not touched for longer than this. */
+  @IsInt()
+  @Min(10)
+  readonly exchangeStaleAfterSec!: number;
+
+  /** How long a prepared order (`POST /markets/:id/orders/prepare`) is advertised as usable. */
+  @IsInt()
+  @Min(5)
+  readonly orderPrepareTtlSec!: number;
+
   @IsInt()
   @Min(0)
   readonly ledgerCacheMs!: number;
@@ -505,6 +516,8 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     },
 
     sessionCleanupMs: parseIntOr(env.SESSION_CLEANUP_MS, 3_600_000),
+    exchangeStaleAfterSec: parseIntOr(env.EXCHANGE_STALE_AFTER_SEC, 300),
+    orderPrepareTtlSec: parseIntOr(env.ORDER_PREPARE_TTL_SEC, 60),
     ledgerCacheMs: parseIntOr(env.LEDGER_CACHE_MS, 15_000),
     depositLockTtlMs: parseIntOr(env.DEPOSIT_LOCK_TTL_MS, 300_000),
     depositConfirmGraceMs: parseIntOr(env.DEPOSIT_CONFIRM_GRACE_MS, 10 * 60_000),

@@ -67,11 +67,12 @@ export class PortfolioService {
       .addOrderBy("p.created_offset", "DESC")
       .getMany();
     const markets = await this.marketsById(rows.map((r) => r.marketId));
+    const summaries = await this.markets.summariesOf([...markets.values()]);
     return {
       parties,
       positions: rows.map((p) => {
         const m = markets.get(p.marketId) ?? null;
-        return this.markets.toApiPosition(p, m, m ? this.markets.toSummary(m) : null);
+        return this.markets.toApiPosition(p, m, summaries.get(p.marketId) ?? null);
       }),
     };
   }
@@ -92,11 +93,12 @@ export class PortfolioService {
       .addOrderBy("l.created_offset", "DESC")
       .getMany();
     const markets = await this.marketsById(rows.map((r) => r.marketId));
+    const summaries = await this.markets.summariesOf([...markets.values()]);
     return {
       parties,
       positions: rows.map((l) => {
         const m = markets.get(l.marketId) ?? null;
-        return this.markets.toApiLiquidity(l, m, m ? this.markets.toSummary(m) : null);
+        return this.markets.toApiLiquidity(l, m, summaries.get(l.marketId) ?? null);
       }),
     };
   }

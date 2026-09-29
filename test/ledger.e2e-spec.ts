@@ -242,6 +242,8 @@ describe("indexer loop", () => {
 describe("markets", () => {
   it("lists and details markets from the index, with the offset header and the blob only on detail", async () => {
     const { market } = await seedTradedMarket();
+    // The category is the series' (through the placeholder event the projection created), never the contract's.
+    await ctx.dataSource.query(`UPDATE to_series SET category = 'crypto' WHERE ticker = 'TEST'`);
     const res = await ctx.agent.get("/api/v1/markets").expect(200);
     expect(res.headers["x-ledger-offset"]).toBe("4");
     const page = bodyOf<ApiPage<ApiMarket>>(res);
@@ -252,6 +254,9 @@ describe("markets", () => {
       contractId: market.cid,
       question: "Will CC trade above $1 by June?",
       category: "crypto",
+      imageUrl: "",
+      description: "",
+      metadata: null,
       status: "Trading",
       phase: "expired",
       feeBps: 100,
@@ -286,11 +291,14 @@ describe("markets", () => {
 
   it("filters, searches, sorts and validates the list query", async () => {
     const f = new LedgerFixture(TEST_TREASURY);
-    const a = f.createMarket({ marketId: 1, question: "Rain tomorrow?", category: "weather" });
-    f.createMarket({ marketId: 2, question: "ETH above 5k?", category: "crypto" });
+    const a = f.createMarket({ marketId: 1, question: "Rain tomorrow?", ticker: "WEATHER-1-RAIN", eventTicker: "WEATHER-1" });
+    f.createMarket({ marketId: 2, question: "ETH above 5k?", ticker: "CRYPTO-1-ETH5K", eventTicker: "CRYPTO-1" });
     f.resolveT0(a.market, "Yes");
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
+    // Categories are the placeholder series' (empty until an operator sets them).
+    await ctx.dataSource.query(`UPDATE to_series SET category = 'weather' WHERE ticker = 'WEATHER'`);
+    await ctx.dataSource.query(`UPDATE to_series SET category = 'crypto' WHERE ticker = 'CRYPTO'`);
 
     expect(
       bodyOf<ApiPage<ApiMarket>>(
@@ -338,7 +346,9 @@ describe("markets", () => {
     expect(
       bodyOf<{ error: string }>(await ctx.agent.get("/api/v1/markets/999").expect(404)).error,
     ).toBe("not_found");
-    await ctx.agent.get("/api/v1/markets/abc").expect(400);
+    // `:market` is an id or a ticker (docs/MARKETS.md §2): an unknown ticker is a 404, a malformed one too.
+    await ctx.agent.get("/api/v1/markets/abc").expect(404);
+    await ctx.agent.get("/api/v1/markets/not%20a%20ticker").expect(404);
   });
 
   it("derives trades, activity and price history from the ledger effects", async () => {

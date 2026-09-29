@@ -28,11 +28,12 @@ export interface StoredProposal {
  * The current version of every `PredictionMarket` (docs/INDEXER.md §3 `to_markets`): one row
  * per `marketId`, overwritten by each successor contract; the version history lives in
  * `to_market_snapshots`. `contract_id` is the ACTIVE contract (what a trade must exercise).
+ * Only what the ledger holds is here — presentation lives in `to_market_metadata`.
  */
 @Entity({ name: "to_markets" })
 @Index("ix_to_markets_status", ["status"])
-@Index("ix_to_markets_category", ["category"])
 @Index("ix_to_markets_expires_at", ["expiresAtSec"])
+@Index("ix_to_markets_event_ticker", ["eventTicker"])
 export class MarketEntity {
   @PrimaryColumn({ name: "market_id", type: "bigint", transformer: bigintNumberTransformer })
   marketId!: number;
@@ -47,17 +48,57 @@ export class MarketEntity {
   @Column({ type: "text" })
   question!: string;
 
-  @Column({ name: "image_url", type: "text", default: "" })
-  imageUrl!: string;
-
-  @Column({ type: "text", default: "" })
-  description!: string;
-
+  /** The resolution terms — part of what a trader signs for, so the contract's own. */
   @Column({ name: "resolution_description", type: "text", default: "" })
   resolutionDescription!: string;
 
-  @Column({ type: "text", default: "" })
-  category!: string;
+  // Presentation (image, description) is NOT here: it is `to_market_metadata`, backend-owned
+  // (docs/MARKETS.md §1); the category is the series' through the event.
+
+  // ── identity (docs/MARKETS.md §2): the contract's own ticker, event and side labels, nothing else ──
+
+  /**
+   * Kalshi-style ticker from `PredictionMarket.ticker` (trimmed, upper-cased). Unique: a later
+   * contract naming a ticker the index already holds is stored as `<ticker>~<marketId>` and logged.
+   */
+  @Index("uq_to_markets_ticker", { unique: true })
+  @Column({ type: "text" })
+  ticker!: string;
+
+  /** The event this market is one leg of (`to_events.ticker`); the projection creates a placeholder row when none exists. */
+  @Column({ name: "event_ticker", type: "text" })
+  eventTicker!: string;
+
+  @Column({ name: "yes_sub_title", type: "text" })
+  yesSubTitle!: string;
+
+  @Column({ name: "no_sub_title", type: "text" })
+  noSubTitle!: string;
+
+  /** Package-id template of the ACTIVE version — what a disclosed contract must name. */
+  @Column({ name: "template_id", type: "text", nullable: true })
+  templateId!: string | null;
+
+  /** Outstanding shares across the market's active positions, maintained by the projection (docs/INDEXER.md §5). */
+  @Column({
+    name: "open_interest_yes",
+    type: "numeric",
+    precision: 38,
+    scale: 10,
+    default: 0,
+    transformer: moneyTransformer,
+  })
+  openInterestYes!: bigint;
+
+  @Column({
+    name: "open_interest_no",
+    type: "numeric",
+    precision: 38,
+    scale: 10,
+    default: 0,
+    transformer: moneyTransformer,
+  })
+  openInterestNo!: bigint;
 
   @Column({ name: "created_at_sec", type: "bigint", transformer: bigintNumberTransformer })
   createdAtSec!: number;

@@ -1,5 +1,7 @@
 import type { AuthedRequest } from "../auth/request";
+import type { Config } from "../config";
 import type { AdminService } from "../services/admin.service";
+import type { KycProvider } from "../types";
 import { ApiError } from "../util/errors";
 import { AdminController, adminActorOf } from "./admin.controller";
 
@@ -44,7 +46,13 @@ describe("AdminController", () => {
     auditTrail: jest.fn().mockResolvedValue({ items: [], page: 1, limit: 25, total: 0 }),
     listPayouts: jest.fn().mockResolvedValue({ items: [] }),
   };
-  const controller = new AdminController(admin as unknown as AdminService);
+  const config = { kycRequiredLevel: "basic-kyc-level", kycEnforceWithdrawals: false } as unknown as Config;
+  const provider = {
+    name: "mock",
+    isConfigured: () => true,
+    healthCheck: async () => ({ ok: true, message: "mock", upstreamStatus: null, checkedAt: "now", details: {} }),
+  } as unknown as KycProvider;
+  const controller = new AdminController(admin as unknown as AdminService, config, provider);
   const req = request({ clientIp: undefined });
   const actor = { type: "admin" as const, userId: "admin-user", sessionId: "admin-sess", ip: null };
 
@@ -67,5 +75,26 @@ describe("AdminController", () => {
     expect(admin.listPayouts).toHaveBeenCalledWith("failed");
     await controller.audit({ subjectType: "user", subjectId: USER_ID });
     expect(admin.auditTrail).toHaveBeenCalledWith({ subjectType: "user", subjectId: USER_ID, actorUserId: undefined, page: 1, limit: 25 });
+  });
+});
+
+
+describe("AdminController — KYC provider status", () => {
+  it("reports the provider wiring around the health probe", async () => {
+    const admin = {} as unknown as AdminService;
+    const config = { kycRequiredLevel: "lvl", kycEnforceWithdrawals: true } as unknown as Config;
+    const provider = {
+      name: "sumsub",
+      isConfigured: () => false,
+      healthCheck: async () => ({ ok: false, message: "unset", upstreamStatus: null, checkedAt: "now", details: { a: 1 } }),
+    } as unknown as KycProvider;
+    await expect(new AdminController(admin, config, provider).kycProviderStatus()).resolves.toEqual({
+      provider: "sumsub",
+      configured: false,
+      levelName: "lvl",
+      enforceWithdrawals: true,
+      webhookPath: "/api/v1/webhooks/kyc/sumsub",
+      health: { ok: false, message: "unset", upstreamStatus: null, checkedAt: "now", details: { a: 1 } },
+    });
   });
 });

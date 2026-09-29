@@ -14,8 +14,7 @@ import type {
   KycSessionResult,
   LedgerWallet,
   PendingPayoutRecord,
-  TransferRow,
-} from "../../src/types";
+  TransferRow, KycProviderHealth } from "../../src/types";
 import { ApiError } from "../../src/util/errors";
 import { asString } from "../../src/util/strings";
 import { formatCC, parseCC } from "../../src/util/money";
@@ -421,7 +420,7 @@ export class FakeEnterpriseWallet {
       if (!templateId.endsWith(":UserWallet")) throw new Error(`fake ledger: cannot create ${templateId}`);
       const owner = asString(a.owner);
       if (this.ledger.wallets.has(owner)) throw new Error(`fake ledger: UserWallet already exists for ${owner}`);
-      // `depositRefs : [Text]` is mandatory on truthoracle-v14: the real ledger rejects a Create without it.
+      // `depositRefs : [Text]` is mandatory on truthoracle-v16: the real ledger rejects a Create without it.
       if (!Array.isArray(a.depositRefs)) throw new Error("fake ledger: UserWallet.depositRefs is mandatory (missing or not a list)");
       this.ledger.seedUserWallet(owner, {
         balanceCC: asString(a.balanceCC, "0"),
@@ -460,6 +459,11 @@ export class FakeEnterpriseWallet {
         this.ledger.archivePayout(contractId);
         return;
       }
+      if (choice === "CreateMarket") {
+        // The market itself reaches the index through FakeLedgerStream (docs/MARKETS.md §4); the
+        // fake wallet only records that the treasury accepted the exercise.
+        return;
+      }
       throw new Error(`fake ledger: unsupported choice ${choice}`);
     }
     throw new Error("fake ledger: unrecognised command shape");
@@ -485,6 +489,10 @@ export class FakeKycProvider implements KycProvider {
 
   isConfigured(): boolean {
     return this.configured;
+  }
+
+  async healthCheck(): Promise<KycProviderHealth> {
+    return { ok: this.configured, message: this.configured ? "fake provider" : "fake provider unconfigured", upstreamStatus: null, checkedAt: new Date().toISOString(), details: {} };
   }
 
   async createSession(user: { id: string }, applicantId: string | null, level: string): Promise<KycSessionResult> {

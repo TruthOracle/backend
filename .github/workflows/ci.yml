@@ -1,3 +1,7 @@
+# Runs on every push to a pull request and on main. Postgres and Redis come up as service
+# containers; the ledger, the wallet and NATS are faked by the test helpers. Red means the
+# branch does not typecheck, lint, pass the unit or e2e suites, build, or ships a migration
+# whose down() does not undo its up().
 name: ci
 
 on:
@@ -5,9 +9,19 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to the same branch supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: typecheck, lint, unit, build, migrations, e2e
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -27,14 +41,45 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/truthoracle_backend_test
       TEST_REDIS_URL: redis://localhost:6379/1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm test
-      - run: npm run test:e2e
-      - run: npm run build
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The e2e suite only ever runs up(). Apply every migration, roll all of them back, check
+      # that nothing but the migrations table survives, and apply them again.
+      - name: Migrations apply, roll back, re-apply
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+          DB_SSL: "false"
+        run: |
+          set -euo pipefail
+          typeorm() { ./node_modules/.bin/typeorm "$1" -d dist/data-source.js; }
+          typeorm migration:run
+          for _ in src/migrations/*.ts; do typeorm migration:revert; done
+          left="$(psql "$DATABASE_URL" -Atc "select string_agg(table_name, ', ') from information_schema.tables where table_schema = 'public' and table_name like 'to\_%' and table_name <> 'to_migrations'")"
+          if [ -n "$left" ]; then
+            echo "::error::tables survive a full rollback ($left): a migration's down() does not undo its up()"
+            exit 1
+          fi
+          typeorm migration:run
+
+      - name: End-to-end tests (Postgres + Redis services, faked ledger / wallet / NATS)
+        run: npm run test:e2e

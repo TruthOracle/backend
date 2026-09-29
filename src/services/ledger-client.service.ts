@@ -152,7 +152,7 @@ export class LedgerClientService {
   }
 
   /**
-   * `depositRefs` is mandatory on the deployed Daml (truthoracle-v14 `UserWallet.depositRefs :
+   * `depositRefs` is mandatory on the deployed Daml (truthoracle-v16 `UserWallet.depositRefs :
    * [Text]`) and is THE confirmation rule of the deposit confirm pass, so a payload without it is
    * not "an older wallet" — it is the wrong package (or a changed JSON shape) and every read fails
    * closed as an upstream error rather than pretending the wallet carries no credits.
@@ -163,7 +163,7 @@ export class LedgerClientService {
     try {
       depositRefs = parseDepositRefs(p.depositRefs);
     } catch (err) {
-      this.logger.error(`UserWallet ${row.contractId} (owner ${asString(p.owner)}): ${(err as Error).message}; is TRUTHORACLE_PACKAGE_ID the deployed truthoracle-v14?`);
+      this.logger.error(`UserWallet ${row.contractId} (owner ${asString(p.owner)}): ${(err as Error).message}; is TRUTHORACLE_PACKAGE_ID the deployed truthoracle-v16?`);
       throw new ApiError(502, "upstream_failed", "ledger returned a UserWallet without depositRefs", { contractId: row.contractId });
     }
     return {
@@ -243,7 +243,7 @@ export class LedgerClientService {
  * id (`walletCreateCommandIdFor(owner)`), so two racing Creates collide on ledger command-dedup
  * instead of minting two wallets — UserWallet has no contract key to stop that on-ledger. The
  * credit itself is always an `Exercise Deposit { amountCC, txRef }` on the wallet that exists,
- * which is what appends `txRef` to `depositRefs` (mandatory `[Text]` on truthoracle-v14).
+ * which is what appends `txRef` to `depositRefs` (mandatory `[Text]` on truthoracle-v16).
  */
 export function userWalletCreateCommand(input: { templateId: string; admin: string; owner: string }): unknown {
   const zero = formatCC(0n);
@@ -269,7 +269,7 @@ export function walletCreateCommandIdFor(ownerParty: string): string {
 
 /**
  * Daml `[Text]` arrives as a JSON array on the JSON Ledger API v2. The field is mandatory on
- * truthoracle-v14, so anything else — missing, null, an Optional wrapper from another package
+ * truthoracle-v16, so anything else — missing, null, an Optional wrapper from another package
  * version — is a hard parse error: the caller must fail the read, never default to "no refs"
  * (which would let the confirm pass mistake a landed credit for one that never happened).
  */

@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import "./util/utc";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DataSource, type DataSourceOptions } from "typeorm";
