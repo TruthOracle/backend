@@ -34,9 +34,15 @@ export class KeycloakTokenService {
     let resolved: KeycloakConfig;
     if (target === "ledger" && this.config.isMainnet) {
       const z = this.config.zkpc;
-      resolved = { url: z.keycloakUrl, realm: z.keycloakRealm || "master", clientId: z.clientId, clientSecret: z.clientSecret };
+      resolved = {
+        url: z.keycloakUrl,
+        realm: z.keycloakRealm || "master",
+        clientId: z.clientId,
+        clientSecret: z.clientSecret,
+      };
     } else {
-      const override = target === "ledger" ? this.config.ledgerKeycloak : this.config.walletKeycloak;
+      const override =
+        target === "ledger" ? this.config.ledgerKeycloak : this.config.walletKeycloak;
       const base = this.config.keycloak;
       resolved = {
         url: override.url || base.url,
@@ -57,7 +63,11 @@ export class KeycloakTokenService {
   async bearerFor(target: "ledger" | "wallet"): Promise<string> {
     const creds = this.credentialsFor(target);
     if (!creds) {
-      throw new ApiError(502, "upstream_failed", `Keycloak credentials for the ${target} are not configured`);
+      throw new ApiError(
+        502,
+        "upstream_failed",
+        `Keycloak credentials for the ${target} are not configured`,
+      );
     }
     const key = `${creds.url}|${creds.realm}|${creds.clientId}`;
     const nowSec = Date.now() / 1000;
@@ -65,7 +75,9 @@ export class KeycloakTokenService {
     const mem = this.memory.get(key);
     if (mem && mem.expiresAtSec > nowSec + KeycloakTokenService.MARGIN_SEC) return mem.token;
 
-    const cached = await this.redis.getJson<{ token: string; expiresAtSec: number }>(`kc:${key}`).catch(() => null);
+    const cached = await this.redis
+      .getJson<{ token: string; expiresAtSec: number }>(`kc:${key}`)
+      .catch(() => null);
     if (cached && cached.expiresAtSec > nowSec + KeycloakTokenService.MARGIN_SEC) {
       this.memory.set(key, cached);
       return cached.token;
@@ -81,30 +93,48 @@ export class KeycloakTokenService {
     return entry.token;
   }
 
-  private async mint(creds: KeycloakConfig, target: string): Promise<{ token: string; expiresInSec: number }> {
+  private async mint(
+    creds: KeycloakConfig,
+    target: string,
+  ): Promise<{ token: string; expiresInSec: number }> {
     let res: Response;
     try {
-      res = await fetch(`${creds.url}/realms/${encodeURIComponent(creds.realm)}/protocol/openid-connect/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "client_credentials",
-          client_id: creds.clientId,
-          client_secret: creds.clientSecret,
-        }).toString(),
-        signal: AbortSignal.timeout(15_000),
-      });
+      res = await fetch(
+        `${creds.url}/realms/${encodeURIComponent(creds.realm)}/protocol/openid-connect/token`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "client_credentials",
+            client_id: creds.clientId,
+            client_secret: creds.clientSecret,
+          }).toString(),
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
     } catch (err) {
-      throw new ApiError(502, "upstream_failed", `Keycloak (${target}) unreachable: ${(err as Error).message}`);
+      throw new ApiError(
+        502,
+        "upstream_failed",
+        `Keycloak (${target}) unreachable: ${(err as Error).message}`,
+      );
     }
     if (!res.ok) {
-      throw new ApiError(502, "upstream_failed", `Keycloak (${target}) refused the client credentials (HTTP ${res.status})`);
+      throw new ApiError(
+        502,
+        "upstream_failed",
+        `Keycloak (${target}) refused the client credentials (HTTP ${res.status})`,
+      );
     }
-    const data = (await res.json().catch(() => ({}))) as { access_token?: unknown; expires_in?: unknown };
+    const data = (await res.json().catch(() => ({}))) as {
+      access_token?: unknown;
+      expires_in?: unknown;
+    };
     if (typeof data.access_token !== "string" || !data.access_token) {
       throw new ApiError(502, "upstream_failed", `Keycloak (${target}) returned no access_token`);
     }
-    const expiresInSec = typeof data.expires_in === "number" && data.expires_in > 0 ? data.expires_in : 900;
+    const expiresInSec =
+      typeof data.expires_in === "number" && data.expires_in > 0 ? data.expires_in : 900;
     return { token: data.access_token, expiresInSec };
   }
 

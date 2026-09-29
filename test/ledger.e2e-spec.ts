@@ -291,13 +291,25 @@ describe("markets", () => {
 
   it("filters, searches, sorts and validates the list query", async () => {
     const f = new LedgerFixture(TEST_TREASURY);
-    const a = f.createMarket({ marketId: 1, question: "Rain tomorrow?", ticker: "WEATHER-1-RAIN", eventTicker: "WEATHER-1" });
-    f.createMarket({ marketId: 2, question: "ETH above 5k?", ticker: "CRYPTO-1-ETH5K", eventTicker: "CRYPTO-1" });
+    const a = f.createMarket({
+      marketId: 1,
+      question: "Rain tomorrow?",
+      ticker: "WEATHER-1-RAIN",
+      eventTicker: "WEATHER-1",
+    });
+    f.createMarket({
+      marketId: 2,
+      question: "ETH above 5k?",
+      ticker: "CRYPTO-1-ETH5K",
+      eventTicker: "CRYPTO-1",
+    });
     f.resolveT0(a.market, "Yes");
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
     // Categories are the placeholder series' (empty until an operator sets them).
-    await ctx.dataSource.query(`UPDATE to_series SET category = 'weather' WHERE ticker = 'WEATHER'`);
+    await ctx.dataSource.query(
+      `UPDATE to_series SET category = 'weather' WHERE ticker = 'WEATHER'`,
+    );
     await ctx.dataSource.query(`UPDATE to_series SET category = 'crypto' WHERE ticker = 'CRYPTO'`);
 
     expect(

@@ -70,7 +70,13 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
 
   /** Claim `key` exactly once for `ttlMs`. True when this caller won (SET NX PX). */
   async claimOnce(key: string, ttlMs: number): Promise<boolean> {
-    const result = await this.client.set(this.key(key), "1", "PX", Math.max(1, Math.round(ttlMs)), "NX");
+    const result = await this.client.set(
+      this.key(key),
+      "1",
+      "PX",
+      Math.max(1, Math.round(ttlMs)),
+      "NX",
+    );
     return result === "OK";
   }
 
@@ -100,7 +106,10 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
    * cannot release a lock the TTL already handed to someone else — a plain GET-then-DEL would
    * leave exactly that window open.
    */
-  async acquireLock(key: string, ttlMs: number): Promise<{ acquired: boolean; release(): Promise<void> }> {
+  async acquireLock(
+    key: string,
+    ttlMs: number,
+  ): Promise<{ acquired: boolean; release(): Promise<void> }> {
     const k = this.key(key);
     const token = randomBytes(12).toString("base64url");
     const result = await this.client.set(k, token, "PX", Math.max(1, Math.round(ttlMs)), "NX");

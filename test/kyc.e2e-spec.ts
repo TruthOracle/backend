@@ -25,9 +25,19 @@ import { KycWebhookEventEntity } from "../src/entities/kyc-webhook-event.entity"
 import { UserEntity } from "../src/entities/user.entity";
 import { KycWebhookProcessor, kycWebhookNakDelayMs } from "../src/processors/kyc-webhook.processor";
 import { IdentityService } from "../src/services/identity.service";
-import { KycProviderSumsubService, redactSumsubPayload, signSumsubRequest } from "../src/services/kyc-provider-sumsub.service";
+import {
+  KycProviderSumsubService,
+  redactSumsubPayload,
+  signSumsubRequest,
+} from "../src/services/kyc-provider-sumsub.service";
 import { KycService, type KycSessionStart } from "../src/services/kyc.service";
-import { type ApiKycSummary, type ApiKycVerification, type ApiMe, KYC_PROVIDER, type UserKycStatus } from "../src/types";
+import {
+  type ApiKycSummary,
+  type ApiKycVerification,
+  type ApiMe,
+  KYC_PROVIDER,
+  type UserKycStatus,
+} from "../src/types";
 import type { ErrorBody } from "../src/util/errors";
 import { type TestApp, testEnv, useTestApp } from "./helpers/app";
 import { FakeKycProvider, subjectMatches } from "./helpers/fakes";
@@ -73,7 +83,8 @@ function fingerprint(pepper: string, canonical: string): string {
 
 /** Asymmetric matchers are typed `any`; these keep them usable inside object literals under the lint rules. */
 const anyString = (): unknown => expect.any(String) as unknown;
-const containing = (subset: Record<string, unknown>): unknown => expect.objectContaining(subset) as unknown;
+const containing = (subset: Record<string, unknown>): unknown =>
+  expect.objectContaining(subset) as unknown;
 
 // ─────────────────────────────────────────── HTTP plumbing ───────────────────────────────────────
 
@@ -91,12 +102,20 @@ async function kycSummary(ctx: TestApp, cookie: string): Promise<Reply<KycSummar
 
 /** `POST /kyc/sessions`. */
 async function kycStart(ctx: TestApp, cookie: string): Promise<Reply<KycSessionStart>> {
-  return reply<KycSessionStart>(await http(ctx).post("/api/v1/kyc/sessions").set("Cookie", cookie).set(ctx.csrf).send({}));
+  return reply<KycSessionStart>(
+    await http(ctx).post("/api/v1/kyc/sessions").set("Cookie", cookie).set(ctx.csrf).send({}),
+  );
 }
 
 /** `POST /kyc/mock/submit` (mock provider only). */
-async function kycMockSubmit(ctx: TestApp, cookie: string, dto: KycMockSubmitDto): Promise<Reply<MockSubmitBody>> {
-  return reply<MockSubmitBody>(await http(ctx).post("/api/v1/kyc/mock/submit").set("Cookie", cookie).set(ctx.csrf).send(dto));
+async function kycMockSubmit(
+  ctx: TestApp,
+  cookie: string,
+  dto: KycMockSubmitDto,
+): Promise<Reply<MockSubmitBody>> {
+  return reply<MockSubmitBody>(
+    await http(ctx).post("/api/v1/kyc/mock/submit").set("Cookie", cookie).set(ctx.csrf).send(dto),
+  );
 }
 
 /** `GET /me` (API.md "Me"). */
@@ -135,7 +154,11 @@ async function newUser(ctx: TestApp, hint: string): Promise<Account> {
 }
 
 /** Attaches a second Telegram identity in link mode (the widget route with the session cookie). */
-async function linkTelegram(ctx: TestApp, cookie: string, hint: string): Promise<{ telegram: TelegramTestUser; identityId: string }> {
+async function linkTelegram(
+  ctx: TestApp,
+  cookie: string,
+  hint: string,
+): Promise<{ telegram: TelegramTestUser; identityId: string }> {
   const telegram = nextTelegramUser(hint);
   const { result } = await signInWithTelegram(http(ctx), telegram, { cookie });
   expect(result.mode).toBe("link");
@@ -143,16 +166,30 @@ async function linkTelegram(ctx: TestApp, cookie: string, hint: string): Promise
 }
 
 /** A second session for the same account, authenticated by an already-linked Telegram identity (`session.auth_identity_id` = that identity). */
-async function signInAgain(ctx: TestApp, telegram: TelegramTestUser): Promise<{ cookie: string; identityId: string }> {
+async function signInAgain(
+  ctx: TestApp,
+  telegram: TelegramTestUser,
+): Promise<{ cookie: string; identityId: string }> {
   const { cookie, result } = await signInWithTelegram(http(ctx), telegram);
   expect(result).toMatchObject({ mode: "login", created: false });
   return { cookie, identityId: result.identity.id };
 }
 
 /** Session → approved submission; returns the verification id. */
-async function approve(ctx: TestApp, cookie: string, person = PERSON, documents: KycMockDocumentDto[] = [PASSPORT]): Promise<string> {
+async function approve(
+  ctx: TestApp,
+  cookie: string,
+  person = PERSON,
+  documents: KycMockDocumentDto[] = [PASSPORT],
+): Promise<string> {
   const started = ok(await kycStart(ctx, cookie));
-  const done = ok(await kycMockSubmit(ctx, cookie, submission(started.verificationId, "approved", person, documents)));
+  const done = ok(
+    await kycMockSubmit(
+      ctx,
+      cookie,
+      submission(started.verificationId, "approved", person, documents),
+    ),
+  );
   expect(done.verification.status).toBe("approved");
   return started.verificationId;
 }
@@ -161,7 +198,8 @@ const personsOf = (ctx: TestApp, userId: string): Promise<KycPersonEntity[]> =>
   ctx.dataSource.getRepository(KycPersonEntity).find({ where: { userId }, order: { kind: "ASC" } });
 const auditRows = (ctx: TestApp, action: string): Promise<AuditEventEntity[]> =>
   ctx.dataSource.getRepository(AuditEventEntity).find({ where: { action }, order: { id: "ASC" } });
-const userRow = (ctx: TestApp, id: string): Promise<UserEntity> => ctx.dataSource.getRepository(UserEntity).findOneByOrFail({ id });
+const userRow = (ctx: TestApp, id: string): Promise<UserEntity> =>
+  ctx.dataSource.getRepository(UserEntity).findOneByOrFail({ id });
 const identityRow = (ctx: TestApp, id: string): Promise<AuthIdentityEntity> =>
   ctx.dataSource.getRepository(AuthIdentityEntity).findOneByOrFail({ id });
 
@@ -179,10 +217,18 @@ async function persistedText(ctx: TestApp): Promise<string> {
 
 // ─────────────────────────────────────────── Sumsub webhook plumbing ─────────────────────────────
 
-const DIGEST_HASH: Record<string, string> = { HMAC_SHA256_HEX: "sha256", HMAC_SHA512_HEX: "sha512", HMAC_SHA1_HEX: "sha1" };
+const DIGEST_HASH: Record<string, string> = {
+  HMAC_SHA256_HEX: "sha256",
+  HMAC_SHA512_HEX: "sha512",
+  HMAC_SHA1_HEX: "sha1",
+};
 
 /** A Sumsub applicant event; `clientComment` is present precisely so we can prove it is dropped (§5, §9.7). */
-function sumsubEvent(userId: string, type = "applicantReviewed", extra: Record<string, unknown> = {}): Record<string, unknown> {
+function sumsubEvent(
+  userId: string,
+  type = "applicantReviewed",
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
   const reviewed = type === "applicantReviewed";
   return {
     applicantId: SUMSUB_APPLICANT,
@@ -200,10 +246,23 @@ function sumsubEvent(userId: string, type = "applicantReviewed", extra: Record<s
   };
 }
 
-function signed(body: Record<string, unknown>, alg = "HMAC_SHA256_HEX", secret = WEBHOOK_SECRET): { raw: Buffer; headers: Record<string, string> } {
+function signed(
+  body: Record<string, unknown>,
+  alg = "HMAC_SHA256_HEX",
+  secret = WEBHOOK_SECRET,
+): { raw: Buffer; headers: Record<string, string> } {
   const raw = Buffer.from(JSON.stringify(body), "utf8");
-  const digest = createHmac(DIGEST_HASH[alg] ?? "sha256", secret).update(raw).digest("hex");
-  return { raw, headers: { "Content-Type": "application/json", "x-payload-digest": digest, "x-payload-digest-alg": alg } };
+  const digest = createHmac(DIGEST_HASH[alg] ?? "sha256", secret)
+    .update(raw)
+    .digest("hex");
+  return {
+    raw,
+    headers: {
+      "Content-Type": "application/json",
+      "x-payload-digest": digest,
+      "x-payload-digest-alg": alg,
+    },
+  };
 }
 
 const eventKeyOf = (raw: Buffer): string => createHash("sha256").update(raw).digest("hex");
@@ -221,10 +280,16 @@ describe("KYC (e2e)", () => {
 
     it("GET /admin/kyc/provider reports the mock provider as configured with no upstream probe", async () => {
       const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
-      const status = ok<{ provider: string; configured: boolean; health: { ok: boolean; upstreamStatus: number | null } }>(
-        await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200),
-      );
-      expect(status).toMatchObject({ provider: "mock", configured: true, health: { ok: true, upstreamStatus: null } });
+      const status = ok<{
+        provider: string;
+        configured: boolean;
+        health: { ok: boolean; upstreamStatus: number | null };
+      }>(await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200));
+      expect(status).toMatchObject({
+        provider: "mock",
+        configured: true,
+        health: { ok: true, upstreamStatus: null },
+      });
     });
 
     it("GET /kyc → provider mock, status none, requiredForWithdrawal false; the §9.4 gate lets an unverified account through", async () => {
@@ -241,18 +306,36 @@ describe("KYC (e2e)", () => {
       expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({ allowed: true });
     });
 
-    it("GET /me: kycRequiredForWithdrawal false, canWithdraw and canDeposit true without any verification (API.md \"Me\", §9.4)", async () => {
+    it('GET /me: kycRequiredForWithdrawal false, canWithdraw and canDeposit true without any verification (API.md "Me", §9.4)', async () => {
       const u = await newUser(ctx, "def-me");
       const view = await me(ctx, u.cookie);
-      expect(view.kyc).toEqual({ provider: "mock", status: "none", levelName: ctx.config.kycRequiredLevel, requiredForWithdrawal: false, attachedIdentityId: null, verification: null });
-      expect(view.capabilities).toEqual({ kycRequiredForWithdrawal: false, canWithdraw: true, canDeposit: true, primaryPartyId: u.wallet.partyId, isAdmin: false });
+      expect(view.kyc).toEqual({
+        provider: "mock",
+        status: "none",
+        levelName: ctx.config.kycRequiredLevel,
+        requiredForWithdrawal: false,
+        attachedIdentityId: null,
+        verification: null,
+      });
+      expect(view.capabilities).toEqual({
+        kycRequiredForWithdrawal: false,
+        canWithdraw: true,
+        canDeposit: true,
+        primaryPartyId: u.wallet.partyId,
+        isAdmin: false,
+      });
     });
 
     it("GET /kyc and POST /kyc/sessions need a session; POST /kyc/sessions is CSRF-checked", async () => {
       await http(ctx).get("/api/v1/kyc").expect(401);
       await http(ctx).post("/api/v1/kyc/sessions").set(ctx.csrf).send({}).expect(401);
       const u = await newUser(ctx, "guard");
-      const csrf = await http(ctx).post("/api/v1/kyc/sessions").set("Cookie", u.cookie).set("Content-Type", "application/json").send({}).expect(403);
+      const csrf = await http(ctx)
+        .post("/api/v1/kyc/sessions")
+        .set("Cookie", u.cookie)
+        .set("Content-Type", "application/json")
+        .send({})
+        .expect(403);
       expect(bodyOf<ErrorBody>(csrf).error).toBe("csrf_rejected");
     });
   });
@@ -263,35 +346,76 @@ describe("KYC (e2e)", () => {
 
     it("requiredForWithdrawal is true; an unverified account cannot withdraw (gate: kyc_required) but can deposit", async () => {
       const u = await newUser(ctx, "enf");
-      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ provider: "mock", status: "none", requiredForWithdrawal: true });
-      expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({ allowed: false, reason: "kyc_required" });
-      expect((await me(ctx, u.cookie)).capabilities).toMatchObject({ kycRequiredForWithdrawal: true, canWithdraw: false, canDeposit: true });
+      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({
+        provider: "mock",
+        status: "none",
+        requiredForWithdrawal: true,
+      });
+      expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({
+        allowed: false,
+        reason: "kyc_required",
+      });
+      expect((await me(ctx, u.cookie)).capabilities).toMatchObject({
+        kycRequiredForWithdrawal: true,
+        canWithdraw: false,
+        canDeposit: true,
+      });
     });
 
     it("POST /kyc/sessions opens attempt 1 attached to the signed-in identity; GET /kyc reports pending; the refresh call reuses it (§9.1, §9.5)", async () => {
       const u = await newUser(ctx, "start");
       const started = ok(await kycStart(ctx, u.cookie));
-      expect(started).toEqual({ provider: "mock", verificationId: anyString(), levelName: ctx.config.kycRequiredLevel });
+      expect(started).toEqual({
+        provider: "mock",
+        verificationId: anyString(),
+        levelName: ctx.config.kycRequiredLevel,
+      });
       const verificationId = started.verificationId;
 
       const summary = ok(await kycSummary(ctx, u.cookie));
-      expect(summary).toMatchObject({ provider: "mock", status: "pending", requiredForWithdrawal: true, attachedIdentityId: u.identityId });
-      expect(summary.verification).toMatchObject({ id: verificationId, provider: "mock", attemptNo: 1, status: "initiated", rejectLabels: [], moderationComment: null, reviewedAt: null });
+      expect(summary).toMatchObject({
+        provider: "mock",
+        status: "pending",
+        requiredForWithdrawal: true,
+        attachedIdentityId: u.identityId,
+      });
+      expect(summary.verification).toMatchObject({
+        id: verificationId,
+        provider: "mock",
+        attemptNo: 1,
+        status: "initiated",
+        rejectLabels: [],
+        moderationComment: null,
+        reviewedAt: null,
+      });
       expect(summary.history).toHaveLength(1);
 
       // The same route serves the WebSDK token refresh: an in-flight attempt is reused, not duplicated (§9.1).
       expect(ok(await kycStart(ctx, u.cookie)).verificationId).toBe(verificationId);
-      expect(await ctx.dataSource.getRepository(KycVerificationEntity).count({ where: { userId: u.user.id } })).toBe(1);
+      expect(
+        await ctx.dataSource
+          .getRepository(KycVerificationEntity)
+          .count({ where: { userId: u.user.id } }),
+      ).toBe(1);
 
-      const row = await ctx.dataSource.getRepository(KycVerificationEntity).findOneByOrFail({ id: verificationId });
+      const row = await ctx.dataSource
+        .getRepository(KycVerificationEntity)
+        .findOneByOrFail({ id: verificationId });
       expect(row.initiatedIdentityId).toBe(u.identityId);
       expect((await userRow(ctx, u.user.id)).kycStatus).toBe("pending");
 
       // §9.5: the session's kind and identity are on the audit event; NATS carries ids only.
       const audit = await auditRows(ctx, "kyc.session_started");
       expect(audit).toHaveLength(1);
-      expect(audit[0].metadata).toMatchObject({ verificationId, provider: "mock", identityId: u.identityId, sessionKind: "user" });
-      expect(ctx.nats.publishedOn("truthoracle.kyc.session_started")).toEqual([containing({ payload: { userId: u.user.id, verificationId, provider: "mock" } })]);
+      expect(audit[0].metadata).toMatchObject({
+        verificationId,
+        provider: "mock",
+        identityId: u.identityId,
+        sessionKind: "user",
+      });
+      expect(ctx.nats.publishedOn("truthoracle.kyc.session_started")).toEqual([
+        containing({ payload: { userId: u.user.id, verificationId, provider: "mock" } }),
+      ]);
     });
 
     it("approved submission → verification approved, users.kyc_status approved, GET /me canWithdraw true; nothing raw is persisted (§9.3, §9.4, §9.7)", async () => {
@@ -299,28 +423,57 @@ describe("KYC (e2e)", () => {
       const verificationId = ok(await kycStart(ctx, u.cookie)).verificationId;
       const done = ok(await kycMockSubmit(ctx, u.cookie, submission(verificationId, "approved")));
       expect(done.userKycStatus).toBe("approved");
-      expect(done.verification).toMatchObject({ id: verificationId, provider: "mock", attemptNo: 1, status: "approved", rejectLabels: [] });
+      expect(done.verification).toMatchObject({
+        id: verificationId,
+        provider: "mock",
+        attemptNo: 1,
+        status: "approved",
+        rejectLabels: [],
+      });
       expect(done.verification.reviewedAt).toEqual(expect.any(String));
 
       const summary = ok(await kycSummary(ctx, u.cookie));
       expect(summary).toMatchObject({ status: "approved", attachedIdentityId: u.identityId });
       expect(summary.verification?.id).toBe(verificationId);
       expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({ allowed: true });
-      expect(await userRow(ctx, u.user.id)).toMatchObject({ kycStatus: "approved", kycVerificationId: verificationId });
+      expect(await userRow(ctx, u.user.id)).toMatchObject({
+        kycStatus: "approved",
+        kycVerificationId: verificationId,
+      });
 
       const view = await me(ctx, u.cookie);
       expect(view.user.kycStatus).toBe("approved");
       expect(view.kyc).toMatchObject({ status: "approved", attachedIdentityId: u.identityId });
-      expect(view.capabilities).toMatchObject({ canWithdraw: true, canDeposit: true, kycRequiredForWithdrawal: true, primaryPartyId: u.wallet.partyId });
+      expect(view.capabilities).toMatchObject({
+        canWithdraw: true,
+        canDeposit: true,
+        kycRequiredForWithdrawal: true,
+        primaryPartyId: u.wallet.partyId,
+      });
       expect(view.identities.find((i) => i.id === u.identityId)?.kycLocked).toBe(true);
 
       expect(ctx.nats.publishedOn("truthoracle.kyc.status_changed")).toEqual([
-        containing({ payload: containing({ userId: u.user.id, verificationId, status: "approved", userKycStatus: "approved" }) }),
+        containing({
+          payload: containing({
+            userId: u.user.id,
+            verificationId,
+            status: "approved",
+            userKycStatus: "approved",
+          }),
+        }),
       ]);
       // §9.7 audit allow-list: verificationId, provider, level, status, rejectType, labels, attemptNo.
       const changed = await auditRows(ctx, "kyc.status_changed");
       expect(changed).toHaveLength(1);
-      expect(Object.keys(changed[0].metadata).sort()).toEqual(["attemptNo", "labels", "level", "provider", "rejectType", "status", "verificationId"]);
+      expect(Object.keys(changed[0].metadata).sort()).toEqual([
+        "attemptNo",
+        "labels",
+        "level",
+        "provider",
+        "rejectType",
+        "status",
+        "verificationId",
+      ]);
       const text = await persistedText(ctx);
       for (const raw of RAW_VALUES) expect(text).not.toContain(raw);
     });
@@ -331,7 +484,14 @@ describe("KYC (e2e)", () => {
       const rows = await personsOf(ctx, u.user.id);
       expect(rows.map((r) => r.kind)).toEqual(["doc", "person"]);
       for (const row of rows) {
-        expect(row).toMatchObject({ userId: u.user.id, verificationId, fingerprintVersion: 1, releasedAt: null, releasedBy: null, releaseReason: null });
+        expect(row).toMatchObject({
+          userId: u.user.id,
+          verificationId,
+          fingerprintVersion: 1,
+          releasedAt: null,
+          releasedBy: null,
+          releaseReason: null,
+        });
         expect(row.fingerprint).toMatch(/^[0-9a-f]{64}$/);
       }
       const pepper = ctx.config.kycFingerprintPepper;
@@ -345,18 +505,33 @@ describe("KYC (e2e)", () => {
 
       const second = await newUser(ctx, "dup-b");
       const verificationId = ok(await kycStart(ctx, second.cookie)).verificationId;
-      const done = ok(await kycMockSubmit(ctx, second.cookie, submission(verificationId, "approved", OTHER_PERSON, [PASSPORT])));
+      const done = ok(
+        await kycMockSubmit(
+          ctx,
+          second.cookie,
+          submission(verificationId, "approved", OTHER_PERSON, [PASSPORT]),
+        ),
+      );
       expect(done.verification.status).toBe("blocked_duplicate");
       expect(done.userKycStatus).toBe("blocked_duplicate");
-      expect(await userRow(ctx, second.user.id)).toMatchObject({ kycStatus: "blocked_duplicate", kycVerificationId: verificationId });
+      expect(await userRow(ctx, second.user.id)).toMatchObject({
+        kycStatus: "blocked_duplicate",
+        kycVerificationId: verificationId,
+      });
 
       // The binding stays with the first account; the second account gets no (partial) binding.
       expect(await personsOf(ctx, second.user.id)).toEqual([]);
       const firstRows = await personsOf(ctx, first.user.id);
       expect(firstRows).toHaveLength(2);
-      expect(firstRows.every((r) => r.verificationId === firstVerification && r.releasedAt === null)).toBe(true);
+      expect(
+        firstRows.every((r) => r.verificationId === firstVerification && r.releasedAt === null),
+      ).toBe(true);
 
-      const refusedStart = refused(await kycStart(ctx, second.cookie), 409, "kyc_duplicate_identity");
+      const refusedStart = refused(
+        await kycStart(ctx, second.cookie),
+        409,
+        "kyc_duplicate_identity",
+      );
       const view = await me(ctx, second.cookie);
       expect(view.kyc.status).toBe("blocked_duplicate");
       expect(view.capabilities).toMatchObject({ canDeposit: false, canWithdraw: false });
@@ -366,13 +541,20 @@ describe("KYC (e2e)", () => {
         expect(JSON.stringify(view)).not.toContain(secret);
       }
 
-      expect(ok(await kycSummary(ctx, second.cookie))).toMatchObject({ status: "blocked_duplicate" });
-      expect(await ctx.get(KycService).withdrawalGate(second.user.id)).toEqual({ allowed: false, reason: "kyc_duplicate_identity" });
+      expect(ok(await kycSummary(ctx, second.cookie))).toMatchObject({
+        status: "blocked_duplicate",
+      });
+      expect(await ctx.get(KycService).withdrawalGate(second.user.id)).toEqual({
+        allowed: false,
+        reason: "kyc_duplicate_identity",
+      });
 
       const detected = await auditRows(ctx, "kyc.duplicate_detected");
       expect(detected).toHaveLength(1);
       expect(detected[0].subjectId).toBe(verificationId);
-      expect(ctx.nats.publishedOn("truthoracle.kyc.duplicate_detected")).toEqual([containing({ payload: containing({ userId: second.user.id, verificationId }) })]);
+      expect(ctx.nats.publishedOn("truthoracle.kyc.duplicate_detected")).toEqual([
+        containing({ payload: containing({ userId: second.user.id, verificationId }) }),
+      ]);
       const text = await persistedText(ctx);
       for (const raw of RAW_VALUES) expect(text).not.toContain(raw);
     });
@@ -384,14 +566,22 @@ describe("KYC (e2e)", () => {
       const second = await newUser(ctx, "pk-b");
       const verificationId = ok(await kycStart(ctx, second.cookie)).verificationId;
       const otherPassport: KycMockDocumentDto = { ...PASSPORT, number: "X7654321" };
-      const done = ok(await kycMockSubmit(ctx, second.cookie, submission(verificationId, "approved", PERSON, [otherPassport])));
+      const done = ok(
+        await kycMockSubmit(
+          ctx,
+          second.cookie,
+          submission(verificationId, "approved", PERSON, [otherPassport]),
+        ),
+      );
       expect(done.verification.status).toBe("blocked_duplicate");
       expect(done.userKycStatus).toBe("blocked_duplicate");
 
       // The fresh doc key was inserted under a savepoint and rolled back with the collision.
       expect(await personsOf(ctx, second.user.id)).toEqual([]);
       const freshDocKey = fingerprint(ctx.config.kycFingerprintPepper, "IND|PASSPORT|X7654321");
-      expect(await ctx.dataSource.getRepository(KycPersonEntity).findOneBy({ fingerprint: freshDocKey })).toBeNull();
+      expect(
+        await ctx.dataSource.getRepository(KycPersonEntity).findOneBy({ fingerprint: freshDocKey }),
+      ).toBeNull();
       refused(await kycStart(ctx, second.cookie), 409, "kyc_duplicate_identity");
     });
 
@@ -401,14 +591,26 @@ describe("KYC (e2e)", () => {
 
       const second = await newUser(ctx, "norm-b");
       const v2 = ok(await kycStart(ctx, second.cookie)).verificationId;
-      const messy: KycMockDocumentDto = { docType: "PASSPORT", country: "ind", number: " z-1234567 " };
-      const dup = ok(await kycMockSubmit(ctx, second.cookie, submission(v2, "approved", OTHER_PERSON, [messy])));
+      const messy: KycMockDocumentDto = {
+        docType: "PASSPORT",
+        country: "ind",
+        number: " z-1234567 ",
+      };
+      const dup = ok(
+        await kycMockSubmit(ctx, second.cookie, submission(v2, "approved", OTHER_PERSON, [messy])),
+      );
       expect(dup.verification.status).toBe("blocked_duplicate");
 
       const third = await newUser(ctx, "norm-c");
       const v3 = ok(await kycStart(ctx, third.cookie)).verificationId;
       const different: KycMockDocumentDto = { ...PASSPORT, number: "Z1234568" };
-      const fine = ok(await kycMockSubmit(ctx, third.cookie, submission(v3, "approved", OTHER_PERSON, [different])));
+      const fine = ok(
+        await kycMockSubmit(
+          ctx,
+          third.cookie,
+          submission(v3, "approved", OTHER_PERSON, [different]),
+        ),
+      );
       expect(fine.verification.status).toBe("approved");
       expect((await personsOf(ctx, third.user.id)).map((r) => r.kind)).toEqual(["doc", "person"]);
     });
@@ -416,12 +618,20 @@ describe("KYC (e2e)", () => {
     it("approved with no identity document → needs_review, never approved; no binding, gate still refuses (§9.3)", async () => {
       const u = await newUser(ctx, "nr");
       const verificationId = ok(await kycStart(ctx, u.cookie)).verificationId;
-      const done = ok(await kycMockSubmit(ctx, u.cookie, submission(verificationId, "approved", PERSON, [])));
+      const done = ok(
+        await kycMockSubmit(ctx, u.cookie, submission(verificationId, "approved", PERSON, [])),
+      );
       expect(done.verification.status).toBe("needs_review");
       expect(done.userKycStatus).toBe("pending");
-      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ status: "pending", verification: containing({ id: verificationId, status: "needs_review" }) });
+      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({
+        status: "pending",
+        verification: containing({ id: verificationId, status: "needs_review" }),
+      });
       expect(await personsOf(ctx, u.user.id)).toEqual([]);
-      expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({ allowed: false, reason: "kyc_required" });
+      expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({
+        allowed: false,
+        reason: "kyc_required",
+      });
       expect((await me(ctx, u.cookie)).capabilities.canWithdraw).toBe(false);
       expect(await auditRows(ctx, "kyc.needs_review")).toHaveLength(1);
     });
@@ -432,7 +642,10 @@ describe("KYC (e2e)", () => {
       const done = ok(await kycMockSubmit(ctx, u.cookie, submission(v1, "rejected_retry")));
       expect(done.verification.status).toBe("rejected_retry");
       expect(done.userKycStatus).toBe("rejected");
-      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ status: "rejected", verification: containing({ id: v1, status: "rejected_retry" }) });
+      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({
+        status: "rejected",
+        verification: containing({ id: v1, status: "rejected_retry" }),
+      });
 
       const v2 = ok(await kycStart(ctx, u.cookie)).verificationId;
       expect(v2).not.toBe(v1);
@@ -440,7 +653,10 @@ describe("KYC (e2e)", () => {
       expect(summary).toMatchObject({ status: "pending", attachedIdentityId: u.identityId });
       expect(summary.verification).toMatchObject({ id: v2, attemptNo: 2, status: "initiated" });
       expect(summary.history.map((v) => v.attemptNo)).toEqual([2, 1]);
-      expect((await ctx.dataSource.getRepository(KycVerificationEntity).findOneByOrFail({ id: v2 })).attemptNo).toBe(2);
+      expect(
+        (await ctx.dataSource.getRepository(KycVerificationEntity).findOneByOrFail({ id: v2 }))
+          .attemptNo,
+      ).toBe(2);
     });
 
     it("rejected_final → GET /kyc rejected; the attempt is closed to further mock outcomes, but a new session is still allowed (§9.2; API.md lists only kyc_duplicate_identity / kyc_provider_unavailable as refusals)", async () => {
@@ -450,7 +666,10 @@ describe("KYC (e2e)", () => {
       expect(done.verification.status).toBe("rejected_final");
       expect(done.userKycStatus).toBe("rejected");
       expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ status: "rejected" });
-      expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({ allowed: false, reason: "kyc_required" });
+      expect(await ctx.get(KycService).withdrawalGate(u.user.id)).toEqual({
+        allowed: false,
+        reason: "kyc_required",
+      });
 
       // A final decision cannot be re-driven through the same verification.
       expect((await kycMockSubmit(ctx, u.cookie, submission(v1, "approved"))).status).toBe(409);
@@ -458,23 +677,43 @@ describe("KYC (e2e)", () => {
       // The §9.2 lifecycle has no "no more sessions" state other than blocked_duplicate (§9.3).
       const v2 = ok(await kycStart(ctx, u.cookie)).verificationId;
       expect(v2).not.toBe(v1);
-      expect(ok(await kycSummary(ctx, u.cookie)).verification).toMatchObject({ id: v2, attemptNo: 2, status: "initiated" });
+      expect(ok(await kycSummary(ctx, u.cookie)).verification).toMatchObject({
+        id: v2,
+        attemptNo: 2,
+        status: "initiated",
+      });
     });
 
     it("mock submit is scoped to the caller: another account's verification and an unknown id are 404; the body is validated", async () => {
       const owner = await newUser(ctx, "scope-a");
       const v = ok(await kycStart(ctx, owner.cookie)).verificationId;
       const intruder = await newUser(ctx, "scope-b");
-      refused(await kycMockSubmit(ctx, intruder.cookie, submission(v, "approved")), 404, "not_found");
-      refused(await kycMockSubmit(ctx, owner.cookie, submission(randomUUID(), "approved")), 404, "not_found");
+      refused(
+        await kycMockSubmit(ctx, intruder.cookie, submission(v, "approved")),
+        404,
+        "not_found",
+      );
+      refused(
+        await kycMockSubmit(ctx, owner.cookie, submission(randomUUID(), "approved")),
+        404,
+        "not_found",
+      );
       const bad = await http(ctx)
         .post("/api/v1/kyc/mock/submit")
         .set("Cookie", owner.cookie)
         .set(ctx.csrf)
-        .send({ verificationId: v, outcome: "approved", person: { ...PERSON, country: "India" }, documents: [{ ...PASSPORT, docType: "VISA" }] })
+        .send({
+          verificationId: v,
+          outcome: "approved",
+          person: { ...PERSON, country: "India" },
+          documents: [{ ...PASSPORT, docType: "VISA" }],
+        })
         .expect(400);
       expect(bodyOf<ErrorBody>(bad).error).toBe("validation_failed");
-      expect((await ctx.dataSource.getRepository(KycVerificationEntity).findOneByOrFail({ id: v })).status).toBe("initiated");
+      expect(
+        (await ctx.dataSource.getRepository(KycVerificationEntity).findOneByOrFail({ id: v }))
+          .status,
+      ).toBe("initiated");
     });
 
     it("identity lock: the identity that started the approval cannot be unlinked (409 identity_locked_by_kyc); GET /me marks it kycLocked; the wallet is not involved (§6.5, §9.5)", async () => {
@@ -486,18 +725,35 @@ describe("KYC (e2e)", () => {
       expect(b.identityId).toBe(linked.identityId);
 
       const verificationId = await approve(ctx, b.cookie);
-      expect(ok(await kycSummary(ctx, a.cookie))).toMatchObject({ status: "approved", attachedIdentityId: b.identityId, verification: containing({ id: verificationId }) });
+      expect(ok(await kycSummary(ctx, a.cookie))).toMatchObject({
+        status: "approved",
+        attachedIdentityId: b.identityId,
+        verification: containing({ id: verificationId }),
+      });
 
-      const locked = await http(ctx).delete(`/api/v1/me/identities/${b.identityId}`).set("Cookie", a.cookie).set(ctx.csrf).expect(409);
+      const locked = await http(ctx)
+        .delete(`/api/v1/me/identities/${b.identityId}`)
+        .set("Cookie", a.cookie)
+        .set(ctx.csrf)
+        .expect(409);
       expect(bodyOf<ErrorBody>(locked).error).toBe("identity_locked_by_kyc");
       expect((await identityRow(ctx, b.identityId)).status).toBe("active");
 
       const view = await me(ctx, a.cookie);
-      expect(view.identities.map((i) => [i.id, i.kycLocked]).sort()).toEqual([[a.identityId, false], [b.identityId, true]].sort());
+      expect(view.identities.map((i) => [i.id, i.kycLocked]).sort()).toEqual(
+        [
+          [a.identityId, false],
+          [b.identityId, true],
+        ].sort(),
+      );
       // The linked wallet is a funding rail, not an identity (§8.1): the lock never applies to it, only §8.2 does.
       const walletA = view.wallets.find((w) => w.partyId === a.wallet.partyId);
       expect(walletA?.isPrimary).toBe(true);
-      const viaWallet = await http(ctx).delete(`/api/v1/wallets/${walletA?.id}`).set("Cookie", a.cookie).set(ctx.csrf).expect(409);
+      const viaWallet = await http(ctx)
+        .delete(`/api/v1/wallets/${walletA?.id}`)
+        .set("Cookie", a.cookie)
+        .set(ctx.csrf)
+        .expect(409);
       expect(bodyOf<ErrorBody>(viaWallet).error).toBe("primary_wallet_in_use");
     });
 
@@ -511,8 +767,15 @@ describe("KYC (e2e)", () => {
 
       await approve(ctx, b.cookie);
       expect(await kyc.lockedIdentityId(a.user.id)).toBe(b.identityId);
-      await expect(identities.unlink(a.user.id, b.identityId, { type: "user", userId: a.user.id })).rejects.toMatchObject({ status: 409, code: "identity_locked_by_kyc" });
-      expect(identities.toApi(await identityRow(ctx, b.identityId), await kyc.lockedIdentityId(a.user.id)).kycLocked).toBe(true);
+      await expect(
+        identities.unlink(a.user.id, b.identityId, { type: "user", userId: a.user.id }),
+      ).rejects.toMatchObject({ status: 409, code: "identity_locked_by_kyc" });
+      expect(
+        identities.toApi(
+          await identityRow(ctx, b.identityId),
+          await kyc.lockedIdentityId(a.user.id),
+        ).kycLocked,
+      ).toBe(true);
 
       // Admins can (§6.5).
       await identities.unlink(a.user.id, b.identityId, { type: "admin", userId: null });
@@ -527,11 +790,19 @@ describe("KYC (e2e)", () => {
     it("identity lock precedence: the sole identity that started the approval answers identity_locked_by_kyc, not last_identity (§6.5 vs §6.3)", async () => {
       const u = await newUser(ctx, "prec");
       await approve(ctx, u.cookie);
-      const res = await http(ctx).delete(`/api/v1/me/identities/${u.identityId}`).set("Cookie", u.cookie).set(ctx.csrf).expect(409);
+      const res = await http(ctx)
+        .delete(`/api/v1/me/identities/${u.identityId}`)
+        .set("Cookie", u.cookie)
+        .set(ctx.csrf)
+        .expect(409);
       expect(bodyOf<ErrorBody>(res).error).toBe("identity_locked_by_kyc");
       // Without the lock the same row is the last identity.
       const plain = await newUser(ctx, "prec-plain");
-      const last = await http(ctx).delete(`/api/v1/me/identities/${plain.identityId}`).set("Cookie", plain.cookie).set(ctx.csrf).expect(409);
+      const last = await http(ctx)
+        .delete(`/api/v1/me/identities/${plain.identityId}`)
+        .set("Cookie", plain.cookie)
+        .set(ctx.csrf)
+        .expect(409);
       expect(bodyOf<ErrorBody>(last).error).toBe("last_identity");
     });
   });
@@ -547,35 +818,77 @@ describe("KYC (e2e)", () => {
         ADMIN_OPERATORS: operator.partyId,
       },
     });
-    const webhookRows = (): Promise<KycWebhookEventEntity[]> => ctx.dataSource.getRepository(KycWebhookEventEntity).find({ order: { receivedAt: "ASC" } });
+    const webhookRows = (): Promise<KycWebhookEventEntity[]> =>
+      ctx.dataSource.getRepository(KycWebhookEventEntity).find({ order: { receivedAt: "ASC" } });
 
     it("GET /admin/kyc/provider probes Sumsub with a signed request and reports the wiring; 401 from Sumsub is named (docs/KYC.md §6)", async () => {
       const calls: { url: string; headers: Record<string, string> }[] = [];
       let answer = { status: 404, body: { description: "Applicant not found", code: 404 } };
       const realFetch = globalThis.fetch;
-      globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      globalThis.fetch = async (
+        input: string | URL | Request,
+        init?: RequestInit,
+      ): Promise<Response> => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         calls.push({ url, headers: (init?.headers ?? {}) as Record<string, string> });
-        return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify(answer.body), {
+          status: answer.status,
+          headers: { "content-type": "application/json" },
+        });
       };
       try {
         const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
-        const status = ok<{ provider: string; configured: boolean; levelName: string; enforceWithdrawals: boolean; webhookPath: string; health: { ok: boolean; upstreamStatus: number | null; message: string; details: Record<string, unknown> } }>(
+        const status = ok<{
+          provider: string;
+          configured: boolean;
+          levelName: string;
+          enforceWithdrawals: boolean;
+          webhookPath: string;
+          health: {
+            ok: boolean;
+            upstreamStatus: number | null;
+            message: string;
+            details: Record<string, unknown>;
+          };
+        }>(
           await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200),
         );
-        expect(status).toMatchObject({ provider: "sumsub", configured: true, levelName: "basic-kyc-level", enforceWithdrawals: false, webhookPath: "/api/v1/webhooks/kyc/sumsub" });
+        expect(status).toMatchObject({
+          provider: "sumsub",
+          configured: true,
+          levelName: "basic-kyc-level",
+          enforceWithdrawals: false,
+          webhookPath: "/api/v1/webhooks/kyc/sumsub",
+        });
         expect(status.health).toMatchObject({ ok: true, upstreamStatus: 404 });
-        expect(status.health.details).toMatchObject({ baseUrl: "https://api.sumsub.com", sandboxToken: true, webhookSecretConfigured: true, acceptedDigestAlgorithms: ["HMAC_SHA256_HEX", "HMAC_SHA512_HEX"] });
+        expect(status.health.details).toMatchObject({
+          baseUrl: "https://api.sumsub.com",
+          sandboxToken: true,
+          webhookSecretConfigured: true,
+          acceptedDigestAlgorithms: ["HMAC_SHA256_HEX", "HMAC_SHA512_HEX"],
+        });
         expect(calls).toHaveLength(1);
-        expect(calls[0].url).toMatch(/^https:\/\/api\.sumsub\.com\/resources\/applicants\/-;externalUserId=health-[0-9a-f-]+\/one$/);
+        expect(calls[0].url).toMatch(
+          /^https:\/\/api\.sumsub\.com\/resources\/applicants\/-;externalUserId=health-[0-9a-f-]+\/one$/,
+        );
         const h = calls[0].headers;
         expect(h["X-App-Token"]).toBe("sbx:e2e-app-token");
         expect(h["X-App-Access-Ts"]).toMatch(/^\d{10}$/);
         const path = calls[0].url.slice("https://api.sumsub.com".length);
-        expect(h["X-App-Access-Sig"]).toBe(signSumsubRequest("e2e-secret-key-not-used-by-these-tests", h["X-App-Access-Ts"], "GET", path));
+        expect(h["X-App-Access-Sig"]).toBe(
+          signSumsubRequest(
+            "e2e-secret-key-not-used-by-these-tests",
+            h["X-App-Access-Ts"],
+            "GET",
+            path,
+          ),
+        );
 
         answer = { status: 401, body: { description: "Invalid signature", code: 401 } };
-        const bad = ok<{ health: { ok: boolean; upstreamStatus: number | null; message: string } }>(await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200));
+        const bad = ok<{ health: { ok: boolean; upstreamStatus: number | null; message: string } }>(
+          await http(ctx).get("/api/v1/admin/kyc/provider").set("Cookie", admin.cookie).expect(200),
+        );
         expect(bad.health).toMatchObject({ ok: false, upstreamStatus: 401 });
         expect(bad.health.message).toContain("SUMSUB_APP_TOKEN / SUMSUB_SECRET_KEY");
       } finally {
@@ -588,9 +901,20 @@ describe("KYC (e2e)", () => {
 
     it("the mock controller is absent: POST /kyc/mock/submit → 404 not_found envelope; GET /kyc reports provider sumsub", async () => {
       const u = await newUser(ctx, "sumsub");
-      const res = await http(ctx).post("/api/v1/kyc/mock/submit").set("Cookie", u.cookie).set(ctx.csrf).send(submission(randomUUID(), "approved")).expect(404);
-      expect(res.body).toEqual({ error: "not_found", message: "Cannot POST /api/v1/kyc/mock/submit" });
-      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ provider: "sumsub", status: "none" });
+      const res = await http(ctx)
+        .post("/api/v1/kyc/mock/submit")
+        .set("Cookie", u.cookie)
+        .set(ctx.csrf)
+        .send(submission(randomUUID(), "approved"))
+        .expect(404);
+      expect(res.body).toEqual({
+        error: "not_found",
+        message: "Cannot POST /api/v1/kyc/mock/submit",
+      });
+      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({
+        provider: "sumsub",
+        status: "none",
+      });
     });
 
     it("POST /webhooks/kyc/sumsub: valid HMAC-SHA256 digest → 200 {received:true}, stored once on event_key without clientComment, {eventId} published (§9.2, §9.7)", async () => {
@@ -603,11 +927,20 @@ describe("KYC (e2e)", () => {
 
       const rows = await webhookRows();
       expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ provider: "sumsub", eventKey: eventKeyOf(raw), type: "applicantReviewed", sandbox: false });
+      expect(rows[0]).toMatchObject({
+        provider: "sumsub",
+        eventKey: eventKeyOf(raw),
+        type: "applicantReviewed",
+        sandbox: false,
+      });
       expect(JSON.stringify(rows[0].payload)).not.toContain("clientComment");
       expect(JSON.stringify(rows[0].payload)).toContain(SUMSUB_APPLICANT);
-      expect(ctx.nats.publishedOn("truthoracle.kyc.webhook.sumsub")).toEqual([containing({ payload: { eventId: rows[0].id } })]);
-      expect((await auditRows(ctx, "kyc.webhook_received")).map((a) => a.subjectId)).toEqual([rows[0].id]);
+      expect(ctx.nats.publishedOn("truthoracle.kyc.webhook.sumsub")).toEqual([
+        containing({ payload: { eventId: rows[0].id } }),
+      ]);
+      expect((await auditRows(ctx, "kyc.webhook_received")).map((a) => a.subjectId)).toEqual([
+        rows[0].id,
+      ]);
 
       // Replays are acknowledged and stored once (idempotent on event_key).
       await postWebhook(ctx, raw, headers).expect(200);
@@ -619,7 +952,10 @@ describe("KYC (e2e)", () => {
       const body = sumsubEvent(u.user.id);
       const good = signed(body);
 
-      const tampered = await postWebhook(ctx, good.raw, { ...good.headers, "x-payload-digest": "0".repeat(64) }).expect(401);
+      const tampered = await postWebhook(ctx, good.raw, {
+        ...good.headers,
+        "x-payload-digest": "0".repeat(64),
+      }).expect(401);
       expect(bodyOf<ErrorBody>(tampered).error).toBe("webhook_rejected");
       const wrongSecret = signed(body, "HMAC_SHA256_HEX", "not-the-secret");
       await postWebhook(ctx, wrongSecret.raw, wrongSecret.headers).expect(401);
@@ -644,19 +980,31 @@ describe("KYC (e2e)", () => {
 
     it("the durable consumer on truthoracle.kyc.webhook.<provider> re-reads the stored row, applies it and marks it processed (§9.2)", async () => {
       const u = await newUser(ctx, "wh-consume");
-      expect(ctx.nats.consumers.some((c) => subjectMatches(c.filterSubject, "truthoracle.kyc.webhook.sumsub"))).toBe(true);
+      expect(
+        ctx.nats.consumers.some((c) =>
+          subjectMatches(c.filterSubject, "truthoracle.kyc.webhook.sumsub"),
+        ),
+      ).toBe(true);
 
       // Nobody started a verification: the event is a no-op that is still recorded as processed.
       const { raw, headers } = signed(sumsubEvent(u.user.id, "applicantPending"));
       await postWebhook(ctx, raw, headers).expect(200);
-      const row = await ctx.dataSource.getRepository(KycWebhookEventEntity).findOneByOrFail({ eventKey: eventKeyOf(raw) });
+      const row = await ctx.dataSource
+        .getRepository(KycWebhookEventEntity)
+        .findOneByOrFail({ eventKey: eventKeyOf(raw) });
       expect(row.processedAt).toBeNull();
-      expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.sumsub", { eventId: row.id })).toEqual(["ack"]);
-      const after = await ctx.dataSource.getRepository(KycWebhookEventEntity).findOneByOrFail({ id: row.id });
+      expect(
+        await ctx.nats.dispatch("truthoracle.kyc.webhook.sumsub", { eventId: row.id }),
+      ).toEqual(["ack"]);
+      const after = await ctx.dataSource
+        .getRepository(KycWebhookEventEntity)
+        .findOneByOrFail({ id: row.id });
       expect(after.processedAt).not.toBeNull();
       expect(after.attempts).toBe(1);
       // Malformed triggers are terminated, never retried.
-      expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.sumsub", { nope: 1 })).toEqual(["term"]);
+      expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.sumsub", { nope: 1 })).toEqual([
+        "term",
+      ]);
     });
 
     it("Sumsub adapter: digest rules over the raw body — both headers required, sha256/sha512 accepted, sha1 only with SUMSUB_ALLOW_SHA1 (§9.1)", async () => {
@@ -678,7 +1026,9 @@ describe("KYC (e2e)", () => {
       const sha512 = signed(body, "HMAC_SHA512_HEX");
       expect(sumsub.verifyWebhook(sha512.raw, sha512.headers)).not.toBeNull();
 
-      expect(sumsub.verifyWebhook(good.raw, { ...good.headers, "x-payload-digest": "0".repeat(64) })).toBeNull();
+      expect(
+        sumsub.verifyWebhook(good.raw, { ...good.headers, "x-payload-digest": "0".repeat(64) }),
+      ).toBeNull();
       const wrongSecret = signed(body, "HMAC_SHA256_HEX", "not-the-secret");
       expect(sumsub.verifyWebhook(wrongSecret.raw, wrongSecret.headers)).toBeNull();
       const { "x-payload-digest-alg": _alg, ...noAlg } = good.headers;
@@ -686,7 +1036,12 @@ describe("KYC (e2e)", () => {
       const { "x-payload-digest": _digest, ...noDigest } = good.headers;
       expect(sumsub.verifyWebhook(good.raw, noDigest)).toBeNull();
       // A tampered body no longer matches its digest.
-      expect(sumsub.verifyWebhook(Buffer.from(good.raw.toString("utf8").replace("GREEN", "RED")), good.headers)).toBeNull();
+      expect(
+        sumsub.verifyWebhook(
+          Buffer.from(good.raw.toString("utf8").replace("GREEN", "RED")),
+          good.headers,
+        ),
+      ).toBeNull();
 
       const sha1 = signed(body, "HMAC_SHA1_HEX");
       expect(sumsub.verifyWebhook(sha1.raw, sha1.headers)).toBeNull();
@@ -728,56 +1083,151 @@ describe("KYC (e2e)", () => {
         }),
       );
 
-      const pendingBody = sumsubEvent(u.user.id, "applicantPending", { createdAtMs: "2026-09-10 10:00:00.000" });
+      const pendingBody = sumsubEvent(u.user.id, "applicantPending", {
+        createdAtMs: "2026-09-10 10:00:00.000",
+      });
       const pending = signed(pendingBody);
       const event = sumsub.verifyWebhook(pending.raw, pending.headers);
       expect(event).not.toBeNull();
 
-      const stored = await kyc.storeWebhookEvent("sumsub", event!, redactSumsubPayload(pendingBody));
+      const stored = await kyc.storeWebhookEvent(
+        "sumsub",
+        event!,
+        redactSumsubPayload(pendingBody),
+      );
       expect(stored).toMatchObject({ created: true, processed: false });
-      expect(await kyc.storeWebhookEvent("sumsub", event!, redactSumsubPayload(pendingBody))).toMatchObject({ id: stored.id, created: false });
+      expect(
+        await kyc.storeWebhookEvent("sumsub", event!, redactSumsubPayload(pendingBody)),
+      ).toMatchObject({ id: stored.id, created: false });
       expect(await events.count()).toBe(1);
       const row = await events.findOneByOrFail({ id: stored.id });
-      expect(row).toMatchObject({ provider: "sumsub", eventKey: eventKeyOf(pending.raw), type: "applicantPending", processedAt: null });
+      expect(row).toMatchObject({
+        provider: "sumsub",
+        eventKey: eventKeyOf(pending.raw),
+        type: "applicantPending",
+        processedAt: null,
+      });
       expect(JSON.stringify(row.payload)).not.toContain("clientComment");
 
       await kyc.publishWebhookTrigger("sumsub", stored.id, row.eventKey);
-      expect(ctx.nats.publishedOn("truthoracle.kyc.webhook.sumsub")).toEqual([{ subject: "truthoracle.kyc.webhook.sumsub", payload: { eventId: stored.id }, msgId: row.eventKey }]);
+      expect(ctx.nats.publishedOn("truthoracle.kyc.webhook.sumsub")).toEqual([
+        {
+          subject: "truthoracle.kyc.webhook.sumsub",
+          payload: { eventId: stored.id },
+          msgId: row.eventKey,
+        },
+      ]);
 
-      expect(await kyc.applyEvent(stored.id)).toEqual({ outcome: "applied", verificationId: verification.id, status: "pending", changed: true });
+      expect(await kyc.applyEvent(stored.id)).toEqual({
+        outcome: "applied",
+        verificationId: verification.id,
+        status: "pending",
+        changed: true,
+      });
       expect((await events.findOneByOrFail({ id: stored.id })).processedAt).not.toBeNull();
       expect((await verifications.findOneByOrFail({ id: verification.id })).status).toBe("pending");
-      expect(await userRow(ctx, u.user.id)).toMatchObject({ kycStatus: "pending", kycProvider: "sumsub", kycApplicantId: SUMSUB_APPLICANT });
-      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ provider: "sumsub", status: "pending", attachedIdentityId: u.identityId });
+      expect(await userRow(ctx, u.user.id)).toMatchObject({
+        kycStatus: "pending",
+        kycProvider: "sumsub",
+        kycApplicantId: SUMSUB_APPLICANT,
+      });
+      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({
+        provider: "sumsub",
+        status: "pending",
+        attachedIdentityId: u.identityId,
+      });
 
       // An older event arriving late is dropped (§9.2 "events older than provider_event_at").
-      const staleBody = sumsubEvent(u.user.id, "applicantOnHold", { createdAtMs: "2026-09-10 09:00:00.000" });
+      const staleBody = sumsubEvent(u.user.id, "applicantOnHold", {
+        createdAtMs: "2026-09-10 09:00:00.000",
+      });
       const stale = signed(staleBody);
-      const staleRow = await kyc.storeWebhookEvent("sumsub", sumsub.verifyWebhook(stale.raw, stale.headers)!, redactSumsubPayload(staleBody));
-      expect(await kyc.applyEvent(staleRow.id)).toEqual({ outcome: "skipped", reason: "stale_event" });
+      const staleRow = await kyc.storeWebhookEvent(
+        "sumsub",
+        sumsub.verifyWebhook(stale.raw, stale.headers)!,
+        redactSumsubPayload(staleBody),
+      );
+      expect(await kyc.applyEvent(staleRow.id)).toEqual({
+        outcome: "skipped",
+        reason: "stale_event",
+      });
       expect((await verifications.findOneByOrFail({ id: verification.id })).status).toBe("pending");
-      expect(await kyc.applyEvent(staleRow.id)).toEqual({ outcome: "skipped", reason: "already_processed" });
+      expect(await kyc.applyEvent(staleRow.id)).toEqual({
+        outcome: "skipped",
+        reason: "already_processed",
+      });
 
       // An event kind the state machine does not act on (applicantTagsChanged) arriving with a LATER
       // timestamp must not move the ordering watermark: the real review that follows, timestamped
       // between the two, is still applied (§9.2).
       const store = async (body: Record<string, unknown>): Promise<string> => {
         const signedBody = signed(body);
-        return (await kyc.storeWebhookEvent("sumsub", sumsub.verifyWebhook(signedBody.raw, signedBody.headers)!, redactSumsubPayload(body))).id;
+        return (
+          await kyc.storeWebhookEvent(
+            "sumsub",
+            sumsub.verifyWebhook(signedBody.raw, signedBody.headers)!,
+            redactSumsubPayload(body),
+          )
+        ).id;
       };
-      const tags = await store(sumsubEvent(u.user.id, "applicantTagsChanged", { createdAtMs: "2026-09-10 11:00:00.000", reviewResult: undefined, reviewStatus: undefined }));
-      expect(await kyc.applyEvent(tags)).toEqual({ outcome: "applied", verificationId: verification.id, status: "pending", changed: false });
-      expect((await verifications.findOneByOrFail({ id: verification.id })).providerEventAt?.toISOString()).toBe("2026-09-10T10:00:00.000Z");
-      const red = await store(
-        sumsubEvent(u.user.id, "applicantReviewed", { createdAtMs: "2026-09-10 10:30:00.000", reviewResult: { reviewAnswer: "RED", reviewRejectType: "RETRY", rejectLabels: ["BAD_PROOF_OF_IDENTITY"] } }),
+      const tags = await store(
+        sumsubEvent(u.user.id, "applicantTagsChanged", {
+          createdAtMs: "2026-09-10 11:00:00.000",
+          reviewResult: undefined,
+          reviewStatus: undefined,
+        }),
       );
-      expect(await kyc.applyEvent(red)).toEqual({ outcome: "applied", verificationId: verification.id, status: "rejected_retry", changed: true });
-      expect(await verifications.findOneByOrFail({ id: verification.id })).toMatchObject({ status: "rejected_retry", rejectLabels: ["BAD_PROOF_OF_IDENTITY"] });
+      expect(await kyc.applyEvent(tags)).toEqual({
+        outcome: "applied",
+        verificationId: verification.id,
+        status: "pending",
+        changed: false,
+      });
+      expect(
+        (
+          await verifications.findOneByOrFail({ id: verification.id })
+        ).providerEventAt?.toISOString(),
+      ).toBe("2026-09-10T10:00:00.000Z");
+      const red = await store(
+        sumsubEvent(u.user.id, "applicantReviewed", {
+          createdAtMs: "2026-09-10 10:30:00.000",
+          reviewResult: {
+            reviewAnswer: "RED",
+            reviewRejectType: "RETRY",
+            rejectLabels: ["BAD_PROOF_OF_IDENTITY"],
+          },
+        }),
+      );
+      expect(await kyc.applyEvent(red)).toEqual({
+        outcome: "applied",
+        verificationId: verification.id,
+        status: "rejected_retry",
+        changed: true,
+      });
+      expect(await verifications.findOneByOrFail({ id: verification.id })).toMatchObject({
+        status: "rejected_retry",
+        rejectLabels: ["BAD_PROOF_OF_IDENTITY"],
+      });
       // A `reviewed` event with no reviewAnswer carries no decision: nothing changes (it is not a rejection).
-      const noAnswer = await store(sumsubEvent(u.user.id, "applicantWorkflowCompleted", { createdAtMs: "2026-09-10 10:45:00.000", reviewResult: {}, reviewStatus: "completed" }));
-      expect(await kyc.applyEvent(noAnswer)).toEqual({ outcome: "applied", verificationId: verification.id, status: "rejected_retry", changed: false });
+      const noAnswer = await store(
+        sumsubEvent(u.user.id, "applicantWorkflowCompleted", {
+          createdAtMs: "2026-09-10 10:45:00.000",
+          reviewResult: {},
+          reviewStatus: "completed",
+        }),
+      );
+      expect(await kyc.applyEvent(noAnswer)).toEqual({
+        outcome: "applied",
+        verificationId: verification.id,
+        status: "rejected_retry",
+        changed: false,
+      });
       // Every status change was published AFTER its transaction committed, in order.
-      expect(ctx.nats.publishedOn("truthoracle.kyc.status_changed").map((e) => (e.payload as { status: string }).status)).toEqual(["pending", "rejected_retry"]);
+      expect(
+        ctx.nats
+          .publishedOn("truthoracle.kyc.status_changed")
+          .map((e) => (e.payload as { status: string }).status),
+      ).toEqual(["pending", "rejected_retry"]);
     });
 
     it("an exhausted webhook row is re-armed by the sweep after the cooldown, and an operator can replay it at once (RUNBOOK §4)", async () => {
@@ -789,13 +1239,23 @@ describe("KYC (e2e)", () => {
       ctx.nats.reset();
 
       // The consumer gave up (20 attempts) five minutes ago: the cooldown has not elapsed → left alone.
-      await events.update({ id: row.id }, { attempts: 20, error: "Sumsub GET /resources/applicants failed: HTTP 503", lastAttemptAt: new Date(Date.now() - 5 * 60_000) });
+      await events.update(
+        { id: row.id },
+        {
+          attempts: 20,
+          error: "Sumsub GET /resources/applicants failed: HTTP 503",
+          lastAttemptAt: new Date(Date.now() - 5 * 60_000),
+        },
+      );
       const processor = ctx.get(KycWebhookProcessor);
       expect(await processor.sweep()).toBe(0);
       expect((await events.findOneByOrFail({ id: row.id })).attempts).toBe(20);
 
       // Past the cooldown: attempts reset, trigger re-published with a fresh msgId.
-      await events.update({ id: row.id }, { lastAttemptAt: new Date(Date.now() - 2 * 60 * 60_000) });
+      await events.update(
+        { id: row.id },
+        { lastAttemptAt: new Date(Date.now() - 2 * 60 * 60_000) },
+      );
       expect(await processor.sweep()).toBe(1);
       expect((await events.findOneByOrFail({ id: row.id })).attempts).toBe(0);
       const republished = ctx.nats.publishedOn("truthoracle.kyc.webhook.sumsub");
@@ -805,35 +1265,73 @@ describe("KYC (e2e)", () => {
       // Operator replay: audited, attempts reset, distinct msgId; a processed row is refused, an unknown id is 404.
       const admin = await signInAsAdmin(http(ctx), operator);
       await events.update({ id: row.id }, { attempts: 20 });
-      const bad = await http(ctx).post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`).set("Cookie", admin.cookie).set(ctx.csrf).send({}).expect(400);
+      const bad = await http(ctx)
+        .post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`)
+        .set("Cookie", admin.cookie)
+        .set(ctx.csrf)
+        .send({})
+        .expect(400);
       expect(bodyOf<ErrorBody>(bad).error).toBe("validation_failed");
-      const replayed = await http(ctx).post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`).set("Cookie", admin.cookie).set(ctx.csrf).send({ reason: "Sumsub outage 2026-09-10" }).expect(200);
+      const replayed = await http(ctx)
+        .post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`)
+        .set("Cookie", admin.cookie)
+        .set(ctx.csrf)
+        .send({ reason: "Sumsub outage 2026-09-10" })
+        .expect(200);
       expect(replayed.body).toEqual({ ok: true, eventId: row.id });
       expect((await events.findOneByOrFail({ id: row.id })).attempts).toBe(0);
       const triggers = ctx.nats.publishedOn("truthoracle.kyc.webhook.sumsub");
       expect(triggers).toHaveLength(2);
       expect(triggers[1].msgId).toMatch(new RegExp(`^${row.eventKey}:replay:\\d+$`));
       expect(await auditRows(ctx, "kyc.webhook_replayed")).toEqual([
-        expect.objectContaining({ actorType: "admin", actorUserId: admin.user.id, subjectType: "kyc_webhook_event", subjectId: row.id, metadata: containing({ reason: "Sumsub outage 2026-09-10", previousAttempts: 20 }) }),
+        expect.objectContaining({
+          actorType: "admin",
+          actorUserId: admin.user.id,
+          subjectType: "kyc_webhook_event",
+          subjectId: row.id,
+          metadata: containing({ reason: "Sumsub outage 2026-09-10", previousAttempts: 20 }),
+        }),
       ]);
       // Applying it through the consumer marks it processed; a replay is then refused.
-      expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.sumsub", { eventId: row.id })).toEqual(["ack"]);
-      const done = await http(ctx).post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`).set("Cookie", admin.cookie).set(ctx.csrf).send({ reason: "again" }).expect(409);
+      expect(
+        await ctx.nats.dispatch("truthoracle.kyc.webhook.sumsub", { eventId: row.id }),
+      ).toEqual(["ack"]);
+      const done = await http(ctx)
+        .post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`)
+        .set("Cookie", admin.cookie)
+        .set(ctx.csrf)
+        .send({ reason: "again" })
+        .expect(409);
       expect(bodyOf<ErrorBody>(done).error).toBe("bad_request");
-      await http(ctx).post(`/api/v1/admin/kyc/webhooks/${randomUUID()}/replay`).set("Cookie", admin.cookie).set(ctx.csrf).send({ reason: "x" }).expect(404);
+      await http(ctx)
+        .post(`/api/v1/admin/kyc/webhooks/${randomUUID()}/replay`)
+        .set("Cookie", admin.cookie)
+        .set(ctx.csrf)
+        .send({ reason: "x" })
+        .expect(404);
       // A user session cannot replay.
-      await http(ctx).post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`).set("Cookie", u.cookie).set(ctx.csrf).send({ reason: "x" }).expect(403);
+      await http(ctx)
+        .post(`/api/v1/admin/kyc/webhooks/${row.id}/replay`)
+        .set("Cookie", u.cookie)
+        .set(ctx.csrf)
+        .send({ reason: "x" })
+        .expect(403);
     });
 
     it("the consumer's retry delay grows exponentially and is capped at 10 minutes", () => {
-      expect([1, 2, 3, 4, 5, 8, 20].map((n) => kycWebhookNakDelayMs(n))).toEqual([5_000, 10_000, 20_000, 40_000, 80_000, 600_000, 600_000]);
+      expect([1, 2, 3, 4, 5, 8, 20].map((n) => kycWebhookNakDelayMs(n))).toEqual([
+        5_000, 10_000, 20_000, 40_000, 80_000, 600_000, 600_000,
+      ]);
     });
   });
 
   // ───────────────────────────────── unconfigured provider (§9.1) ────────────────────────────────
   describe("unconfigured provider — KycProvider.isConfigured() false", () => {
     const fakeProvider = new FakeKycProvider("sumsub");
-    const ctx = useTestApp({ env: { KYC_PROVIDER: "sumsub" }, configure: (b) => b.overrideProvider(KYC_PROVIDER).useValue(fakeProvider) });
+    const ctx = useTestApp({
+      env: { KYC_PROVIDER: "sumsub" },
+      configure: (b) => b.overrideProvider(KYC_PROVIDER).useValue(fakeProvider),
+    });
 
     it("POST /kyc/sessions → 503 kyc_provider_unavailable and GET /kyc reports provider null; configured again → a session opens", async () => {
       const u = await newUser(ctx, "unconf");
@@ -842,8 +1340,14 @@ describe("KYC (e2e)", () => {
       expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ provider: null, status: "none" });
       expect(await ctx.dataSource.getRepository(KycVerificationEntity).count()).toBe(0);
       fakeProvider.configured = true;
-      expect(ok(await kycStart(ctx, u.cookie))).toMatchObject({ provider: "sumsub", accessToken: "fake-token-1" });
-      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({ provider: "sumsub", status: "pending" });
+      expect(ok(await kycStart(ctx, u.cookie))).toMatchObject({
+        provider: "sumsub",
+        accessToken: "fake-token-1",
+      });
+      expect(ok(await kycSummary(ctx, u.cookie))).toMatchObject({
+        provider: "sumsub",
+        status: "pending",
+      });
     });
   });
 
@@ -857,20 +1361,52 @@ describe("KYC (e2e)", () => {
     };
 
     it("refuses KYC_PROVIDER=mock on APP_NETWORK=mainnet and on APP_ENV=prod", () => {
-      expect(() => getConfiguration(testEnv({ APP_NETWORK: "mainnet", KYC_PROVIDER: "mock", ...zkpc }))).toThrow(/KYC_PROVIDER=mock/);
-      expect(() => getConfiguration(testEnv({ APP_ENV: "prod", KYC_PROVIDER: "mock" }))).toThrow(/KYC_PROVIDER=mock/);
+      expect(() =>
+        getConfiguration(testEnv({ APP_NETWORK: "mainnet", KYC_PROVIDER: "mock", ...zkpc })),
+      ).toThrow(/KYC_PROVIDER=mock/);
+      expect(() => getConfiguration(testEnv({ APP_ENV: "prod", KYC_PROVIDER: "mock" }))).toThrow(
+        /KYC_PROVIDER=mock/,
+      );
       // The same mainnet environment boots with the real provider.
-      const cfg = getConfiguration(testEnv({ APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "prd:token", SUMSUB_WEBHOOK_SECRET: "wh", ...zkpc }));
+      const cfg = getConfiguration(
+        testEnv({
+          APP_NETWORK: "mainnet",
+          KYC_PROVIDER: "sumsub",
+          SUMSUB_APP_TOKEN: "prd:token",
+          SUMSUB_WEBHOOK_SECRET: "wh",
+          ...zkpc,
+        }),
+      );
       expect(cfg.kycProvider).toBe("sumsub");
       expect(cfg.isMainnet).toBe(true);
     });
 
     it("KYC_ENFORCE_WITHDRAWALS is a plain flag; refuses a sandbox Sumsub token on mainnet, and Sumsub without a webhook secret", () => {
-      expect(getConfiguration(testEnv({ KYC_ENFORCE_WITHDRAWALS: "true" })).kycEnforceWithdrawals).toBe(true);
+      expect(
+        getConfiguration(testEnv({ KYC_ENFORCE_WITHDRAWALS: "true" })).kycEnforceWithdrawals,
+      ).toBe(true);
       expect(getConfiguration(testEnv()).kycEnforceWithdrawals).toBe(false);
-      expect(() => getConfiguration(testEnv({ APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "sbx:token", SUMSUB_WEBHOOK_SECRET: "wh", ...zkpc }))).toThrow(/sbx:/);
+      expect(() =>
+        getConfiguration(
+          testEnv({
+            APP_NETWORK: "mainnet",
+            KYC_PROVIDER: "sumsub",
+            SUMSUB_APP_TOKEN: "sbx:token",
+            SUMSUB_WEBHOOK_SECRET: "wh",
+            ...zkpc,
+          }),
+        ),
+      ).toThrow(/sbx:/);
       // Sessions would start while every webhook is 401 — refused at boot instead.
-      expect(() => getConfiguration(testEnv({ KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "sbx:token", SUMSUB_SECRET_KEY: "k" }))).toThrow(/SUMSUB_WEBHOOK_SECRET/);
+      expect(() =>
+        getConfiguration(
+          testEnv({
+            KYC_PROVIDER: "sumsub",
+            SUMSUB_APP_TOKEN: "sbx:token",
+            SUMSUB_SECRET_KEY: "k",
+          }),
+        ),
+      ).toThrow(/SUMSUB_WEBHOOK_SECRET/);
     });
   });
 });

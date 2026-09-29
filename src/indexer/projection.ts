@@ -536,7 +536,9 @@ export class LedgerProjection {
   ): Promise<{ ticker: string; eventTicker: string; yesSubTitle: string; noSubTitle: string }> {
     let ticker = asText(p.ticker).trim().toUpperCase();
     if (!TICKER_PATTERN.test(ticker))
-      this.logger.warn(`market ${marketId}: on-ledger ticker "${asText(p.ticker)}" is not a valid ticker; kept as-is`);
+      this.logger.warn(
+        `market ${marketId}: on-ledger ticker "${asText(p.ticker)}" is not a valid ticker; kept as-is`,
+      );
     const taken = await m.query<{ market_id: string }[]>(
       `SELECT market_id FROM to_markets WHERE ticker = $1 AND market_id <> $2`,
       [ticker, String(marketId)],
@@ -552,7 +554,12 @@ export class LedgerProjection {
       this.logger.warn(
         `market ${marketId}: on-ledger eventTicker "${asText(p.eventTicker)}" is not a valid ticker; kept as-is`,
       );
-    return { ticker, eventTicker, yesSubTitle: asText(p.yesSubTitle), noSubTitle: asText(p.noSubTitle) };
+    return {
+      ticker,
+      eventTicker,
+      yesSubTitle: asText(p.yesSubTitle),
+      noSubTitle: asText(p.noSubTitle),
+    };
   }
 
   /**
@@ -570,7 +577,9 @@ export class LedgerProjection {
     eventTicker: string,
     market: { expiresAtSec: number },
   ): Promise<void> {
-    const exists = await m.query<unknown[]>(`SELECT 1 FROM to_events WHERE ticker = $1`, [eventTicker]);
+    const exists = await m.query<unknown[]>(`SELECT 1 FROM to_events WHERE ticker = $1`, [
+      eventTicker,
+    ]);
     if (exists.length > 0) return;
     const seriesTicker = placeholderSeriesTickerOf(eventTicker);
     await m.query(
@@ -667,7 +676,13 @@ export class LedgerProjection {
         const overwrite = Object.keys(row)
           .filter(
             (k) =>
-              !["marketId", "createdOffset", "createdAtLedger", "openInterestYes", "openInterestNo"].includes(k),
+              ![
+                "marketId",
+                "createdOffset",
+                "createdAtLedger",
+                "openInterestYes",
+                "openInterestNo",
+              ].includes(k),
           )
           .map((k) => meta.findColumnWithPropertyName(k)?.databaseName ?? k);
         await m
@@ -750,7 +765,12 @@ export class LedgerProjection {
           .returning("contract_id")
           .execute();
         if ((res.raw as unknown[]).length > 0)
-          await bumpOpenInterest(m, asInt(p.marketId), asDecimal(p.yesShares), asDecimal(p.noShares));
+          await bumpOpenInterest(
+            m,
+            asInt(p.marketId),
+            asDecimal(p.yesShares),
+            asDecimal(p.noShares),
+          );
         return;
       }
       case "Truthoracle:LiquidityPosition":

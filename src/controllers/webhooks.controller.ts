@@ -3,7 +3,10 @@ import { ApiTags } from "@nestjs/swagger";
 
 import { Public } from "../auth/decorators";
 import type { AuthedRequest } from "../auth/request";
-import { KycProviderSumsubService, redactSumsubPayload } from "../services/kyc-provider-sumsub.service";
+import {
+  KycProviderSumsubService,
+  redactSumsubPayload,
+} from "../services/kyc-provider-sumsub.service";
 import { KycService } from "../services/kyc.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { ApiError } from "../util/errors";
@@ -48,7 +51,9 @@ export class WebhooksController {
         await this.kyc.publishWebhookTrigger("sumsub", stored.id, event.eventKey);
       } catch (err) {
         // The row is durable; KycWebhookProcessor's sweep re-publishes it. Never make Sumsub retry.
-        this.logger.warn(`webhook ${stored.id} stored but its trigger was not published: ${(err as Error).message}`);
+        this.logger.warn(
+          `webhook ${stored.id} stored but its trigger was not published: ${(err as Error).message}`,
+        );
       }
     }
     return { received: true };

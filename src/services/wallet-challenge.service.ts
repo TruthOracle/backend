@@ -70,13 +70,19 @@ export class WalletChallengeService {
     host: string;
   }): Promise<ApiChallenge> {
     const partyId = String(input.partyId ?? "").trim();
-    if (!isValidPartyId(partyId)) throw new ApiError(400, "validation_failed", "partyId is not a Canton party id");
-    if (!CHALLENGE_PURPOSES.includes(input.purpose)) throw new ApiError(400, "validation_failed", "unknown challenge purpose");
+    if (!isValidPartyId(partyId))
+      throw new ApiError(400, "validation_failed", "partyId is not a Canton party id");
+    if (!CHALLENGE_PURPOSES.includes(input.purpose))
+      throw new ApiError(400, "validation_failed", "unknown challenge purpose");
     if (input.purpose === "link-wallet" && !input.sessionId) {
       throw new ApiError(401, "unauthenticated", "link-wallet challenges require a session");
     }
     if (input.purpose === "admin-sign-in" && input.sessionId) {
-      throw new ApiError(409, "challenge_purpose_mismatch", "admin-sign-in challenges cannot be issued to an existing session");
+      throw new ApiError(
+        409,
+        "challenge_purpose_mismatch",
+        "admin-sign-in challenges cannot be issued to an existing session",
+      );
     }
     // Deliberately NO operator check here: an admin-sign-in challenge is issued to any well-formed
     // party and the operator list is consulted at verify time only, so an anonymous caller cannot
@@ -108,34 +114,58 @@ export class WalletChallengeService {
     sessionId?: string | null;
   }): Promise<VerifiedChallenge> {
     const challengeId = String(input.challengeId ?? "").trim();
-    if (!/^[0-9a-f-]{36}$/i.test(challengeId)) throw new ApiError(401, "challenge_rejected", "unknown challenge");
+    if (!/^[0-9a-f-]{36}$/i.test(challengeId))
+      throw new ApiError(401, "challenge_rejected", "unknown challenge");
 
     // Consume first — atomically (GETDEL): whatever happens next this challenge is spent, and two
     // concurrent presentations of one signature can never both read the record.
     const record = await this.redis.takeJson<ChallengeRecord>(`wc:${challengeId}`);
-    if (!record) throw new ApiError(401, "challenge_rejected", "challenge unknown, expired or already used");
-    if (Date.parse(record.expiresAt) <= Date.now()) throw new ApiError(401, "challenge_rejected", "challenge expired");
+    if (!record)
+      throw new ApiError(401, "challenge_rejected", "challenge unknown, expired or already used");
+    if (Date.parse(record.expiresAt) <= Date.now())
+      throw new ApiError(401, "challenge_rejected", "challenge expired");
 
     const partyId = String(input.partyId ?? "").trim();
-    if (partyId !== record.partyId) throw new ApiError(401, "challenge_rejected", "challenge was issued for another party");
+    if (partyId !== record.partyId)
+      throw new ApiError(401, "challenge_rejected", "challenge was issued for another party");
 
     if (record.purpose !== input.expectedPurpose) {
-      throw new ApiError(401, "challenge_purpose_mismatch", `challenge purpose ${record.purpose} is not accepted here`);
+      throw new ApiError(
+        401,
+        "challenge_purpose_mismatch",
+        `challenge purpose ${record.purpose} is not accepted here`,
+      );
     }
     // Purpose isolation (§7.3 / §7.4): a link-wallet challenge is bound to the session it was
     // issued to and must be presented by that very session; an admin-sign-in challenge is refused
     // as soon as any session is presented — admin sign-in never runs in link mode.
-    if (record.purpose === "link-wallet" && (!input.sessionId || input.sessionId !== record.sessionId)) {
-      throw new ApiError(401, "challenge_purpose_mismatch", "link-wallet challenge was issued to another session");
+    if (
+      record.purpose === "link-wallet" &&
+      (!input.sessionId || input.sessionId !== record.sessionId)
+    ) {
+      throw new ApiError(
+        401,
+        "challenge_purpose_mismatch",
+        "link-wallet challenge was issued to another session",
+      );
     }
     if (record.purpose === "admin-sign-in" && input.sessionId) {
-      throw new ApiError(401, "challenge_purpose_mismatch", "admin-sign-in challenges cannot be used while signed in");
+      throw new ApiError(
+        401,
+        "challenge_purpose_mismatch",
+        "admin-sign-in challenges cannot be used while signed in",
+      );
     }
 
     const publicKeyBase64 = publicKeyToBase64(input.publicKey);
-    if (!publicKeyBase64) throw new ApiError(400, "validation_failed", "publicKey is not a 32-byte Ed25519 key");
+    if (!publicKeyBase64)
+      throw new ApiError(400, "validation_failed", "publicKey is not a 32-byte Ed25519 key");
     if (!publicKeyMatchesParty(input.publicKey, partyId)) {
-      throw new ApiError(401, "wallet_key_mismatch", "this wallet's signing key is not its namespace key");
+      throw new ApiError(
+        401,
+        "wallet_key_mismatch",
+        "this wallet's signing key is not its namespace key",
+      );
     }
     const pinned = this.config.adminOperators.get(partyId);
     if (pinned && !publicKeysEqual(pinned, input.publicKey)) {
@@ -146,9 +176,15 @@ export class WalletChallengeService {
     }
 
     const message = this.buildMessage(record);
-    const result = verifyPartySignature({ message, signature: input.signature, publicKey: input.publicKey });
+    const result = verifyPartySignature({
+      message,
+      signature: input.signature,
+      publicKey: input.publicKey,
+    });
     if (!result.ok) {
-      this.logger.warn(`signature rejected for ${partyId.slice(0, 16)}…: ${result.reason} (${describeAttempt({ signature: input.signature, publicKey: input.publicKey })})`);
+      this.logger.warn(
+        `signature rejected for ${partyId.slice(0, 16)}…: ${result.reason} (${describeAttempt({ signature: input.signature, publicKey: input.publicKey })})`,
+      );
       throw new ApiError(401, "signature_invalid", "signature did not verify");
     }
     return { partyId, publicKeyBase64, purpose: record.purpose, form: result.form };

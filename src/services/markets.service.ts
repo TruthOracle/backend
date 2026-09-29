@@ -256,8 +256,14 @@ export class MarketsService {
     if (rows.length === 0) return out;
     const ids = rows.map((m) => String(m.marketId));
     const eventTickers = [...new Set(rows.map((m) => m.eventTicker))];
-    const catalogByEvent = new Map<string, { seriesTicker: string; category: string; imageUrl: string }>();
-    const metadataByTicker = new Map<string, { imageUrl: string; description: string; updatedAt: Date }>();
+    const catalogByEvent = new Map<
+      string,
+      { seriesTicker: string; category: string; imageUrl: string }
+    >();
+    const metadataByTicker = new Map<
+      string,
+      { imageUrl: string; description: string; updatedAt: Date }
+    >();
     if (eventTickers.length > 0) {
       const events = await manager.query<
         { ticker: string; series_ticker: string; image_url: string; category: string | null }[]
@@ -339,7 +345,8 @@ export class MarketsService {
     const out = new Map<number, ApiMarketSummary>();
     if (rows.length === 0) return out;
     const extras = await this.extrasFor(rows);
-    for (const m of rows) out.set(m.marketId, this.toSummary(m, extras.get(m.marketId) ?? NO_EXTRAS));
+    for (const m of rows)
+      out.set(m.marketId, this.toSummary(m, extras.get(m.marketId) ?? NO_EXTRAS));
     return out;
   }
 

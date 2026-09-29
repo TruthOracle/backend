@@ -250,7 +250,9 @@ describe("payouts (e2e)", () => {
   // ═══════════════════════════════════ KYC enforcement OFF (default) ═══════════════════════════
   describe("KYC enforcement off (default config)", () => {
     // A long scan interval keeps the processor's timer out of the way; the spec drives scans itself.
-    const ctx = useTestApp({ env: { PAYOUT_SCAN_MS: "600000", ADMIN_OPERATORS: operator.partyId } });
+    const ctx = useTestApp({
+      env: { PAYOUT_SCAN_MS: "600000", ADMIN_OPERATORS: operator.partyId },
+    });
 
     afterEach(() => {
       restoreTransfer(ctx.wallet);
@@ -265,8 +267,11 @@ describe("payouts (e2e)", () => {
       const [settled] = await auditRows(ctx, "payout.settled");
       expect(settled.metadata).toMatchObject({ amountCC: "3.0000000000", mode: "external" });
       const me = await ctx.agent.get("/api/v1/me/audit").set("Cookie", s.a.cookie).expect(200);
-      const items = bodyOf<{ items: { action: string; metadata: Record<string, unknown> }[] }>(me).items;
-      for (const item of items.filter((i) => i.action.startsWith("payout."))) expect(item.metadata.amountCC).toMatch(/^\d+\.\d{10}$/);
+      const items = bodyOf<{ items: { action: string; metadata: Record<string, unknown> }[] }>(
+        me,
+      ).items;
+      for (const item of items.filter((i) => i.action.startsWith("payout.")))
+        expect(item.metadata.amountCC).toMatch(/^\d+\.\d{10}$/);
     });
 
     it("the to_payouts row is the arbiter: two settlements racing past the lock record exactly one transfer (compare-and-set write-ahead)", async () => {
@@ -278,7 +283,21 @@ describe("payouts (e2e)", () => {
       // removed mid-flight (TTL expiry / Redis failover) — so the only thing standing between them
       // and two transfers is the row's compare-and-set.
       const payouts = ctx.dataSource.getRepository(PayoutEntity);
-      await payouts.save(payouts.create({ pendingPayoutCid: cid, payeeParty: s.a.wallet.partyId, userId: s.a.user.id, payeeWalletId: s.a.walletRow.id, status: "queued", amountCC: parseCC("3"), reason: "withdraw", attempts: 0, lastError: null, firstSeenAt: new Date(), settledAt: null }));
+      await payouts.save(
+        payouts.create({
+          pendingPayoutCid: cid,
+          payeeParty: s.a.wallet.partyId,
+          userId: s.a.user.id,
+          payeeWalletId: s.a.walletRow.id,
+          status: "queued",
+          amountCC: parseCC("3"),
+          reason: "withdraw",
+          attempts: 0,
+          lastError: null,
+          firstSeenAt: new Date(),
+          settledAt: null,
+        }),
+      );
       // The payee lookup sits between the row read and the write-ahead; slowing it keeps both
       // requests in that window at once.
       const walletLinks = ctx.get(WalletLinkService);
@@ -296,9 +315,14 @@ describe("payouts (e2e)", () => {
       const results = await Promise.all([first, second]);
       expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
       const loser = results.find((r) => r.status === 409);
-      expect(bodyOf<ErrorBody>(loser!)).toMatchObject({ error: "payout_blocked", details: { reason: "in_flight" } });
+      expect(bodyOf<ErrorBody>(loser!)).toMatchObject({
+        error: "payout_blocked",
+        details: { reason: "in_flight" },
+      });
       // Exactly one transfer and one MarkPaid — the loser never called upstream (a 502 DUPLICATE from the wallet would have meant it did).
-      expect(ctx.wallet.transfers).toEqual([expect.objectContaining({ commandId: transferCommandId })]);
+      expect(ctx.wallet.transfers).toEqual([
+        expect.objectContaining({ commandId: transferCommandId }),
+      ]);
       expect(ctx.wallet.submits).toHaveLength(1);
       expect(await payoutRow(ctx, cid)).toMatchObject({ status: "settled_external", attempts: 1 });
     });
@@ -312,7 +336,9 @@ describe("payouts (e2e)", () => {
       for (let i = 0; i < 6; i += 1) await runScan(ctx);
       expect(await payoutRow(ctx, cid)).toMatchObject({ status: "settling", attempts: 1 });
       // The scan never re-sent this transfer (it settles the scenario's other payouts as usual).
-      expect(ctx.wallet.transfers.find((t) => t.commandId === commandIdsFor(cid).transferCommandId)).toBeUndefined();
+      expect(
+        ctx.wallet.transfers.find((t) => t.commandId === commandIdsFor(cid).transferCommandId),
+      ).toBeUndefined();
       await settle(ctx, cid, s.a.cookie).expect(502);
       expect(await payoutRow(ctx, cid)).toMatchObject({ status: "settling", attempts: 2 });
     });
@@ -322,10 +348,18 @@ describe("payouts (e2e)", () => {
       const cid = s.withdraw.contractId;
       const { transferCommandId, markPaidCommandId } = commandIdsFor(cid);
       await driveToFailed(ctx, cid, s.a.cookie);
-      expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", transferCommandId, attempts: ctx.config.payoutMaxAttempts });
+      expect(await payoutRow(ctx, cid)).toMatchObject({
+        status: "failed",
+        transferCommandId,
+        attempts: ctx.config.payoutMaxAttempts,
+      });
       const admin = await signInAsAdmin(request.agent(ctx.app.getHttpServer() as Server), operator);
       const adminSettle = (body: Record<string, unknown>) =>
-        ctx.agent.post(`/api/v1/admin/payouts/${cid}/settle`).set("Cookie", admin.cookie).set(ctx.csrf).send(body);
+        ctx.agent
+          .post(`/api/v1/admin/payouts/${cid}/settle`)
+          .set("Cookie", admin.cookie)
+          .set(ctx.csrf)
+          .send(body);
 
       // Without force, and with force on a row younger than PAYOUT_RESEND_GRACE_MS, nothing is re-sent.
       expect((await adminSettle({ reason: "look" })).status).toBe(502);
@@ -333,15 +367,41 @@ describe("payouts (e2e)", () => {
       expect(ctx.wallet.transfers).toHaveLength(0);
       expect(await auditRows(ctx, "payout.admin_override")).toHaveLength(0);
 
-      await ctx.dataSource.getRepository(PayoutEntity).update({ pendingPayoutCid: cid }, { firstSeenAt: new Date(Date.now() - ctx.config.payoutResendGraceMs - 1000) });
-      const forced = await adminSettle({ force: true, reason: "wallet confirmed nothing left the treasury; ticket 77" }).expect(200);
-      expect(bodyOf<SettleBody>(forced)).toMatchObject({ mode: "external", payout: { status: "settled_external", onLedger: false } });
+      await ctx.dataSource
+        .getRepository(PayoutEntity)
+        .update(
+          { pendingPayoutCid: cid },
+          { firstSeenAt: new Date(Date.now() - ctx.config.payoutResendGraceMs - 1000) },
+        );
+      const forced = await adminSettle({
+        force: true,
+        reason: "wallet confirmed nothing left the treasury; ticket 77",
+      }).expect(200);
+      expect(bodyOf<SettleBody>(forced)).toMatchObject({
+        mode: "external",
+        payout: { status: "settled_external", onLedger: false },
+      });
       // The identical command id keeps ledger dedup as the backstop; MarkPaid follows.
-      expect(ctx.wallet.transfers).toEqual([expect.objectContaining({ to: s.a.wallet.partyId, amountCC: parseCC("3"), commandId: transferCommandId })]);
+      expect(ctx.wallet.transfers).toEqual([
+        expect.objectContaining({
+          to: s.a.wallet.partyId,
+          amountCC: parseCC("3"),
+          commandId: transferCommandId,
+        }),
+      ]);
       expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([markPaidCommandId]);
       expect(ctx.ledger.payouts.has(cid)).toBe(false);
       expect(await auditRows(ctx, "payout.admin_override")).toEqual([
-        expect.objectContaining({ actorType: "admin", actorUserId: admin.user.id, subjectId: cid, metadata: containing({ detail: "resend_transfer", transferCommandId, reason: "wallet confirmed nothing left the treasury; ticket 77" }) }),
+        expect.objectContaining({
+          actorType: "admin",
+          actorUserId: admin.user.id,
+          subjectId: cid,
+          metadata: containing({
+            detail: "resend_transfer",
+            transferCommandId,
+            reason: "wallet confirmed nothing left the treasury; ticket 77",
+          }),
+        }),
       ]);
     });
 
@@ -353,24 +413,40 @@ describe("payouts (e2e)", () => {
       // (a) accepted, not yet executed → the row stays `settling`, the user sees in_flight, nothing is "Settled".
       ctx.wallet.lagLedger = true;
       const pending = await settle(ctx, s.bond.contractId, s.a.cookie).expect(409);
-      expect(bodyOf<ErrorBody>(pending)).toMatchObject({ error: "payout_blocked", details: { status: "settling", reason: "in_flight" } });
-      expect(await payoutRow(ctx, s.bond.contractId)).toMatchObject({ status: "settling", settleCommandId, attempts: 1 });
+      expect(bodyOf<ErrorBody>(pending)).toMatchObject({
+        error: "payout_blocked",
+        details: { status: "settling", reason: "in_flight" },
+      });
+      expect(await payoutRow(ctx, s.bond.contractId)).toMatchObject({
+        status: "settling",
+        settleCommandId,
+        attempts: 1,
+      });
       expect(ctx.ledger.payouts.has(s.bond.contractId)).toBe(true);
       expect(await auditRows(ctx, "payout.settled")).toHaveLength(0);
       // The ledger executes it: the next scan finds the contract gone and the wallet confirming the command → settled.
       ctx.wallet.applyPending();
       await runScan(ctx);
-      expect(await payoutRow(ctx, s.bond.contractId)).toMatchObject({ status: "settled_in_app", settleCommandId });
+      expect(await payoutRow(ctx, s.bond.contractId)).toMatchObject({
+        status: "settled_in_app",
+        settleCommandId,
+      });
       expect((await ctx.ledger.fetchUserWallet(s.a.wallet.partyId))?.balanceCC).toBe(parseCC("11"));
 
       // (b) accepted, then REJECTED by the ledger (stale walletCid after a trade): the retry uses a
       // fresh command id — the ledger may have recorded the rejected one — and settles.
-      const prize = ctx.ledger.seedPendingPayout({ user: s.a.wallet.partyId, amountCC: "2", reason: "model-prize" });
+      const prize = ctx.ledger.seedPendingPayout({
+        user: s.a.wallet.partyId,
+        amountCC: "2",
+        reason: "model-prize",
+      });
       const base = commandIdsFor(prize.contractId).settleCommandId;
       await settle(ctx, prize.contractId, s.a.cookie).expect(409);
       ctx.wallet.rejectPending();
       ctx.wallet.lagLedger = false;
-      const retried = bodyOf<SettleBody>(await settle(ctx, prize.contractId, s.a.cookie).expect(200));
+      const retried = bodyOf<SettleBody>(
+        await settle(ctx, prize.contractId, s.a.cookie).expect(200),
+      );
       expect(retried.mode).toBe("in_app");
       const row = await payoutRow(ctx, prize.contractId);
       expect(row.status).toBe("settled_in_app");
@@ -381,7 +457,11 @@ describe("payouts (e2e)", () => {
       // (c) a settled row whose contract is somehow still live is reported, never silently skipped.
       ctx.ledger.payouts.set(prize.contractId, { ...prize });
       await runScan(ctx);
-      expect(sentry).toHaveBeenCalledWith("settled payout still active on the ledger", "error", expect.objectContaining({ cid: prize.contractId }));
+      expect(sentry).toHaveBeenCalledWith(
+        "settled payout still active on the ledger",
+        "error",
+        expect.objectContaining({ cid: prize.contractId }),
+      );
     });
 
     it("GET /in-app-wallet/payouts lists only the caller's payouts — on ledger, queued on first sight", async () => {
@@ -859,31 +939,28 @@ describe("payouts (e2e)", () => {
     // `409 payout_blocked (details.status)`. Once failed, the row belongs to the operator queue:
     // a user retry must be refused (before any recorded-command shortcut, so `attempts` never
     // climbs past the cap) and the scan must not touch it (RETRIABLE excludes `failed`).
-    it(
-      "a failed row belongs to the operator queue: the user's retry is 409 payout_blocked and the scan leaves it alone",
-      async () => {
-        const s = await seedScenario(ctx);
-        const cid = s.withdraw.contractId;
-        const { transferCommandId } = commandIdsFor(cid);
-        const max = ctx.config.payoutMaxAttempts;
-        await driveToFailed(ctx, cid, s.a.cookie);
-        expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", attempts: max });
+    it("a failed row belongs to the operator queue: the user's retry is 409 payout_blocked and the scan leaves it alone", async () => {
+      const s = await seedScenario(ctx);
+      const cid = s.withdraw.contractId;
+      const { transferCommandId } = commandIdsFor(cid);
+      const max = ctx.config.payoutMaxAttempts;
+      await driveToFailed(ctx, cid, s.a.cookie);
+      expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", attempts: max });
 
-        const refused = await settle(ctx, cid, s.a.cookie).expect(409);
-        expect(bodyOf<ErrorBody>(refused)).toMatchObject({
-          error: "payout_blocked",
-          details: { status: "failed" },
-        });
-        expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", attempts: max });
+      const refused = await settle(ctx, cid, s.a.cookie).expect(409);
+      expect(bodyOf<ErrorBody>(refused)).toMatchObject({
+        error: "payout_blocked",
+        details: { status: "failed" },
+      });
+      expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", attempts: max });
 
-        // The scan settles the other open payouts of the scenario but never picks this row up again.
-        await runScan(ctx);
-        expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", attempts: max });
-        expect(ctx.wallet.transfers.find((t) => t.commandId === transferCommandId)).toBeUndefined();
-        expect(ctx.ledger.payouts.has(cid)).toBe(true);
-        expect(await auditRows(ctx, "payout.failed")).toHaveLength(1);
-      },
-    );
+      // The scan settles the other open payouts of the scenario but never picks this row up again.
+      await runScan(ctx);
+      expect(await payoutRow(ctx, cid)).toMatchObject({ status: "failed", attempts: max });
+      expect(ctx.wallet.transfers.find((t) => t.commandId === transferCommandId)).toBeUndefined();
+      expect(ctx.ledger.payouts.has(cid)).toBe(true);
+      expect(await auditRows(ctx, "payout.failed")).toHaveLength(1);
+    });
 
     it("archived contracts: settled_external when the recorded transfer went through, archived when nothing was submitted", async () => {
       const s = await seedScenario(ctx);

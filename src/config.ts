@@ -555,12 +555,16 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     issues.push("SUMSUB_APP_TOKEN is a sandbox token (sbx:) but APP_NETWORK=mainnet");
   }
   if (config.kycProvider === "sumsub" && config.sumsub.appToken && !config.sumsub.webhookSecret) {
-    issues.push("KYC_PROVIDER=sumsub requires SUMSUB_WEBHOOK_SECRET (sessions would start while every webhook is rejected with 401)");
+    issues.push(
+      "KYC_PROVIDER=sumsub requires SUMSUB_WEBHOOK_SECRET (sessions would start while every webhook is rejected with 401)",
+    );
   }
   if ((isProd || config.isMainnet) && !config.dbSslInsecureAck) {
     const local = /(localhost|127\.0\.0\.1|@postgres[:/])/.test(config.databaseUrl);
     if (config.dbSsl === "true" || (config.dbSsl === "auto" && !local)) {
-      issues.push("DB_SSL=true/auto does not verify the Postgres server certificate; set DB_SSL=verify (with DB_SSL_CA when needed) or DB_SSL_INSECURE_ACK=true to accept unverified TLS in prod / on mainnet");
+      issues.push(
+        "DB_SSL=true/auto does not verify the Postgres server certificate; set DB_SSL=verify (with DB_SSL_CA when needed) or DB_SSL_INSECURE_ACK=true to accept unverified TLS in prod / on mainnet",
+      );
     }
   }
   if (config.isMainnet) {

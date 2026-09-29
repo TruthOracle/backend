@@ -147,7 +147,9 @@ export class AdminService {
 
     // A non-primary party may own its own on-ledger UserWallet (§8.1); the primary's IS the in-app wallet.
     const own = await this.walletLinks.ownLedgerWallets(walletRows, user.partyId);
-    const wallets = walletRows.map((w) => this.walletLinks.toApi(w, { ownLedgerWallet: own.get(w.id) ?? null }));
+    const wallets = walletRows.map((w) =>
+      this.walletLinks.toApi(w, { ownLedgerWallet: own.get(w.id) ?? null }),
+    );
 
     const providerOf = new Map<string, IdentityProvider>(identities.map((i) => [i.id, i.provider]));
     const sessions = await Promise.all(
@@ -300,7 +302,11 @@ export class AdminService {
   }
 
   /** `POST /admin/kyc/webhooks/:id/replay { reason }` — re-publish a stored event's trigger (RUNBOOK §4). */
-  async replayWebhook(eventId: string, reason: string, actor: AdminActor): Promise<{ ok: true; eventId: string }> {
+  async replayWebhook(
+    eventId: string,
+    reason: string,
+    actor: AdminActor,
+  ): Promise<{ ok: true; eventId: string }> {
     const { eventId: id } = await this.kyc.replayWebhook(eventId, reason, actor);
     return { ok: true, eventId: id };
   }
@@ -381,7 +387,8 @@ export class AdminService {
     const hit = known.get(identityId);
     if (hit) return hit;
     const identity = await this.identities.findById(identityId);
-    if (!identity) throw new ApiError(500, "internal_error", "session references an unknown identity");
+    if (!identity)
+      throw new ApiError(500, "internal_error", "session references an unknown identity");
     return identity.provider;
   }
 

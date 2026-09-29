@@ -33,7 +33,11 @@ export class SessionGuard implements CanActivate {
     req.requestHost = requestHostOf(req, this.config);
     req.requestProto = requestProtoOf(req, this.config);
 
-    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [context.getHandler(), context.getClass()]) === true;
+    const isPublic =
+      this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) === true;
 
     const { token, kind } = extractToken(req);
     if (!token) {
@@ -56,8 +60,13 @@ export class SessionGuard implements CanActivate {
     // §6.8: an admin session is an operator credential for /admin and the session's own
     // housekeeping; every other account route refuses it unless the handler opted in.
     if (verified.session.kind === "admin" && !isPublic) {
-      const allowed = this.reflector.getAllAndOverride<boolean>(ALLOW_ADMIN_SESSION_KEY, [context.getHandler(), context.getClass()]) === true;
-      if (!allowed) throw new ApiError(403, "forbidden", "admin sessions cannot use account routes");
+      const allowed =
+        this.reflector.getAllAndOverride<boolean>(ALLOW_ADMIN_SESSION_KEY, [
+          context.getHandler(),
+          context.getClass(),
+        ]) === true;
+      if (!allowed)
+        throw new ApiError(403, "forbidden", "admin sessions cannot use account routes");
     }
 
     req.session = verified.session;

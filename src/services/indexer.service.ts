@@ -227,18 +227,16 @@ export class IndexerService {
         "resync",
       );
       const state = await this.state(manager);
-      await manager
-        .getRepository(IndexerStateEntity)
-        .update(
-          { key: INDEXER_STATE_KEY },
-          {
-            offset: at,
-            prunedOffset: pruned,
-            gaps: [...(state.gaps ?? []), gap],
-            lastError: null,
-            lastErrorAt: null,
-          },
-        );
+      await manager.getRepository(IndexerStateEntity).update(
+        { key: INDEXER_STATE_KEY },
+        {
+          offset: at,
+          prunedOffset: pruned,
+          gaps: [...(state.gaps ?? []), gap],
+          lastError: null,
+          lastErrorAt: null,
+        },
+      );
       this.logger.warn(`resync: ${inserted} contract(s) added, ${archived} marked archived`);
     });
     this.sentry.captureMessage("ledger indexer resynced from an ACS snapshot", "warning", {
@@ -262,18 +260,16 @@ export class IndexerService {
         reason: `operator resync: ${reason}`,
         at: new Date().toISOString(),
       };
-      await manager
-        .getRepository(IndexerStateEntity)
-        .update(
-          { key: INDEXER_STATE_KEY },
-          {
-            offset: end,
-            ledgerEnd: end,
-            gaps: state.offset < end ? [...(fresh.gaps ?? []), gap] : (fresh.gaps ?? []),
-            bootstrappedAt: fresh.bootstrappedAt ?? new Date(),
-            bootstrapOffset: fresh.bootstrapOffset ?? end,
-          },
-        );
+      await manager.getRepository(IndexerStateEntity).update(
+        { key: INDEXER_STATE_KEY },
+        {
+          offset: end,
+          ledgerEnd: end,
+          gaps: state.offset < end ? [...(fresh.gaps ?? []), gap] : (fresh.gaps ?? []),
+          bootstrappedAt: fresh.bootstrappedAt ?? new Date(),
+          bootstrapOffset: fresh.bootstrapOffset ?? end,
+        },
+      );
     });
     return this.status();
   }

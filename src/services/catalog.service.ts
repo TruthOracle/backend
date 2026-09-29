@@ -356,7 +356,11 @@ export class CatalogService {
     reason?: string,
   ): Promise<ApiMarket> {
     if (patch.imageUrl === undefined && patch.description === undefined)
-      throw new ApiError(400, "validation_failed", "nothing to update: send imageUrl and/or description");
+      throw new ApiError(
+        400,
+        "validation_failed",
+        "nothing to update: send imageUrl and/or description",
+      );
     const market = await this.markets.resolve(ref);
     await this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(MarketMetadataEntity);
@@ -367,11 +371,20 @@ export class CatalogService {
       if (patch.description !== undefined) row.description = patch.description;
       row.updatedByUserId = actor.userId ?? null;
       await repo.save(row);
-      await this.record(manager, actor, "catalog.market_metadata_updated", "market", market.ticker, {
-        reason,
-        marketId: market.marketId,
-        fields: Object.keys(patch).filter((k) => patch[k as keyof MarketMetadataPatch] !== undefined),
-      });
+      await this.record(
+        manager,
+        actor,
+        "catalog.market_metadata_updated",
+        "market",
+        market.ticker,
+        {
+          reason,
+          marketId: market.marketId,
+          fields: Object.keys(patch).filter(
+            (k) => patch[k as keyof MarketMetadataPatch] !== undefined,
+          ),
+        },
+      );
     });
     await this.announce("market", market.ticker);
     return this.markets.get(market.marketId);
@@ -389,7 +402,9 @@ export class CatalogService {
     const seriesRows = await manager
       .getRepository(SeriesEntity)
       .createQueryBuilder("s")
-      .where("s.ticker IN (:...tickers)", { tickers: [...new Set(rows.map((r) => r.seriesTicker))] })
+      .where("s.ticker IN (:...tickers)", {
+        tickers: [...new Set(rows.map((r) => r.seriesTicker))],
+      })
       .getMany();
     const series = new Map(seriesRows.map((s) => [s.ticker, s]));
     const marketRows = await manager

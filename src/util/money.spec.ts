@@ -1,4 +1,16 @@
-import { absCC, addCC, cmpCC, DUST, formatCC, isDust, moneyTransformer, parseCC, subCC, sumCC, tryParseCC } from "./money";
+import {
+  absCC,
+  addCC,
+  cmpCC,
+  DUST,
+  formatCC,
+  isDust,
+  moneyTransformer,
+  parseCC,
+  subCC,
+  sumCC,
+  tryParseCC,
+} from "./money";
 
 describe("util/money", () => {
   it("parses plain decimals into 1e-10 units", () => {
@@ -41,7 +53,9 @@ describe("util/money", () => {
     expect(formatCC(0n)).toBe("0.0000000000");
     expect(formatCC(1n)).toBe("0.0000000001");
     expect(formatCC(-2_500_000_000n)).toBe("-0.2500000000");
-    expect(formatCC(parseCC("123456789012345678.1234567891"))).toBe("123456789012345678.1234567891");
+    expect(formatCC(parseCC("123456789012345678.1234567891"))).toBe(
+      "123456789012345678.1234567891",
+    );
   });
 
   it("round-trips numeric(38,10) through the column transformer", () => {

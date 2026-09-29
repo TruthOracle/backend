@@ -52,26 +52,38 @@ export const SUMSUB_EVENT_KINDS: Readonly<Record<string, KycEventKind>> = {
 
 /** `x-payload-digest-alg` values a deployment accepts (the dashboard must be set to one of them). */
 export function acceptedDigestAlgorithms(allowSha1: boolean): string[] {
-  return Object.keys(SUMSUB_DIGEST_ALGS).filter((alg) => allowSha1 || SUMSUB_DIGEST_ALGS[alg] !== "sha1");
+  return Object.keys(SUMSUB_DIGEST_ALGS).filter(
+    (alg) => allowSha1 || SUMSUB_DIGEST_ALGS[alg] !== "sha1",
+  );
 }
 
 /**
  * What the credential probe means (docs/KYC.md §6): a lookup of an applicant that cannot exist
  * answers 404 iff the app token and the request signature were accepted.
  */
-export function interpretSumsubProbe(status: number, detail = ""): { ok: boolean; message: string } {
+export function interpretSumsubProbe(
+  status: number,
+  detail = "",
+): { ok: boolean; message: string } {
   switch (status) {
     case 404:
       return { ok: true, message: "Sumsub accepted the app token and the request signature" };
     case 200:
-      return { ok: true, message: "Sumsub accepted the credentials (and found an applicant for the probe id)" };
+      return {
+        ok: true,
+        message: "Sumsub accepted the credentials (and found an applicant for the probe id)",
+      };
     case 401:
       return {
         ok: false,
-        message: "Sumsub rejected the app token or the request signature — check SUMSUB_APP_TOKEN / SUMSUB_SECRET_KEY and that the server clock is within a minute of UTC",
+        message:
+          "Sumsub rejected the app token or the request signature — check SUMSUB_APP_TOKEN / SUMSUB_SECRET_KEY and that the server clock is within a minute of UTC",
       };
     case 403:
-      return { ok: false, message: "the app token is valid but lacks the 'View applicants' permission" };
+      return {
+        ok: false,
+        message: "the app token is valid but lacks the 'View applicants' permission",
+      };
     case 0:
       return { ok: false, message: `Sumsub is unreachable${detail ? `: ${detail}` : ""}` };
     default:
@@ -139,7 +151,9 @@ export function eventKeyOf(rawBody: Buffer): string {
 }
 
 function obj(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 function stringList(value: unknown): string[] {
@@ -294,7 +308,11 @@ export class KycProviderSumsubService implements KycProvider {
       ttlInSecs: SDK_TOKEN_TTL_SEC,
       ...(email ? { applicantIdentifiers: { email } } : {}),
     };
-    const res = await this.request<{ token?: unknown }>("POST", "/resources/accessTokens/sdk", body);
+    const res = await this.request<{ token?: unknown }>(
+      "POST",
+      "/resources/accessTokens/sdk",
+      body,
+    );
     const token = asString(res.token);
     if (!token) throw new ApiError(502, "upstream_failed", "Sumsub returned no SDK token");
     const resolvedApplicant = applicantId ?? (await this.findApplicantByExternalUserId(user.id));
@@ -305,7 +323,10 @@ export class KycProviderSumsubService implements KycProvider {
     };
   }
 
-  verifyWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): KycEvent | null {
+  verifyWebhook(
+    rawBody: Buffer,
+    headers: Record<string, string | string[] | undefined>,
+  ): KycEvent | null {
     const secret = this.config.sumsub.webhookSecret;
     if (!secret) {
       this.logger.warn("SUMSUB_WEBHOOK_SECRET is not configured: webhook rejected");
@@ -322,7 +343,10 @@ export class KycProviderSumsubService implements KycProvider {
   }
 
   async fetchApplicant(applicantId: string): Promise<ApplicantSummary> {
-    const data = await this.request<unknown>("GET", `/resources/applicants/${encodeURIComponent(applicantId)}/one`);
+    const data = await this.request<unknown>(
+      "GET",
+      `/resources/applicants/${encodeURIComponent(applicantId)}/one`,
+    );
     return normaliseSumsubApplicant(data);
   }
 
@@ -344,14 +368,27 @@ export class KycProviderSumsubService implements KycProvider {
       },
     };
     if (!this.isConfigured()) {
-      return { ok: false, upstreamStatus: null, message: "SUMSUB_BASE_URL, SUMSUB_APP_TOKEN and SUMSUB_SECRET_KEY must all be set", ...base };
+      return {
+        ok: false,
+        upstreamStatus: null,
+        message: "SUMSUB_BASE_URL, SUMSUB_APP_TOKEN and SUMSUB_SECRET_KEY must all be set",
+        ...base,
+      };
     }
     if (!s.webhookSecret) {
-      return { ok: false, upstreamStatus: null, message: "SUMSUB_WEBHOOK_SECRET is not set: every webhook would be rejected with 401", ...base };
+      return {
+        ok: false,
+        upstreamStatus: null,
+        message: "SUMSUB_WEBHOOK_SECRET is not set: every webhook would be rejected with 401",
+        ...base,
+      };
     }
     const probe = `health-${randomUUID()}`;
     try {
-      await this.request<unknown>("GET", `/resources/applicants/-;externalUserId=${encodeURIComponent(probe)}/one`);
+      await this.request<unknown>(
+        "GET",
+        `/resources/applicants/-;externalUserId=${encodeURIComponent(probe)}/one`,
+      );
       return { ...interpretSumsubProbe(200), upstreamStatus: 200, ...base };
     } catch (err) {
       const status = err instanceof ApiError ? Number(err.details?.upstreamStatus ?? 0) : 0;
@@ -374,7 +411,11 @@ export class KycProviderSumsubService implements KycProvider {
     }
   }
 
-  private async request<T>(method: "GET" | "POST", pathWithQuery: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    method: "GET" | "POST",
+    pathWithQuery: string,
+    body?: unknown,
+  ): Promise<T> {
     if (!this.isConfigured()) {
       throw new ApiError(503, "kyc_provider_unavailable", "Sumsub is not configured");
     }
@@ -421,7 +462,11 @@ export class KycProviderSumsubService implements KycProvider {
     try {
       return JSON.parse(text) as T;
     } catch {
-      throw new ApiError(502, "upstream_failed", `Sumsub ${method} ${pathWithQuery.split(";")[0]} returned non-JSON`);
+      throw new ApiError(
+        502,
+        "upstream_failed",
+        `Sumsub ${method} ${pathWithQuery.split(";")[0]} returned non-JSON`,
+      );
     }
   }
 }

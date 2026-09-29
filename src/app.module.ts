@@ -32,7 +32,8 @@ function getConfigModule(config: Config): DynamicModule {
 }
 
 type ClassLike = abstract new (...args: never[]) => unknown;
-const isClass = (v: unknown): v is ClassLike => typeof v === "function" && /^class\s/.test(Function.prototype.toString.call(v));
+const isClass = (v: unknown): v is ClassLike =>
+  typeof v === "function" && /^class\s/.test(Function.prototype.toString.call(v));
 
 /** Global request pipeline: guards, validation and the error envelope (main.ts adds HTTP-level middleware). */
 export function buildValidationPipe(): ValidationPipe {
@@ -52,8 +53,10 @@ export class AppModule {
       NotFoundFallback,
       {
         provide: KYC_PROVIDER,
-        useFactory: (mock: KycProviderMockService, sumsub: KycProviderSumsubService): KycProvider =>
-          config.kycProvider === "mock" ? mock : sumsub,
+        useFactory: (
+          mock: KycProviderMockService,
+          sumsub: KycProviderSumsubService,
+        ): KycProvider => (config.kycProvider === "mock" ? mock : sumsub),
         inject: [KycProviderMockService, KycProviderSumsubService],
       },
       // IdentityService resolves this lazily via ModuleRef (no constructor-time cycle with KycService).

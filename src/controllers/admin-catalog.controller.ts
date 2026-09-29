@@ -16,7 +16,13 @@ import {
 import { CatalogService } from "../services/catalog.service";
 import { ExchangeService } from "../services/exchange.service";
 import { MarketOperatorService } from "../services/market-operator.service";
-import type { ApiCreateMarketResult, ApiEvent, ApiExchangeHalt, ApiMarket, ApiSeries } from "../types";
+import type {
+  ApiCreateMarketResult,
+  ApiEvent,
+  ApiExchangeHalt,
+  ApiMarket,
+  ApiSeries,
+} from "../types";
 import { adminActorOf } from "./admin.controller";
 
 /**
@@ -42,9 +48,14 @@ export class AdminCatalogController {
 
   @Post("series")
   @HttpCode(200)
-  createSeries(@Body() body: CreateSeriesDto, @Req() req: AuthedRequest): Promise<{ series: ApiSeries }> {
+  createSeries(
+    @Body() body: CreateSeriesDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ series: ApiSeries }> {
     const { reason, ...input } = body;
-    return this.catalog.createSeries(input, adminActorOf(req), reason).then((series) => ({ series }));
+    return this.catalog
+      .createSeries(input, adminActorOf(req), reason)
+      .then((series) => ({ series }));
   }
 
   @Patch("series/:ticker")
@@ -55,12 +66,17 @@ export class AdminCatalogController {
     @Req() req: AuthedRequest,
   ): Promise<{ series: ApiSeries }> {
     const { reason, ...patch } = body;
-    return this.catalog.updateSeries(ticker, patch, adminActorOf(req), reason).then((series) => ({ series }));
+    return this.catalog
+      .updateSeries(ticker, patch, adminActorOf(req), reason)
+      .then((series) => ({ series }));
   }
 
   @Post("events")
   @HttpCode(200)
-  createEvent(@Body() body: CreateEventDto, @Req() req: AuthedRequest): Promise<{ event: ApiEvent }> {
+  createEvent(
+    @Body() body: CreateEventDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ event: ApiEvent }> {
     const { reason, ...input } = body;
     return this.catalog.createEvent(input, adminActorOf(req), reason).then((event) => ({ event }));
   }
@@ -73,13 +89,18 @@ export class AdminCatalogController {
     @Req() req: AuthedRequest,
   ): Promise<{ event: ApiEvent }> {
     const { reason, ...patch } = body;
-    return this.catalog.updateEvent(ticker, patch, adminActorOf(req), reason).then((event) => ({ event }));
+    return this.catalog
+      .updateEvent(ticker, patch, adminActorOf(req), reason)
+      .then((event) => ({ event }));
   }
 
   /** Submits `MarketCounter.CreateMarket` treasury-signed; the market appears once indexed (docs/MARKETS.md §4). */
   @Post("markets")
   @HttpCode(200)
-  createMarket(@Body() body: CreateMarketDto, @Req() req: AuthedRequest): Promise<ApiCreateMarketResult> {
+  createMarket(
+    @Body() body: CreateMarketDto,
+    @Req() req: AuthedRequest,
+  ): Promise<ApiCreateMarketResult> {
     const { reason, ...input } = body;
     return this.operator.createMarket(input, adminActorOf(req), reason);
   }
@@ -93,15 +114,24 @@ export class AdminCatalogController {
     @Req() req: AuthedRequest,
   ): Promise<{ market: ApiMarket }> {
     const { reason, ...patch } = body;
-    return this.catalog.updateMarketMetadata(ref, patch, adminActorOf(req), reason).then((market) => ({ market }));
+    return this.catalog
+      .updateMarketMetadata(ref, patch, adminActorOf(req), reason)
+      .then((market) => ({ market }));
   }
 
   @Post("exchange/halt")
   @HttpCode(200)
-  halt(@Body() body: ExchangeHaltDto, @Req() req: AuthedRequest): Promise<{ halt: ApiExchangeHalt }> {
+  halt(
+    @Body() body: ExchangeHaltDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ halt: ApiExchangeHalt }> {
     return this.exchange
       .setHalt(
-        { active: body.active, reason: body.reason, estimatedResumeAt: body.estimatedResumeAt ?? null },
+        {
+          active: body.active,
+          reason: body.reason,
+          estimatedResumeAt: body.estimatedResumeAt ?? null,
+        },
         adminActorOf(req),
       )
       .then((halt) => ({ halt }));

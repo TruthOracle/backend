@@ -69,28 +69,71 @@ describe("config", () => {
       ["missing REDIS_URL", { REDIS_URL: "" }, /REDIS_URL/],
       ["missing NATS_URL", { NATS_URL: "" }, /NATS_URL/],
       ["short SESSION_SECRET", { SESSION_SECRET: "short" }, /SESSION_SECRET/],
-      ["short KYC_FINGERPRINT_PEPPER", { KYC_FINGERPRINT_PEPPER: "short" }, /KYC_FINGERPRINT_PEPPER/],
+      [
+        "short KYC_FINGERPRINT_PEPPER",
+        { KYC_FINGERPRINT_PEPPER: "short" },
+        /KYC_FINGERPRINT_PEPPER/,
+      ],
       ["short BACKEND_PROXY_SECRET", { BACKEND_PROXY_SECRET: "short" }, /BACKEND_PROXY_SECRET/],
       ["mock in prod", { APP_ENV: "prod", KYC_PROVIDER: "mock" }, /KYC_PROVIDER=mock/],
       [
         "mock on mainnet",
-        { APP_NETWORK: "mainnet", KYC_PROVIDER: "mock", ZKPC_LEDGER_API_URL: "https://l", ZKPC_KEYCLOAK_URL: "https://k", ZKPC_KEYCLOAK_CLIENT_ID: "c", ZKPC_KEYCLOAK_CLIENT_SECRET: "s" },
+        {
+          APP_NETWORK: "mainnet",
+          KYC_PROVIDER: "mock",
+          ZKPC_LEDGER_API_URL: "https://l",
+          ZKPC_KEYCLOAK_URL: "https://k",
+          ZKPC_KEYCLOAK_CLIENT_ID: "c",
+          ZKPC_KEYCLOAK_CLIENT_SECRET: "s",
+        },
         /KYC_PROVIDER=mock/,
       ],
       [
         "sbx token on mainnet",
-        { APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "sbx:abc", ZKPC_LEDGER_API_URL: "https://l", ZKPC_KEYCLOAK_URL: "https://k", ZKPC_KEYCLOAK_CLIENT_ID: "c", ZKPC_KEYCLOAK_CLIENT_SECRET: "s" },
+        {
+          APP_NETWORK: "mainnet",
+          KYC_PROVIDER: "sumsub",
+          SUMSUB_APP_TOKEN: "sbx:abc",
+          ZKPC_LEDGER_API_URL: "https://l",
+          ZKPC_KEYCLOAK_URL: "https://k",
+          ZKPC_KEYCLOAK_CLIENT_ID: "c",
+          ZKPC_KEYCLOAK_CLIENT_SECRET: "s",
+        },
         /sandbox token/,
       ],
       ["mainnet without ZKPC", { APP_NETWORK: "mainnet", KYC_PROVIDER: "sumsub" }, /ZKPC_/],
-      ["cookie domain with proxy secret", { COOKIE_DOMAIN: "example.com", BACKEND_PROXY_SECRET: "x".repeat(32) }, /COOKIE_DOMAIN/],
+      [
+        "cookie domain with proxy secret",
+        { COOKIE_DOMAIN: "example.com", BACKEND_PROXY_SECRET: "x".repeat(32) },
+        /COOKIE_DOMAIN/,
+      ],
       ["bad operator party", { ADMIN_OPERATORS: "not-a-party=abc" }, /ADMIN_OPERATORS/],
       ["bad origin", { FRONTEND_ORIGINS: "app.test" }, /origin entry/],
       ["bad rotation ack", { KYC_PEPPER_ROTATION_ACK: "nope" }, /KYC_PEPPER_ROTATION_ACK/],
-      ["sumsub without a webhook secret", { KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "prd:x", SUMSUB_SECRET_KEY: "k" }, /SUMSUB_WEBHOOK_SECRET/],
-      ["prod with unverified Postgres TLS", { APP_ENV: "prod", KYC_PROVIDER: "sumsub", DATABASE_URL: "postgresql://u:p@db.remote:5432/x" }, /DB_SSL=verify/],
-      ["prod with DB_SSL=true", { APP_ENV: "prod", KYC_PROVIDER: "sumsub", DB_SSL: "true" }, /DB_SSL=verify/],
-      ["a deposit lock TTL below the worst-case walk", { DEPOSIT_LOCK_TTL_MS: "1000" }, /depositLockTtlMs/],
+      [
+        "sumsub without a webhook secret",
+        { KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "prd:x", SUMSUB_SECRET_KEY: "k" },
+        /SUMSUB_WEBHOOK_SECRET/,
+      ],
+      [
+        "prod with unverified Postgres TLS",
+        {
+          APP_ENV: "prod",
+          KYC_PROVIDER: "sumsub",
+          DATABASE_URL: "postgresql://u:p@db.remote:5432/x",
+        },
+        /DB_SSL=verify/,
+      ],
+      [
+        "prod with DB_SSL=true",
+        { APP_ENV: "prod", KYC_PROVIDER: "sumsub", DB_SSL: "true" },
+        /DB_SSL=verify/,
+      ],
+      [
+        "a deposit lock TTL below the worst-case walk",
+        { DEPOSIT_LOCK_TTL_MS: "1000" },
+        /depositLockTtlMs/,
+      ],
     ])("refuses %s", (_name, extra, pattern) => {
       expect(() => cfg(extra)).toThrow(pattern);
     });
@@ -99,9 +142,30 @@ describe("config", () => {
       // KYC enforcement is a plain flag: nothing else has to be attested first (ARCHITECTURE §18).
       expect(cfg({ KYC_ENFORCE_WITHDRAWALS: "true" }).kycEnforceWithdrawals).toBe(true);
       expect(cfg().kycEnforceWithdrawals).toBe(false);
-      expect(cfg({ APP_ENV: "prod", KYC_PROVIDER: "sumsub", DATABASE_URL: "postgresql://u:p@db.remote:5432/x", DB_SSL: "verify" }).dbSsl).toBe("verify");
-      expect(cfg({ APP_ENV: "prod", KYC_PROVIDER: "sumsub", DATABASE_URL: "postgresql://u:p@db.remote:5432/x", DB_SSL_INSECURE_ACK: "true" }).dbSslInsecureAck).toBe(true);
-      expect(cfg({ KYC_PROVIDER: "sumsub", SUMSUB_APP_TOKEN: "prd:x", SUMSUB_SECRET_KEY: "k", SUMSUB_WEBHOOK_SECRET: "w" }).sumsub.webhookSecret).toBe("w");
+      expect(
+        cfg({
+          APP_ENV: "prod",
+          KYC_PROVIDER: "sumsub",
+          DATABASE_URL: "postgresql://u:p@db.remote:5432/x",
+          DB_SSL: "verify",
+        }).dbSsl,
+      ).toBe("verify");
+      expect(
+        cfg({
+          APP_ENV: "prod",
+          KYC_PROVIDER: "sumsub",
+          DATABASE_URL: "postgresql://u:p@db.remote:5432/x",
+          DB_SSL_INSECURE_ACK: "true",
+        }).dbSslInsecureAck,
+      ).toBe(true);
+      expect(
+        cfg({
+          KYC_PROVIDER: "sumsub",
+          SUMSUB_APP_TOKEN: "prd:x",
+          SUMSUB_SECRET_KEY: "k",
+          SUMSUB_WEBHOOK_SECRET: "w",
+        }).sumsub.webhookSecret,
+      ).toBe("w");
       const knobs = cfg({ DEPOSIT_CONFIRM_GRACE_MS: "0", PAYOUT_RESEND_GRACE_MS: "0" });
       expect(knobs.depositConfirmGraceMs).toBe(0);
       expect(knobs.payoutResendGraceMs).toBe(0);

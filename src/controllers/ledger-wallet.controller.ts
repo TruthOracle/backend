@@ -30,9 +30,7 @@ export class LedgerWalletController {
 
   /** The primary party's UserWallet as indexed plus every PendingPayout of the account's parties. */
   @Get("ledger")
-  async ledger(
-    @Req() req: AuthedRequest,
-  ): Promise<{
+  async ledger(@Req() req: AuthedRequest): Promise<{
     partyId: string | null;
     wallet: ApiIndexedWallet | null;
     payouts: ApiLedgerPayout[];

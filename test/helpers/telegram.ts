@@ -19,14 +19,20 @@ export interface TelegramTestUser {
 }
 
 /** Signs a Login Widget payload the way Telegram does (§7.2): key = SHA256(bot token), sorted `k=v` lines. */
-export function signTelegramWidget(fields: Record<string, string>, botToken: string): Record<string, string> {
+export function signTelegramWidget(
+  fields: Record<string, string>,
+  botToken: string,
+): Record<string, string> {
   const key = createHash("sha256").update(botToken, "utf8").digest();
   const dataCheckString = Object.keys(fields)
     .filter((k) => k !== "hash")
     .sort()
     .map((k) => `${k}=${fields[k]}`)
     .join("\n");
-  return { ...fields, hash: createHmac("sha256", key).update(dataCheckString, "utf8").digest("hex") };
+  return {
+    ...fields,
+    hash: createHmac("sha256", key).update(dataCheckString, "utf8").digest("hex"),
+  };
 }
 
 let nextId = 700_000_000;
@@ -42,9 +48,16 @@ export function nextTelegramUser(firstName: string): TelegramTestUser {
  * the rolling offset keeps `auth_date` distinct while staying well inside TELEGRAM_AUTH_MAX_AGE_SEC.
  */
 let authDateOffset = 0;
-export function freshWidgetPayload(user: TelegramTestUser, botToken = TEST_TELEGRAM_BOT_TOKEN): Record<string, string> {
+export function freshWidgetPayload(
+  user: TelegramTestUser,
+  botToken = TEST_TELEGRAM_BOT_TOKEN,
+): Record<string, string> {
   authDateOffset = (authDateOffset + 1) % 200;
-  const fields: Record<string, string> = { id: user.id, first_name: user.first_name, auth_date: String(Math.floor(Date.now() / 1000) - authDateOffset) };
+  const fields: Record<string, string> = {
+    id: user.id,
+    first_name: user.first_name,
+    auth_date: String(Math.floor(Date.now() / 1000) - authDateOffset),
+  };
   if (user.last_name !== undefined) fields.last_name = user.last_name;
   if (user.username !== undefined) fields.username = user.username;
   return signTelegramWidget(fields, botToken);
@@ -61,9 +74,15 @@ export async function signInWithTelegram(
   user: TelegramTestUser,
   opts: { cookie?: string } = {},
 ): Promise<{ user: ApiUser; cookie: string; result: ApiLoginResult }> {
-  const headers: Record<string, string> = { Origin: TEST_ORIGIN, "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    Origin: TEST_ORIGIN,
+    "Content-Type": "application/json",
+  };
   if (opts.cookie) headers.Cookie = opts.cookie;
-  const res = await agent.post("/api/v1/auth/telegram/widget").set(headers).send(freshWidgetPayload(user));
+  const res = await agent
+    .post("/api/v1/auth/telegram/widget")
+    .set(headers)
+    .send(freshWidgetPayload(user));
   if (res.status !== 200) {
     throw new Error(`POST /auth/telegram/widget → ${res.status} ${JSON.stringify(res.body)}`);
   }

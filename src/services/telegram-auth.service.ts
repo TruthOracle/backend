@@ -131,7 +131,11 @@ export class TelegramAuthService {
   }
 
   oidcEnabled(): boolean {
-    return Boolean(this.config.telegramOidcClientId && this.config.telegramOidcClientSecret && this.config.telegramOidcIssuer);
+    return Boolean(
+      this.config.telegramOidcClientId &&
+      this.config.telegramOidcClientSecret &&
+      this.config.telegramOidcIssuer,
+    );
   }
 
   // ── Login Widget / Mini App ─────────────────────────────────────────────────
@@ -140,7 +144,12 @@ export class TelegramAuthService {
     this.requireConfigured();
     const maxAgeSec = this.config.telegramAuthMaxAgeSec;
     const result = verifyLoginWidget(payload, this.config.telegramBotToken, { maxAgeSec });
-    if (!result.ok) throw new ApiError(401, "invalid_credential", `telegram widget payload rejected: ${result.reason}`);
+    if (!result.ok)
+      throw new ApiError(
+        401,
+        "invalid_credential",
+        `telegram widget payload rejected: ${result.reason}`,
+      );
     await this.claimReplay(result.replayKey, maxAgeSec);
     return claimFromUser(result.user);
   }
@@ -149,7 +158,8 @@ export class TelegramAuthService {
     this.requireConfigured();
     const maxAgeSec = this.config.telegramInitDataMaxAgeSec;
     const result = verifyMiniAppInitData(initData, this.config.telegramBotToken, { maxAgeSec });
-    if (!result.ok) throw new ApiError(401, "invalid_credential", `telegram initData rejected: ${result.reason}`);
+    if (!result.ok)
+      throw new ApiError(401, "invalid_credential", `telegram initData rejected: ${result.reason}`);
     await this.claimReplay(result.replayKey, maxAgeSec);
     return claimFromUser(result.user);
   }
@@ -157,7 +167,8 @@ export class TelegramAuthService {
   /** The payload hash is claimed once (`tg:<hash>`) so a leaked redirect URL cannot be replayed. */
   private async claimReplay(hash: string, maxAgeSec: number): Promise<void> {
     const claimed = await this.redis.claimOnce(`tg:${hash}`, maxAgeSec * 1000 + REPLAY_GRACE_MS);
-    if (!claimed) throw new ApiError(401, "invalid_credential", "telegram payload was already used");
+    if (!claimed)
+      throw new ApiError(401, "invalid_credential", "telegram payload was already used");
   }
 
   // ── OIDC ───────────────────────────────────────────────────────────────────
@@ -171,11 +182,17 @@ export class TelegramAuthService {
     sessionId?: string | null;
   }): Promise<{ redirectUrl: string; cookie: string }> {
     this.requireOidcConfigured();
-    const host = String(input.host ?? "").trim().toLowerCase();
+    const host = String(input.host ?? "")
+      .trim()
+      .toLowerCase();
     const proto: "http" | "https" = input.proto === "http" ? "http" : "https";
     if (!host) throw new ApiError(400, "validation_failed", "request host is unknown");
     if (!this.hostAllowed(proto, host)) {
-      throw new ApiError(400, "validation_failed", "this host is not an allowed frontend origin (FRONTEND_ORIGINS)");
+      throw new ApiError(
+        400,
+        "validation_failed",
+        "this host is not an allowed frontend origin (FRONTEND_ORIGINS)",
+      );
     }
     if (input.mode === "link" && (!input.userId || !input.sessionId)) {
       throw new ApiError(401, "unauthenticated", "link mode requires a session");
@@ -211,7 +228,10 @@ export class TelegramAuthService {
     url.searchParams.set("nonce", record.nonce);
     url.searchParams.set("code_challenge", sha256b64url(verifier));
     url.searchParams.set("code_challenge_method", "S256");
-    return { redirectUrl: url.toString(), cookie: oidcCookie(cookieValue, OIDC_STATE_TTL_MS, this.config) };
+    return {
+      redirectUrl: url.toString(),
+      cookie: oidcCookie(cookieValue, OIDC_STATE_TTL_MS, this.config),
+    };
   }
 
   async oidcCallback(input: {
@@ -224,39 +244,82 @@ export class TelegramAuthService {
   }): Promise<OidcCallbackResult> {
     this.requireOidcConfigured();
     const state = String(input.state ?? "").trim();
-    if (!TOKEN_RE.test(state)) throw new OidcCallbackError(401, "oidc_failed", "state is missing or malformed", null);
+    if (!TOKEN_RE.test(state))
+      throw new OidcCallbackError(401, "oidc_failed", "state is missing or malformed", null);
 
     // Consume first — atomically: two callbacks presenting the same state race on one GETDEL, so
     // exactly one of them ever sees the record.
     const record = await this.redis.takeJson<OidcStateRecord>(`oidc:state:${state}`);
-    if (!record) throw new OidcCallbackError(401, "oidc_failed", "state unknown, expired or already used", null);
+    if (!record)
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        "state unknown, expired or already used",
+        null,
+      );
     if (!this.hostAllowed(record.proto, record.host)) {
-      throw new OidcCallbackError(401, "oidc_failed", "the stored app host is no longer an allowed origin", null);
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        "the stored app host is no longer an allowed origin",
+        null,
+      );
     }
-    const target: OidcRedirectTarget = { host: record.host, proto: record.proto, returnTo: record.returnTo };
+    const target: OidcRedirectTarget = {
+      host: record.host,
+      proto: record.proto,
+      returnTo: record.returnTo,
+    };
 
     const cookieValue = String(input.cookieValue ?? "").trim();
-    if (!TOKEN_RE.test(cookieValue) || !timingSafeStringEqual(sha256b64url(cookieValue), record.cookieHash)) {
-      throw new OidcCallbackError(401, "oidc_failed", "this browser did not start the sign-in", target);
+    if (
+      !TOKEN_RE.test(cookieValue) ||
+      !timingSafeStringEqual(sha256b64url(cookieValue), record.cookieHash)
+    ) {
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        "this browser did not start the sign-in",
+        target,
+      );
     }
     if (input.providerError) {
-      throw new OidcCallbackError(401, "oidc_failed", `telegram refused the sign-in (${String(input.providerError).slice(0, 64)})`, target);
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        `telegram refused the sign-in (${String(input.providerError).slice(0, 64)})`,
+        target,
+      );
     }
     if (record.mode === "link" && (!input.currentUserId || input.currentUserId !== record.userId)) {
-      throw new OidcCallbackError(409, "oidc_failed", "this link flow was started by a different account", target);
+      throw new OidcCallbackError(
+        409,
+        "oidc_failed",
+        "this link flow was started by a different account",
+        target,
+      );
     }
     const code = String(input.code ?? "").trim();
-    if (!code || code.length > 2048) throw new OidcCallbackError(401, "oidc_failed", "authorization code is missing", target);
+    if (!code || code.length > 2048)
+      throw new OidcCallbackError(401, "oidc_failed", "authorization code is missing", target);
 
     const discovery = await this.discovery().catch((err: unknown) => {
-      throw new OidcCallbackError(502, "oidc_failed", err instanceof ApiError ? err.message : "telegram discovery failed", target);
+      throw new OidcCallbackError(
+        502,
+        "oidc_failed",
+        err instanceof ApiError ? err.message : "telegram discovery failed",
+        target,
+      );
     });
 
     let tokens: { id_token?: unknown };
     try {
       tokens = (await this.fetchJson(discovery.token_endpoint, {
         method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          accept: "application/json",
+        },
         body: new URLSearchParams({
           grant_type: "authorization_code",
           code,
@@ -267,11 +330,14 @@ export class TelegramAuthService {
         }).toString(),
       })) as { id_token?: unknown };
     } catch (err) {
-      this.logger.warn(`telegram token exchange failed: ${err instanceof Error ? err.message.slice(0, 160) : "error"}`);
+      this.logger.warn(
+        `telegram token exchange failed: ${err instanceof Error ? err.message.slice(0, 160) : "error"}`,
+      );
       throw new OidcCallbackError(502, "oidc_failed", "telegram token exchange failed", target);
     }
     const idToken = typeof tokens?.id_token === "string" ? tokens.id_token : "";
-    if (!idToken) throw new OidcCallbackError(502, "oidc_failed", "telegram returned no id_token", target);
+    if (!idToken)
+      throw new OidcCallbackError(502, "oidc_failed", "telegram returned no id_token", target);
 
     let payload: JWTPayload;
     try {
@@ -282,14 +348,30 @@ export class TelegramAuthService {
       }));
     } catch (err) {
       this.logger.warn(`telegram id_token rejected: ${err instanceof Error ? err.name : "error"}`);
-      throw new OidcCallbackError(401, "oidc_failed", "telegram id_token could not be verified", target);
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        "telegram id_token could not be verified",
+        target,
+      );
     }
     if (typeof payload.nonce !== "string" || !timingSafeStringEqual(payload.nonce, record.nonce)) {
-      throw new OidcCallbackError(401, "oidc_failed", "telegram id_token nonce does not match", target);
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        "telegram id_token nonce does not match",
+        target,
+      );
     }
     // Fail closed: without a numeric Telegram user id there is no identity to resolve.
     const subject = numericId(payload.sub) ?? numericId(payload.id);
-    if (!subject) throw new OidcCallbackError(401, "oidc_failed", "telegram id_token carries no numeric user id", target);
+    if (!subject)
+      throw new OidcCallbackError(
+        401,
+        "oidc_failed",
+        "telegram id_token carries no numeric user id",
+        target,
+      );
 
     return {
       claim: claimFromOidc(subject, payload),
@@ -307,17 +389,26 @@ export class TelegramAuthService {
     const issuer = this.config.telegramOidcIssuer.replace(/\/$/, "");
     let raw: unknown;
     try {
-      raw = await this.fetchJson(`${issuer}/.well-known/openid-configuration`, { headers: { accept: "application/json" } });
+      raw = await this.fetchJson(`${issuer}/.well-known/openid-configuration`, {
+        headers: { accept: "application/json" },
+      });
     } catch (err) {
-      this.logger.warn(`telegram discovery failed: ${err instanceof Error ? err.message.slice(0, 160) : "error"}`);
+      this.logger.warn(
+        `telegram discovery failed: ${err instanceof Error ? err.message.slice(0, 160) : "error"}`,
+      );
       throw new ApiError(502, "oidc_failed", "telegram OIDC discovery failed");
     }
     const doc = (raw ?? {}) as Record<string, unknown>;
-    if (!isHttpsUrl(doc.authorization_endpoint) || !isHttpsUrl(doc.token_endpoint) || !isHttpsUrl(doc.jwks_uri)) {
+    if (
+      !isHttpsUrl(doc.authorization_endpoint) ||
+      !isHttpsUrl(doc.token_endpoint) ||
+      !isHttpsUrl(doc.jwks_uri)
+    ) {
       throw new ApiError(502, "oidc_failed", "telegram OIDC discovery document is incomplete");
     }
     const docIssuer = typeof doc.issuer === "string" ? doc.issuer.replace(/\/$/, "") : "";
-    if (docIssuer !== issuer) throw new ApiError(502, "oidc_failed", "telegram OIDC discovery issuer mismatch");
+    if (docIssuer !== issuer)
+      throw new ApiError(502, "oidc_failed", "telegram OIDC discovery issuer mismatch");
     const discovery: OidcDiscovery = {
       issuer: docIssuer,
       authorization_endpoint: doc.authorization_endpoint,
@@ -352,11 +443,21 @@ export class TelegramAuthService {
   }
 
   private requireConfigured(): void {
-    if (!this.isConfigured()) throw new ApiError(503, "upstream_failed", "telegram sign-in is not configured (TELEGRAM_BOT_TOKEN)");
+    if (!this.isConfigured())
+      throw new ApiError(
+        503,
+        "upstream_failed",
+        "telegram sign-in is not configured (TELEGRAM_BOT_TOKEN)",
+      );
   }
 
   private requireOidcConfigured(): void {
-    if (!this.oidcEnabled()) throw new ApiError(503, "upstream_failed", "telegram OIDC is not configured (TELEGRAM_OIDC_CLIENT_ID/SECRET)");
+    if (!this.oidcEnabled())
+      throw new ApiError(
+        503,
+        "upstream_failed",
+        "telegram OIDC is not configured (TELEGRAM_OIDC_CLIENT_ID/SECRET)",
+      );
   }
 }
 
@@ -375,7 +476,8 @@ function claimFromUser(user: TelegramUser): IdentityClaim {
 
 function claimFromOidc(subject: string, payload: JWTPayload): IdentityClaim {
   const s = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
-  const name = s(payload.name) ?? [s(payload.given_name), s(payload.family_name)].filter(Boolean).join(" ");
+  const name =
+    s(payload.name) ?? [s(payload.given_name), s(payload.family_name)].filter(Boolean).join(" ");
   return {
     provider: "telegram",
     subject,

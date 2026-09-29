@@ -213,7 +213,10 @@ export interface KycProvider {
     level: string,
   ): Promise<KycSessionResult>;
   /** null = signature / algorithm rejected. */
-  verifyWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): KycEvent | null;
+  verifyWebhook(
+    rawBody: Buffer,
+    headers: Record<string, string | string[] | undefined>,
+  ): KycEvent | null;
   fetchApplicant(applicantId: string): Promise<ApplicantSummary>;
 }
 
@@ -1094,7 +1097,12 @@ export const ORDER_ACTIONS = [
 ] as const;
 export type OrderAction = (typeof ORDER_ACTIONS)[number];
 /** Actions a quote can be produced for (the others are exact: 1 CC ↔ 1 YES + 1 NO, or a settlement). */
-export const QUOTABLE_ACTIONS: readonly OrderAction[] = ["buy", "sell", "swap", "provide_liquidity"];
+export const QUOTABLE_ACTIONS: readonly OrderAction[] = [
+  "buy",
+  "sell",
+  "swap",
+  "provide_liquidity",
+];
 
 export interface ApiQuoteBuy {
   action: "buy";

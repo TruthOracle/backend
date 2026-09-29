@@ -57,7 +57,11 @@ export function createMarketCommandIdFor(ticker: string): string {
 export function sideLabel(raw: string | undefined, fallback: "Yes" | "No"): string {
   const label = (raw ?? "").trim();
   if (label.length > 80)
-    throw new ApiError(400, "validation_failed", "yesSubTitle / noSubTitle are at most 80 characters");
+    throw new ApiError(
+      400,
+      "validation_failed",
+      "yesSubTitle / noSubTitle are at most 80 characters",
+    );
   return label || fallback;
 }
 
@@ -80,42 +84,70 @@ export class MarketOperatorService {
     private readonly nats: NatsService,
   ) {}
 
-  async createMarket(input: CreateMarketInput, actor: Actor, reason?: string): Promise<ApiCreateMarketResult> {
+  async createMarket(
+    input: CreateMarketInput,
+    actor: Actor,
+    reason?: string,
+  ): Promise<ApiCreateMarketResult> {
     const ticker = normalizeTicker(input.ticker);
     const eventTicker = normalizeTicker(input.eventTicker);
     const yesSubTitle = sideLabel(input.yesSubTitle, "Yes");
     const noSubTitle = sideLabel(input.noSubTitle, "No");
-    const event = await this.dataSource.getRepository(CatalogEventEntity).findOneBy({ ticker: eventTicker });
+    const event = await this.dataSource
+      .getRepository(CatalogEventEntity)
+      .findOneBy({ ticker: eventTicker });
     if (!event) throw new ApiError(404, "not_found", `event ${eventTicker} does not exist`);
-    if (event.archived) throw new ApiError(409, "catalog_conflict", `event ${eventTicker} is archived`);
+    if (event.archived)
+      throw new ApiError(409, "catalog_conflict", `event ${eventTicker} is archived`);
     const taken = await this.dataSource.getRepository(MarketEntity).findOneBy({ ticker });
-    if (taken) throw new ApiError(409, "catalog_conflict", `ticker ${ticker} is used by market ${taken.marketId}`);
+    if (taken)
+      throw new ApiError(
+        409,
+        "catalog_conflict",
+        `ticker ${ticker} is used by market ${taken.marketId}`,
+      );
 
-    const state = await this.dataSource.getRepository(IndexerStateEntity).findOneBy({ key: INDEXER_STATE_KEY });
+    const state = await this.dataSource
+      .getRepository(IndexerStateEntity)
+      .findOneBy({ key: INDEXER_STATE_KEY });
     if (!state?.marketCounterCid)
-      throw new ApiError(503, "not_ready", "the MarketCounter is not indexed yet — the indexer must see it first");
+      throw new ApiError(
+        503,
+        "not_ready",
+        "the MarketCounter is not indexed yet — the indexer must see it first",
+      );
 
     const nowSec = Math.floor(Date.now() / 1000);
     const expiresAtSec = Math.floor(Date.parse(input.expiresAt) / 1000);
-    if (!Number.isFinite(expiresAtSec)) throw new ApiError(400, "validation_failed", "expiresAt is not a date");
+    if (!Number.isFinite(expiresAtSec))
+      throw new ApiError(400, "validation_failed", "expiresAt is not a date");
     const liquidityPeriodSecs = input.liquidityPeriodSecs ?? 0;
     if (expiresAtSec <= nowSec + liquidityPeriodSecs)
       throw new ApiError(400, "validation_failed", "expiresAt must be after the liquidity period");
     const p0 = Number(input.initialProbability);
     if (!(p0 >= 0.01 && p0 <= 0.99))
-      throw new ApiError(400, "validation_failed", "initialProbability must be within [0.01, 0.99]");
+      throw new ApiError(
+        400,
+        "validation_failed",
+        "initialProbability must be within [0.01, 0.99]",
+      );
     if (!(Number(input.initialValueCC) > 0))
       throw new ApiError(400, "validation_failed", "initialValueCC must be positive");
     const feeBps = input.feeBps ?? 30;
     const prizeFeeShareBps = input.prizeFeeShareBps ?? 0;
-    if (feeBps < 0 || feeBps > 1000) throw new ApiError(400, "validation_failed", "feeBps must be 0..1000");
+    if (feeBps < 0 || feeBps > 1000)
+      throw new ApiError(400, "validation_failed", "feeBps must be 0..1000");
     if (prizeFeeShareBps < 0 || prizeFeeShareBps > 10_000)
       throw new ApiError(400, "validation_failed", "prizeFeeShareBps must be 0..10000");
     const policy = input.policy ?? {};
     const reporters = policy.reporters ?? [];
     const quorum = policy.quorum ?? 0;
     if (quorum > reporters.length)
-      throw new ApiError(400, "validation_failed", "policy.quorum cannot exceed the reporter count");
+      throw new ApiError(
+        400,
+        "validation_failed",
+        "policy.quorum cannot exceed the reporter count",
+      );
 
     // Presentation never reaches the ledger (v16 carries none): it is written to the backend's own
     // table before the submit, keyed by ticker, so it is there the moment the indexer sees the
@@ -179,7 +211,8 @@ export class MarketOperatorService {
         },
       ],
     });
-    const expectedMarketId = state.marketCounterValue === null ? null : state.marketCounterValue + 1;
+    const expectedMarketId =
+      state.marketCounterValue === null ? null : state.marketCounterValue + 1;
     await this.audit.record({
       actorType: actor.type,
       actorUserId: actor.userId ?? null,
@@ -193,7 +226,10 @@ export class MarketOperatorService {
         commandId,
         expectedMarketId,
         status: res.status,
-        presentation: [imageUrl !== undefined ? "imageUrl" : null, description !== undefined ? "description" : null].filter(Boolean),
+        presentation: [
+          imageUrl !== undefined ? "imageUrl" : null,
+          description !== undefined ? "description" : null,
+        ].filter(Boolean),
       },
       ip: actor.ip ?? null,
     });

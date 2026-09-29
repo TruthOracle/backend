@@ -20,7 +20,9 @@ async function main(): Promise<number> {
   }
   const config = getConfiguration();
   const provider: KycProvider =
-    config.kycProvider === "sumsub" ? new KycProviderSumsubService(config) : new KycProviderMockService(config);
+    config.kycProvider === "sumsub"
+      ? new KycProviderSumsubService(config)
+      : new KycProviderMockService(config);
   const health = await provider.healthCheck();
   const lines = [
     `provider            ${provider.name}`,
@@ -30,7 +32,8 @@ async function main(): Promise<number> {
     `webhook path        /api/v1/webhooks/kyc/${provider.name}   (register https://<app-host>/__backend + this path in the vendor dashboard)`,
     `probe               ${health.ok ? "OK" : "FAILED"}${health.upstreamStatus !== null ? ` (HTTP ${health.upstreamStatus})` : ""} — ${health.message}`,
   ];
-  for (const [k, v] of Object.entries(health.details)) lines.push(`  ${k.padEnd(26)} ${JSON.stringify(v)}`);
+  for (const [k, v] of Object.entries(health.details))
+    lines.push(`  ${k.padEnd(26)} ${JSON.stringify(v)}`);
   console.log(lines.join("\n"));
   return health.ok ? 0 : 1;
 }

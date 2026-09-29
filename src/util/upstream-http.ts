@@ -55,7 +55,11 @@ export async function authedJson<T = unknown>(
   }
 
   if (!res.ok) {
-    throw new UpstreamError(`${method} ${path} failed: HTTP ${res.status} ${text.slice(0, 600)}`, res.status, text.slice(0, 2000));
+    throw new UpstreamError(
+      `${method} ${path} failed: HTTP ${res.status} ${text.slice(0, 600)}`,
+      res.status,
+      text.slice(0, 2000),
+    );
   }
   if (!text) return {} as T;
   try {

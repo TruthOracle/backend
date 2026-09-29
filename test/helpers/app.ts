@@ -22,7 +22,8 @@ import { NatsService } from "../../src/services/nats.service";
 import { RedisService } from "../../src/services/redis.service";
 import { FakeEnterpriseWallet, FakeLedgerClient, FakeLedgerStream, FakeNatsService } from "./fakes";
 
-export const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgresql://localhost:5432/truthoracle_backend_test";
+export const TEST_DATABASE_URL =
+  process.env.TEST_DATABASE_URL ?? "postgresql://localhost:5432/truthoracle_backend_test";
 export const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://localhost:6379/1";
 /** An allowed browser origin for CSRF-passing requests (FRONTEND_ORIGINS in the test env). */
 export const TEST_ORIGIN = "http://app.test";
@@ -139,7 +140,11 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
   if (overrides.configure) builder = overrides.configure(builder);
   const moduleRef = await builder.compile();
 
-  const app = moduleRef.createNestApplication<NestExpressApplication>({ rawBody: true, bodyParser: false, logger: false });
+  const app = moduleRef.createNestApplication<NestExpressApplication>({
+    rawBody: true,
+    bodyParser: false,
+    logger: false,
+  });
   setupHttpApp(app, config);
   await app.init();
 

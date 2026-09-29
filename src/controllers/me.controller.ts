@@ -1,4 +1,17 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+  Req,
+  Res,
+} from "@nestjs/common";
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 import type { Response } from "express";
 
@@ -74,7 +87,9 @@ export class MeController {
     return {
       user: this.users.toApi(user),
       identities: identities.map((i) => this.identities.toApi(i, locked)),
-      wallets: walletRows.map((w) => this.walletLinks.toApi(w, { ownLedgerWallet: ownLedger.get(w.id) ?? null })),
+      wallets: walletRows.map((w) =>
+        this.walletLinks.toApi(w, { ownLedgerWallet: ownLedger.get(w.id) ?? null }),
+      ),
       kyc,
       capabilities: this.capabilities(user, session, gate.allowed),
     };
@@ -109,7 +124,10 @@ export class MeController {
   /** §6.3–6.5 via IdentityService.unlink: 409 identity_locked_by_kyc | last_identity. */
   @Delete("identities/:id")
   @HttpCode(200)
-  async unlinkIdentity(@Param("id", ParseUUIDPipe) id: string, @Req() req: AuthedRequest): Promise<{ ok: true }> {
+  async unlinkIdentity(
+    @Param("id", ParseUUIDPipe) id: string,
+    @Req() req: AuthedRequest,
+  ): Promise<{ ok: true }> {
     const { user } = principalOf(req);
     await this.identities.unlink(user.id, id, actorOf(req));
     return { ok: true };
@@ -130,7 +148,8 @@ export class MeController {
   ): Promise<{ identity: ApiIdentity }> {
     const { user } = principalOf(req);
     const identity = await this.identities.findById(id);
-    if (!identity || identity.userId !== user.id) throw new ApiError(404, "not_found", "identity not found");
+    if (!identity || identity.userId !== user.id)
+      throw new ApiError(404, "not_found", "identity not found");
     await this.rateLimit.enforce("link", { userId: user.id });
     const claim = await this.proofFor(identity, body);
     const reattached = await this.identities.reattach(user.id, id, claim, actorOf(req));
@@ -144,14 +163,18 @@ export class MeController {
   @Get("sessions")
   async listSessions(@Req() req: AuthedRequest): Promise<{ sessions: ApiSession[] }> {
     const { user, session } = principalOf(req);
-    const [rows, identities] = await Promise.all([this.sessions.listForUser(user.id), this.identities.listForUser(user.id)]);
+    const [rows, identities] = await Promise.all([
+      this.sessions.listForUser(user.id),
+      this.identities.listForUser(user.id),
+    ]);
     const providerOf = new Map<string, IdentityProvider>(identities.map((i) => [i.id, i.provider]));
     const out: ApiSession[] = [];
     for (const s of rows) {
       let provider = providerOf.get(s.authIdentityId);
       if (!provider) {
         const identity = await this.identities.findById(s.authIdentityId);
-        if (!identity) throw new ApiError(500, "internal_error", "session references an unknown identity");
+        if (!identity)
+          throw new ApiError(500, "internal_error", "session references an unknown identity");
         provider = identity.provider;
       }
       out.push(this.sessions.toApi(s, provider, session.id));
@@ -170,7 +193,8 @@ export class MeController {
   ): Promise<{ ok: true }> {
     const { user, session } = principalOf(req);
     const target = await this.sessions.findById(id);
-    if (!target || target.userId !== user.id) throw new ApiError(404, "not_found", "session not found");
+    if (!target || target.userId !== user.id)
+      throw new ApiError(404, "not_found", "session not found");
     await this.sessions.revoke(id, actorOf(req));
     if (id === session.id) res.append("Set-Cookie", this.sessions.clearedCookie());
     return { ok: true };
@@ -201,7 +225,10 @@ export class MeController {
 
   /** The user's own trail: events they performed or that concern their account. */
   @Get("audit")
-  async auditTrail(@Query() query: PageQueryDto, @Req() req: AuthedRequest): Promise<ApiPage<ApiAuditEvent>> {
+  async auditTrail(
+    @Query() query: PageQueryDto,
+    @Req() req: AuthedRequest,
+  ): Promise<ApiPage<ApiAuditEvent>> {
     const { user } = principalOf(req);
     const page = query.page ?? 1;
     const limit = query.limit ?? DEFAULT_PAGE_LIMIT;
@@ -216,7 +243,11 @@ export class MeController {
    * needs an in-app wallet owner; `canDeposit` needs a primary wallet and no open duplicate
    * conflict; `isAdmin` is a property of the session, never of the account (§6.8).
    */
-  private capabilities(user: UserEntity, session: SessionEntity, withdrawAllowed: boolean): ApiCapabilities {
+  private capabilities(
+    user: UserEntity,
+    session: SessionEntity,
+    withdrawAllowed: boolean,
+  ): ApiCapabilities {
     const active = user.status === "active";
     const hasPrimary = user.partyId !== null;
     return {
@@ -228,19 +259,39 @@ export class MeController {
     };
   }
 
-  private async proofFor(identity: AuthIdentityEntity, body: ReattachIdentityDto): Promise<IdentityClaim> {
+  private async proofFor(
+    identity: AuthIdentityEntity,
+    body: ReattachIdentityDto,
+  ): Promise<IdentityClaim> {
     switch (identity.provider) {
       case "google": {
-        if (!body.credential) throw new ApiError(400, "validation_failed", "credential is required to re-attach a Google identity");
+        if (!body.credential)
+          throw new ApiError(
+            400,
+            "validation_failed",
+            "credential is required to re-attach a Google identity",
+          );
         return this.googleAuth.verifyCredential(body.credential, body.nonce);
       }
       case "telegram": {
         if (body.initData) return this.telegram.verifyMiniApp(body.initData);
         if (body.id && body.hash && body.auth_date) {
           const { id, first_name, last_name, username, photo_url, auth_date, hash } = body;
-          return this.telegram.verifyWidget({ id, first_name, last_name, username, photo_url, auth_date, hash });
+          return this.telegram.verifyWidget({
+            id,
+            first_name,
+            last_name,
+            username,
+            photo_url,
+            auth_date,
+            hash,
+          });
         }
-        throw new ApiError(400, "validation_failed", "a Telegram widget payload or initData is required to re-attach a Telegram identity");
+        throw new ApiError(
+          400,
+          "validation_failed",
+          "a Telegram widget payload or initData is required to re-attach a Telegram identity",
+        );
       }
       case "canton_wallet":
         // Only operators hold one (§6.8); it is a credential for POST /auth/admin, not an account method.

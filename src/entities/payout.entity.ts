@@ -1,4 +1,11 @@
-import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn } from "typeorm";
+import {
+  Column,
+  CreateDateColumn,
+  Entity,
+  Index,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from "typeorm";
 
 import type { PayoutStatus } from "../types";
 import { moneyTransformer } from "../util/money";
@@ -23,7 +30,13 @@ export class PayoutEntity {
   @Column({ name: "payee_wallet_id", type: "uuid", nullable: true })
   payeeWalletId!: string | null;
 
-  @Column({ name: "amount_cc", type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
+  @Column({
+    name: "amount_cc",
+    type: "numeric",
+    precision: 38,
+    scale: 10,
+    transformer: moneyTransformer,
+  })
   amountCC!: bigint;
 
   @Column({ type: "text" })

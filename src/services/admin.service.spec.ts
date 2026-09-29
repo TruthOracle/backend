@@ -20,7 +20,12 @@ import type { WalletLinkService } from "./wallet-link.service";
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_ID = "22222222-2222-4222-8222-222222222222";
-const actor: AdminActor = { type: "admin", userId: "admin-user", sessionId: "admin-sess", ip: "10.0.0.1" };
+const actor: AdminActor = {
+  type: "admin",
+  userId: "admin-user",
+  sessionId: "admin-sess",
+  ip: "10.0.0.1",
+};
 const NOW = new Date("2026-09-10T10:00:00.000Z");
 
 const user = { id: USER_ID, status: "active", kycStatus: "none", createdAt: NOW } as UserEntity;
@@ -57,13 +62,28 @@ interface Mocks {
   verifications: { find: jest.Mock };
   persons: { find: jest.Mock };
   users: { findById: jest.Mock; suspend: jest.Mock; reinstate: jest.Mock; toApi: jest.Mock };
-  identities: { listForUser: jest.Mock; findById: jest.Mock; unlink: jest.Mock; reattach: jest.Mock; toApi: jest.Mock };
+  identities: {
+    listForUser: jest.Mock;
+    findById: jest.Mock;
+    unlink: jest.Mock;
+    reattach: jest.Mock;
+    toApi: jest.Mock;
+  };
   sessions: { listForUser: jest.Mock; revokeAllForUser: jest.Mock; toApi: jest.Mock };
   walletLinks: { listForUser: jest.Mock; toApi: jest.Mock; ownLedgerWallets: jest.Mock };
-  kyc: { summaryForUser: jest.Mock; lockedIdentityId: jest.Mock; adminOverride: jest.Mock; transferPerson: jest.Mock };
+  kyc: {
+    summaryForUser: jest.Mock;
+    lockedIdentityId: jest.Mock;
+    adminOverride: jest.Mock;
+    transferPerson: jest.Mock;
+  };
   payouts: { listForUser: jest.Mock; listAll: jest.Mock; settle: jest.Mock; toApi: jest.Mock };
   audit: { record: jest.Mock; list: jest.Mock; toApi: jest.Mock };
-  ledger: { fetchUserWallet: jest.Mock; fetchPendingPayouts: jest.Mock; fetchPendingPayout: jest.Mock };
+  ledger: {
+    fetchUserWallet: jest.Mock;
+    fetchPendingPayouts: jest.Mock;
+    fetchPendingPayout: jest.Mock;
+  };
 }
 
 function build(): { service: AdminService; m: Mocks } {
@@ -82,16 +102,26 @@ function build(): { service: AdminService; m: Mocks } {
       findById: jest.fn().mockResolvedValue(null),
       unlink: jest.fn().mockResolvedValue(undefined),
       reattach: jest.fn(),
-      toApi: jest.fn((i: AuthIdentityEntity, locked?: string | null) => ({ id: i.id, kycLocked: locked === i.id })),
+      toApi: jest.fn((i: AuthIdentityEntity, locked?: string | null) => ({
+        id: i.id,
+        kycLocked: locked === i.id,
+      })),
     },
     sessions: {
       listForUser: jest.fn().mockResolvedValue([]),
       revokeAllForUser: jest.fn().mockResolvedValue(2),
-      toApi: jest.fn((s: SessionEntity, authMethod: string, current: string | null) => ({ id: s.id, authMethod, current: s.id === current })),
+      toApi: jest.fn((s: SessionEntity, authMethod: string, current: string | null) => ({
+        id: s.id,
+        authMethod,
+        current: s.id === current,
+      })),
     },
     walletLinks: {
       listForUser: jest.fn().mockResolvedValue([]),
-      toApi: jest.fn((w: WalletEntity, extras?: { ownLedgerWallet?: unknown }) => ({ id: w.id, ownLedgerWallet: extras?.ownLedgerWallet ?? null })),
+      toApi: jest.fn((w: WalletEntity, extras?: { ownLedgerWallet?: unknown }) => ({
+        id: w.id,
+        ownLedgerWallet: extras?.ownLedgerWallet ?? null,
+      })),
       ownLedgerWallets: jest.fn().mockResolvedValue(new Map()),
     },
     kyc: {
@@ -104,7 +134,10 @@ function build(): { service: AdminService; m: Mocks } {
       listForUser: jest.fn().mockResolvedValue([]),
       listAll: jest.fn().mockResolvedValue([]),
       settle: jest.fn(),
-      toApi: jest.fn((p: PayoutEntity, onLedger: boolean) => ({ pendingPayoutCid: p.pendingPayoutCid, onLedger })),
+      toApi: jest.fn((p: PayoutEntity, onLedger: boolean) => ({
+        pendingPayoutCid: p.pendingPayoutCid,
+        onLedger,
+      })),
     },
     audit: {
       record: jest.fn().mockResolvedValue(undefined),
@@ -161,7 +194,9 @@ describe("AdminService", () => {
 
       const inner = queryBuilder([], 0);
       brackets.whereFactory(inner as never);
-      expect(inner.where).toHaveBeenCalledWith("u.display_name ILIKE :like", { like: "%50\\%\\_off\\\\%" });
+      expect(inner.where).toHaveBeenCalledWith("u.display_name ILIKE :like", {
+        like: "%50\\%\\_off\\\\%",
+      });
       const fragments = inner.orWhere.mock.calls.map((c: unknown[]) => c[0] as string);
       expect(fragments).toEqual([
         "u.email ILIKE :like",
@@ -198,15 +233,24 @@ describe("AdminService", () => {
         { id: "w-second", partyId: "p::2", isPrimary: false } as WalletEntity,
       ];
       m.walletLinks.listForUser.mockResolvedValue(walletRows);
-      m.walletLinks.ownLedgerWallets.mockResolvedValue(new Map([["w-primary", null], ["w-second", { contractId: "uw-2", owner: "p::2" }]]));
+      m.walletLinks.ownLedgerWallets.mockResolvedValue(
+        new Map([
+          ["w-primary", null],
+          ["w-second", { contractId: "uw-2", owner: "p::2" }],
+        ]),
+      );
       m.kyc.summaryForUser.mockResolvedValue({ status: "approved", history: [{ id: "v-1" }] });
-      m.sessions.listForUser.mockResolvedValue([{ id: "s-1", authIdentityId: "i-wallet" } as SessionEntity]);
+      m.sessions.listForUser.mockResolvedValue([
+        { id: "s-1", authIdentityId: "i-wallet" } as SessionEntity,
+      ]);
       m.payouts.listForUser.mockResolvedValue([
         { pendingPayoutCid: "pp-live" } as PayoutEntity,
         { pendingPayoutCid: "pp-gone" } as PayoutEntity,
       ]);
       m.ledger.fetchPendingPayouts.mockResolvedValue([{ contractId: "pp-live" }]);
-      m.persons.find.mockResolvedValue([{ fingerprint: "fp-1", kind: "doc", boundAt: NOW } as KycPersonEntity]);
+      m.persons.find.mockResolvedValue([
+        { fingerprint: "fp-1", kind: "doc", boundAt: NOW } as KycPersonEntity,
+      ]);
 
       const detail = await service.userDetail(USER_ID);
 
@@ -228,8 +272,13 @@ describe("AdminService", () => {
         { pendingPayoutCid: "pp-live", onLedger: true },
         { pendingPayoutCid: "pp-gone", onLedger: false },
       ]);
-      expect(detail.persons).toEqual([{ fingerprint: "fp-1", kind: "doc", boundAt: NOW.toISOString() }]);
-      expect(m.persons.find).toHaveBeenCalledWith({ where: { userId: USER_ID, releasedAt: IsNull() }, order: { boundAt: "ASC" } });
+      expect(detail.persons).toEqual([
+        { fingerprint: "fp-1", kind: "doc", boundAt: NOW.toISOString() },
+      ]);
+      expect(m.persons.find).toHaveBeenCalledWith({
+        where: { userId: USER_ID, releasedAt: IsNull() },
+        order: { boundAt: "ASC" },
+      });
     });
 
     it("skips the ledger payout read when the user has no payout rows", async () => {
@@ -240,7 +289,9 @@ describe("AdminService", () => {
 
     it("resolves a session's sign-in method by lookup when the identity is not in the user's list", async () => {
       const { service, m } = build();
-      m.sessions.listForUser.mockResolvedValue([{ id: "s-x", authIdentityId: "i-missing" } as SessionEntity]);
+      m.sessions.listForUser.mockResolvedValue([
+        { id: "s-x", authIdentityId: "i-missing" } as SessionEntity,
+      ]);
       m.identities.findById.mockResolvedValueOnce({ id: "i-missing", provider: "telegram" });
       const detail = await service.userDetail(USER_ID);
       expect(detail.sessions[0].authMethod).toBe("telegram");
@@ -261,7 +312,9 @@ describe("AdminService", () => {
 
     it("revokes every session and audits the reason and count as an admin", async () => {
       const { service, m } = build();
-      await expect(service.revokeSessions(USER_ID, "lost laptop", actor)).resolves.toEqual({ ok: true });
+      await expect(service.revokeSessions(USER_ID, "lost laptop", actor)).resolves.toEqual({
+        ok: true,
+      });
       expect(m.sessions.revokeAllForUser).toHaveBeenCalledWith(USER_ID);
       expect(m.audit.record).toHaveBeenCalledWith({
         actorType: "admin",
@@ -284,7 +337,12 @@ describe("AdminService", () => {
   });
 
   describe("identities", () => {
-    const unlinked = { id: "i-tg", userId: USER_ID, provider: "telegram", status: "unlinked" } as AuthIdentityEntity;
+    const unlinked = {
+      id: "i-tg",
+      userId: USER_ID,
+      provider: "telegram",
+      status: "unlinked",
+    } as AuthIdentityEntity;
     const active = { ...unlinked, status: "active" } as AuthIdentityEntity;
 
     it("unlink goes through IdentityService with the admin actor and records the reason", async () => {
@@ -308,7 +366,11 @@ describe("AdminService", () => {
     it("unlink surfaces IdentityService rules (last_identity) without auditing", async () => {
       const { service, m } = build();
       m.identities.unlink.mockRejectedValue(new ApiError(409, "last_identity", "keep one"));
-      await expectApiError(service.unlinkIdentity(USER_ID, "i-tg", "x", actor), 409, "last_identity");
+      await expectApiError(
+        service.unlinkIdentity(USER_ID, "i-tg", "x", actor),
+        409,
+        "last_identity",
+      );
       expect(m.audit.record).not.toHaveBeenCalled();
     });
 
@@ -363,28 +425,55 @@ describe("AdminService", () => {
 
     it("override propagates the duplicate-person refusal", async () => {
       const { service, m } = build();
-      m.kyc.adminOverride.mockRejectedValue(new ApiError(409, "kyc_duplicate_identity", "bound elsewhere"));
-      await expectApiError(service.kycOverride(USER_ID, "approved", "x", actor), 409, "kyc_duplicate_identity");
+      m.kyc.adminOverride.mockRejectedValue(
+        new ApiError(409, "kyc_duplicate_identity", "bound elsewhere"),
+      );
+      await expectApiError(
+        service.kycOverride(USER_ID, "approved", "x", actor),
+        409,
+        "kyc_duplicate_identity",
+      );
     });
 
     it("queues list verifications by status, newest first, with the user id", async () => {
       const { service, m } = build();
-      m.verifications.find.mockResolvedValue([{ ...verification, status: "blocked_duplicate", rejectLabels: ["DUPLICATE"] }]);
+      m.verifications.find.mockResolvedValue([
+        { ...verification, status: "blocked_duplicate", rejectLabels: ["DUPLICATE"] },
+      ]);
       const dup = await service.kycDuplicates();
-      expect(m.verifications.find).toHaveBeenCalledWith({ where: { status: "blocked_duplicate" }, order: { updatedAt: "DESC", id: "ASC" }, take: 200 });
-      expect(dup.items).toEqual([expect.objectContaining({ id: "v-1", userId: USER_ID, status: "blocked_duplicate", rejectLabels: ["DUPLICATE"] })]);
+      expect(m.verifications.find).toHaveBeenCalledWith({
+        where: { status: "blocked_duplicate" },
+        order: { updatedAt: "DESC", id: "ASC" },
+        take: 200,
+      });
+      expect(dup.items).toEqual([
+        expect.objectContaining({
+          id: "v-1",
+          userId: USER_ID,
+          status: "blocked_duplicate",
+          rejectLabels: ["DUPLICATE"],
+        }),
+      ]);
       await service.kycNeedsReview();
-      expect(m.verifications.find).toHaveBeenLastCalledWith(expect.objectContaining({ where: { status: "needs_review" } }));
+      expect(m.verifications.find).toHaveBeenLastCalledWith(
+        expect.objectContaining({ where: { status: "needs_review" } }),
+      );
     });
 
     it("transfer requires an existing target user, then delegates", async () => {
       const { service, m } = build();
-      await expect(service.transferPerson("fp-1", OTHER_ID, "merge", actor)).resolves.toEqual({ ok: true });
+      await expect(service.transferPerson("fp-1", OTHER_ID, "merge", actor)).resolves.toEqual({
+        ok: true,
+      });
       expect(m.users.findById).toHaveBeenCalledWith(OTHER_ID);
       expect(m.kyc.transferPerson).toHaveBeenCalledWith("fp-1", OTHER_ID, "merge", actor);
 
       m.users.findById.mockResolvedValue(null);
-      await expectApiError(service.transferPerson("fp-1", OTHER_ID, "merge", actor), 404, "not_found");
+      await expectApiError(
+        service.transferPerson("fp-1", OTHER_ID, "merge", actor),
+        404,
+        "not_found",
+      );
       expect(m.kyc.transferPerson).toHaveBeenCalledTimes(1);
     });
   });
@@ -392,7 +481,10 @@ describe("AdminService", () => {
   describe("payouts", () => {
     it("lists rows with the live ledger view and passes the status filter through", async () => {
       const { service, m } = build();
-      m.payouts.listAll.mockResolvedValue([{ pendingPayoutCid: "pp-1" }, { pendingPayoutCid: "pp-2" }]);
+      m.payouts.listAll.mockResolvedValue([
+        { pendingPayoutCid: "pp-1" },
+        { pendingPayoutCid: "pp-2" },
+      ]);
       m.ledger.fetchPendingPayouts.mockResolvedValue([{ contractId: "pp-2" }]);
       const out = await service.listPayouts("blocked_kyc");
       expect(m.payouts.listAll).toHaveBeenCalledWith({ status: "blocked_kyc" });
@@ -410,8 +502,15 @@ describe("AdminService", () => {
 
     it("settles through PayoutService with an admin actor carrying force + reason and re-reads the ledger uncached", async () => {
       const { service, m } = build();
-      m.payouts.settle.mockResolvedValue({ payout: { pendingPayoutCid: "pp-1" }, mode: "external" });
-      const out = await service.settlePayout("pp-1", { force: true, reason: "manual KYC check done" }, actor);
+      m.payouts.settle.mockResolvedValue({
+        payout: { pendingPayoutCid: "pp-1" },
+        mode: "external",
+      });
+      const out = await service.settlePayout(
+        "pp-1",
+        { force: true, reason: "manual KYC check done" },
+        actor,
+      );
       expect(m.payouts.settle).toHaveBeenCalledWith("pp-1", {
         type: "admin",
         userId: "admin-user",
@@ -421,7 +520,10 @@ describe("AdminService", () => {
         ip: "10.0.0.1",
       });
       expect(m.ledger.fetchPendingPayout).toHaveBeenCalledWith("pp-1", { uncached: true });
-      expect(out).toEqual({ payout: { pendingPayoutCid: "pp-1", onLedger: false }, mode: "external" });
+      expect(out).toEqual({
+        payout: { pendingPayoutCid: "pp-1", onLedger: false },
+        mode: "external",
+      });
     });
   });
 
@@ -429,15 +531,41 @@ describe("AdminService", () => {
     it("normalises paging, drops blank filters and maps events", async () => {
       const { service, m } = build();
       m.audit.list.mockResolvedValue({ items: [{ id: "7" }], total: 1 });
-      const out = await service.auditTrail({ subjectType: "user", subjectId: "", actorUserId: undefined, page: -1, limit: 0 });
-      expect(m.audit.list).toHaveBeenCalledWith({ subjectType: "user", subjectId: undefined, actorUserId: undefined, page: 1, limit: 25 });
+      const out = await service.auditTrail({
+        subjectType: "user",
+        subjectId: "",
+        actorUserId: undefined,
+        page: -1,
+        limit: 0,
+      });
+      expect(m.audit.list).toHaveBeenCalledWith({
+        subjectType: "user",
+        subjectId: undefined,
+        actorUserId: undefined,
+        page: 1,
+        limit: 25,
+      });
       expect(out).toEqual({ items: [{ id: "7" }], page: 1, limit: 25, total: 1 });
     });
   });
 
   it("verificationToApi never leaks anything but the documented fields", () => {
-    const api = verificationToApi({ ...verification, manualReason: "secret note", providerApplicantId: "app-1" });
-    expect(Object.keys(api).sort()).toEqual(["attemptNo", "createdAt", "id", "levelName", "moderationComment", "provider", "rejectLabels", "reviewedAt", "status"]);
+    const api = verificationToApi({
+      ...verification,
+      manualReason: "secret note",
+      providerApplicantId: "app-1",
+    });
+    expect(Object.keys(api).sort()).toEqual([
+      "attemptNo",
+      "createdAt",
+      "id",
+      "levelName",
+      "moderationComment",
+      "provider",
+      "rejectLabels",
+      "reviewedAt",
+      "status",
+    ]);
   });
 
   it("escapeLike escapes LIKE metacharacters", () => {
