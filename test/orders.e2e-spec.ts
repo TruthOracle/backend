@@ -46,14 +46,7 @@ async function seedLiveMarket(): Promise<{
   });
   const w = f.createWallet(alice);
   const d = f.deposit(w.wallet, "100", "ref-1");
-  const b = f.buy({
-    market: created.market,
-    wallet: d.wallet,
-    buyer: alice,
-    side: "Yes",
-    collateralCC: "10",
-    sharesOut: "18",
-  });
+  const b = f.buy({ market: created.market, wallet: d.wallet, buyer: alice, side: "Yes", collateralCC: "10", sharesOut: "18" });
   ctx.stream.push(...f.txs);
   await ctx.get(IndexerService).runOnce();
   return { f, market: b.market, wallet: b.wallet, position: b.position };
@@ -63,16 +56,9 @@ describe("quotes", () => {
   it("quotes a buy and a sell against the active market version with slippage bounds", async () => {
     const { market } = await seedLiveMarket();
     const q = bodyOf<ApiQuote>(
-      await ctx.agent
-        .get("/api/v1/markets/LIVE-1/quote?action=buy&side=Yes&amountCC=10")
-        .expect(200),
+      await ctx.agent.get("/api/v1/markets/LIVE-1/quote?action=buy&side=Yes&amountCC=10").expect(200),
     );
-    expect(q).toMatchObject({
-      marketId: 1,
-      ticker: "LIVE-1",
-      contractId: market.cid,
-      phase: "trading",
-    });
+    expect(q).toMatchObject({ marketId: 1, ticker: "LIVE-1", contractId: market.cid, phase: "trading" });
     expect(q.bounds.slippageBps).toBe(100);
     const buy = q.quote as ApiQuoteBuy;
     expect(buy.action).toBe("buy");
@@ -88,9 +74,7 @@ describe("quotes", () => {
     expect(buy.maxPayoutCC).toBe(buy.sharesOut);
 
     const s = bodyOf<ApiQuote>(
-      await ctx.agent
-        .get("/api/v1/markets/1/quote?action=sell&side=Yes&shares=5&slippageBps=50")
-        .expect(200),
+      await ctx.agent.get("/api/v1/markets/1/quote?action=sell&side=Yes&shares=5&slippageBps=50").expect(200),
     );
     const sell = s.quote as ApiQuoteSell;
     expect(sell.action).toBe("sell");
@@ -100,32 +84,23 @@ describe("quotes", () => {
     expect(parseCC(sell.priceAfter)).toBeLessThan(parseCC(sell.priceBefore));
 
     expect(
-      bodyOf<ApiQuote>(
-        await ctx.agent.get("/api/v1/markets/1/quote?action=swap&side=Yes&shares=4").expect(200),
-      ).quote.action,
+      bodyOf<ApiQuote>(await ctx.agent.get("/api/v1/markets/1/quote?action=swap&side=Yes&shares=4").expect(200)).quote.action,
     ).toBe("swap");
     expect(
-      bodyOf<ApiQuote>(
-        await ctx.agent
-          .get("/api/v1/markets/1/quote?action=provide_liquidity&amountCC=10")
-          .expect(200),
-      ).bounds.maxCostCC,
+      bodyOf<ApiQuote>(await ctx.agent.get("/api/v1/markets/1/quote?action=provide_liquidity&amountCC=10").expect(200))
+        .bounds.maxCostCC,
     ).toBeDefined();
   });
 
   it("validates the request and refuses markets that are not trading", async () => {
     const seeded = await seedLiveMarket();
     const seedLiveMarketState = (): Promise<typeof seeded> => Promise.resolve(seeded);
-    expect(
-      bodyOf<{ error: string }>(
-        await ctx.agent.get("/api/v1/markets/1/quote?action=buy&amountCC=10").expect(400),
-      ).error,
-    ).toBe("validation_failed");
+    expect(bodyOf<{ error: string }>(await ctx.agent.get("/api/v1/markets/1/quote?action=buy&amountCC=10").expect(400)).error).toBe(
+      "validation_failed",
+    );
     await ctx.agent.get("/api/v1/markets/1/quote?action=split&amountCC=1").expect(400);
     await ctx.agent.get("/api/v1/markets/1/quote?action=buy&side=Yes&amountCC=abc").expect(400);
-    await ctx.agent
-      .get("/api/v1/markets/1/quote?action=buy&side=Yes&amountCC=10&slippageBps=5000")
-      .expect(400);
+    await ctx.agent.get("/api/v1/markets/1/quote?action=buy&side=Yes&amountCC=10&slippageBps=5000").expect(400);
     await ctx.agent.get("/api/v1/markets/1/quote?action=buy&side=Yes&amountCC=0").expect(400);
 
     // An expired market (fixture default dates are in the past), on the same fixture ledger.
@@ -146,9 +121,7 @@ describe("orders/prepare", () => {
     const { market, wallet, position } = await seedLiveMarket();
     const { cookie } = await issueSessionDirect(ctx, { ...makeTestWallet("a"), partyId: alice });
     const headers = { Cookie: cookie, ...ctx.csrf };
-    const before = Number(
-      (await ctx.agent.get("/api/v1/markets").expect(200)).headers["x-ledger-offset"],
-    );
+    const before = Number((await ctx.agent.get("/api/v1/markets").expect(200)).headers["x-ledger-offset"]);
 
     const prepared = bodyOf<ApiPreparedOrder>(
       await ctx.agent
@@ -157,13 +130,7 @@ describe("orders/prepare", () => {
         .send({ action: "buy", side: "No", amountCC: "12.5", slippageBps: 200 })
         .expect(200),
     );
-    expect(prepared).toMatchObject({
-      action: "buy",
-      marketId: 1,
-      ticker: "LIVE-1",
-      actAs: alice,
-      ledgerOffset: before,
-    });
+    expect(prepared).toMatchObject({ action: "buy", marketId: 1, ticker: "LIVE-1", actAs: alice, ledgerOffset: before });
     expect(prepared.command.ExerciseCommand).toMatchObject({
       templateId: `fakepkg:Truthoracle:PredictionMarket`,
       contractId: market.cid,
@@ -205,17 +172,9 @@ describe("orders/prepare", () => {
         .expect(200),
     );
     expect(sell.command.ExerciseCommand.choice).toBe("Sell");
-    expect(sell.command.ExerciseCommand.choiceArgument).toMatchObject({
-      seller: alice,
-      sharesIn: dec("8"),
-      positionCid: position.cid,
-    });
+    expect(sell.command.ExerciseCommand.choiceArgument).toMatchObject({ seller: alice, sharesIn: dec("8"), positionCid: position.cid });
     const split = bodyOf<ApiPreparedOrder>(
-      await ctx.agent
-        .post("/api/v1/markets/1/orders/prepare")
-        .set(headers)
-        .send({ action: "split", amountCC: "3" })
-        .expect(200),
+      await ctx.agent.post("/api/v1/markets/1/orders/prepare").set(headers).send({ action: "split", amountCC: "3" }).expect(200),
     );
     expect(split.command.ExerciseCommand.choice).toBe("Split");
     expect(split.quote).toBeNull();
@@ -226,11 +185,7 @@ describe("orders/prepare", () => {
     const { cookie } = await issueSessionDirect(ctx, { ...makeTestWallet("a"), partyId: alice });
     const headers = { Cookie: cookie, ...ctx.csrf };
     const expectCode = async (body: object, status: number, code: string): Promise<void> => {
-      const res = await ctx.agent
-        .post("/api/v1/markets/1/orders/prepare")
-        .set(headers)
-        .send(body)
-        .expect(status);
+      const res = await ctx.agent.post("/api/v1/markets/1/orders/prepare").set(headers).send(body).expect(status);
       expect(bodyOf<{ error: string }>(res).error).toBe(code);
     };
     await expectCode({ action: "buy", side: "Yes", amountCC: "1000" }, 409, "insufficient_balance");
@@ -241,15 +196,10 @@ describe("orders/prepare", () => {
     await expectCode({ action: "redeem" }, 409, "market_not_tradable");
     await expectCode({ action: "buy", side: "Maybe", amountCC: "1" }, 400, "validation_failed");
     await expectCode({ action: "buy", side: "Yes" }, 400, "validation_failed");
-    await expectCode(
-      { action: "buy", side: "Yes", amountCC: "1", extra: true },
-      400,
-      "validation_failed",
-    );
+    await expectCode({ action: "buy", side: "Yes", amountCC: "1", extra: true }, 400, "validation_failed");
 
     // Bob has an account but no in-app wallet on the ledger; Carol has no wallet linked at all.
-    const bobCookie = (await issueSessionDirect(ctx, { ...makeTestWallet("b"), partyId: bob }))
-      .cookie;
+    const bobCookie = (await issueSessionDirect(ctx, { ...makeTestWallet("b"), partyId: bob })).cookie;
     expect(
       bodyOf<{ error: string }>(
         await ctx.agent
@@ -259,9 +209,7 @@ describe("orders/prepare", () => {
           .expect(409),
       ).error,
     ).toBe("no_in_app_wallet");
-    const carolCookie = (
-      await issueSessionDirect(ctx, makeTestWallet("c"), { withWalletRow: false })
-    ).cookie;
+    const carolCookie = (await issueSessionDirect(ctx, makeTestWallet("c"), { withWalletRow: false })).cookie;
     expect(
       bodyOf<{ error: string }>(
         await ctx.agent
@@ -283,11 +231,7 @@ describe("orders/prepare", () => {
     ).toBe("no_in_app_wallet");
 
     // Sessions: anonymous and admin sessions are refused.
-    await ctx.agent
-      .post("/api/v1/markets/1/orders/prepare")
-      .set(ctx.csrf)
-      .send({ action: "buy", side: "Yes", amountCC: "1" })
-      .expect(401);
+    await ctx.agent.post("/api/v1/markets/1/orders/prepare").set(ctx.csrf).send({ action: "buy", side: "Yes", amountCC: "1" }).expect(401);
     const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
     await ctx.agent
       .post("/api/v1/markets/1/orders/prepare")
@@ -303,47 +247,21 @@ describe("orders/prepare", () => {
     const admin = await issueSessionDirect(ctx, operator, { kind: "admin" });
     const adminHeaders = { Cookie: admin.cookie, ...ctx.csrf };
 
-    const open = bodyOf<ApiExchangeStatus>(
-      await ctx.agent.get("/api/v1/exchange/status").expect(200),
-    );
-    expect(open).toMatchObject({
-      tradingActive: true,
-      exchangeActive: false,
-      network: "devnet",
-      packageName: "truthoracle-test",
-    });
-    expect(open.halt).toEqual({
-      active: false,
-      reason: null,
-      since: null,
-      estimatedResumeAt: null,
-    });
+    const open = bodyOf<ApiExchangeStatus>(await ctx.agent.get("/api/v1/exchange/status").expect(200));
+    expect(open).toMatchObject({ tradingActive: true, exchangeActive: false, network: "devnet", packageName: "truthoracle-test" });
+    expect(open.halt).toEqual({ active: false, reason: null, since: null, estimatedResumeAt: null });
     expect(open.ledger.indexEnabled).toBe(false);
 
-    await ctx.agent
-      .post("/api/v1/admin/exchange/halt")
-      .set(adminHeaders)
-      .send({ active: true })
-      .expect(400);
+    await ctx.agent.post("/api/v1/admin/exchange/halt").set(adminHeaders).send({ active: true }).expect(400);
     const halted = bodyOf<{ halt: { active: boolean; reason: string; since: string } }>(
       await ctx.agent
         .post("/api/v1/admin/exchange/halt")
         .set(adminHeaders)
-        .send({
-          active: true,
-          reason: "participant maintenance",
-          estimatedResumeAt: "2026-10-01T10:00:00.000Z",
-        })
+        .send({ active: true, reason: "participant maintenance", estimatedResumeAt: "2026-10-01T10:00:00.000Z" })
         .expect(200),
     ).halt;
-    expect(halted).toMatchObject({
-      active: true,
-      reason: "participant maintenance",
-      estimatedResumeAt: "2026-10-01T10:00:00.000Z",
-    });
-    const status = bodyOf<ApiExchangeStatus>(
-      await ctx.agent.get("/api/v1/exchange/status").expect(200),
-    );
+    expect(halted).toMatchObject({ active: true, reason: "participant maintenance", estimatedResumeAt: "2026-10-01T10:00:00.000Z" });
+    const status = bodyOf<ApiExchangeStatus>(await ctx.agent.get("/api/v1/exchange/status").expect(200));
     expect(status.tradingActive).toBe(false);
     expect(status.halt.since).toBe(halted.since);
 
@@ -359,15 +277,8 @@ describe("orders/prepare", () => {
     // Quotes stay available while halted (they are reads), redemptions are never blocked by a halt.
     await ctx.agent.get("/api/v1/markets/1/quote?action=buy&side=Yes&amountCC=1").expect(200);
 
-    await ctx.agent
-      .post("/api/v1/admin/exchange/halt")
-      .set(adminHeaders)
-      .send({ active: false, reason: "resumed" })
-      .expect(200);
-    expect(
-      bodyOf<ApiExchangeStatus>(await ctx.agent.get("/api/v1/exchange/status").expect(200))
-        .tradingActive,
-    ).toBe(true);
+    await ctx.agent.post("/api/v1/admin/exchange/halt").set(adminHeaders).send({ active: false, reason: "resumed" }).expect(200);
+    expect(bodyOf<ApiExchangeStatus>(await ctx.agent.get("/api/v1/exchange/status").expect(200)).tradingActive).toBe(true);
     await ctx.agent
       .post("/api/v1/markets/1/orders/prepare")
       .set({ Cookie: user.cookie, ...ctx.csrf })
@@ -379,19 +290,8 @@ describe("orders/prepare", () => {
     );
     expect(audit.map((a) => a.metadata.active)).toEqual([true, false]);
     // A user session cannot halt.
-    await ctx.agent
-      .post("/api/v1/admin/exchange/halt")
-      .set({ Cookie: user.cookie, ...ctx.csrf })
-      .send({ active: true, reason: "x" })
-      .expect(403);
-    const m = bodyOf<{ market: ApiMarket }>(
-      await ctx.agent.get("/api/v1/markets/1").expect(200),
-    ).market;
-    expect(m).toMatchObject({
-      ticker: "LIVE-1",
-      eventTicker: "LIVE",
-      yesSubTitle: "Above",
-      noSubTitle: "Below",
-    });
+    await ctx.agent.post("/api/v1/admin/exchange/halt").set({ Cookie: user.cookie, ...ctx.csrf }).send({ active: true, reason: "x" }).expect(403);
+    const m = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/1").expect(200)).market;
+    expect(m).toMatchObject({ ticker: "LIVE-1", eventTicker: "LIVE", yesSubTitle: "Above", noSubTitle: "Below" });
   });
 });

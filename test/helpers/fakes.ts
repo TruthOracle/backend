@@ -14,9 +14,7 @@ import type {
   KycSessionResult,
   LedgerWallet,
   PendingPayoutRecord,
-  TransferRow,
-  KycProviderHealth,
-} from "../../src/types";
+  TransferRow, KycProviderHealth } from "../../src/types";
 import { ApiError } from "../../src/util/errors";
 import { asString } from "../../src/util/strings";
 import { formatCC, parseCC } from "../../src/util/money";
@@ -145,12 +143,7 @@ export class FakeLedgerClient {
 
   seedUserWallet(
     owner: string,
-    fields: {
-      balanceCC?: bigint | string;
-      depositedCC?: bigint | string;
-      withdrawnCC?: bigint | string;
-      depositRefs?: string[];
-    } = {},
+    fields: { balanceCC?: bigint | string; depositedCC?: bigint | string; withdrawnCC?: bigint | string; depositRefs?: string[] } = {},
   ): LedgerWallet {
     const wallet: LedgerWallet = {
       contractId: this.nextCid("uw"),
@@ -164,12 +157,7 @@ export class FakeLedgerClient {
     return wallet;
   }
 
-  seedPendingPayout(fields: {
-    user: string;
-    amountCC: bigint | string;
-    reason: string;
-    marketId?: string;
-  }): PendingPayoutRecord {
+  seedPendingPayout(fields: { user: string; amountCC: bigint | string; reason: string; marketId?: string }): PendingPayoutRecord {
     const record: PendingPayoutRecord = {
       contractId: this.nextCid("pp"),
       user: fields.user,
@@ -194,9 +182,7 @@ export class FakeLedgerClient {
 
   /** Reads made to `fetchUserWallet`, as owner parties. */
   fetchUserWalletCalls(): string[] {
-    return this.reads
-      .filter((r) => r.startsWith("fetchUserWallet:"))
-      .map((r) => r.slice("fetchUserWallet:".length));
+    return this.reads.filter((r) => r.startsWith("fetchUserWallet:")).map((r) => r.slice("fetchUserWallet:".length));
   }
 
   private read(what: string): void {
@@ -226,32 +212,18 @@ export class FakeLedgerClient {
     return p ? { ...p } : null;
   }
 
-  async activeContracts(
-    _party: string,
-    entity: string,
-  ): Promise<{ contractId: string; payload: Record<string, unknown> }[]> {
+  async activeContracts(_party: string, entity: string): Promise<{ contractId: string; payload: Record<string, unknown> }[]> {
     this.read(`activeContracts:${entity}`);
     if (entity === "UserWallet") {
       return [...this.wallets.values()].map((w) => ({
         contractId: w.contractId,
-        payload: {
-          owner: w.owner,
-          balanceCC: formatCC(w.balanceCC),
-          depositedCC: formatCC(w.depositedCC),
-          withdrawnCC: formatCC(w.withdrawnCC),
-          depositRefs: w.depositRefs,
-        },
+        payload: { owner: w.owner, balanceCC: formatCC(w.balanceCC), depositedCC: formatCC(w.depositedCC), withdrawnCC: formatCC(w.withdrawnCC), depositRefs: w.depositRefs },
       }));
     }
     if (entity === "PendingPayout") {
       return [...this.payouts.values()].map((p) => ({
         contractId: p.contractId,
-        payload: {
-          user: p.user,
-          marketId: p.marketId,
-          amountCC: formatCC(p.amountCC),
-          reason: p.reason,
-        },
+        payload: { user: p.user, marketId: p.marketId, amountCC: formatCC(p.amountCC), reason: p.reason },
       }));
     }
     return [];
@@ -271,15 +243,7 @@ export class FakeLedgerClient {
 // Enterprise Wallet
 // ---------------------------------------------------------------------------------------------
 
-const NEVER_HAPPENED = new Set([
-  "failed",
-  "rejected",
-  "error",
-  "cancelled",
-  "canceled",
-  "not_found",
-  "notfound",
-]);
+const NEVER_HAPPENED = new Set(["failed", "rejected", "error", "cancelled", "canceled", "not_found", "notfound"]);
 
 export interface RecordedSubmit {
   commandId: string;
@@ -330,12 +294,7 @@ export class FakeEnterpriseWallet {
     return true;
   }
 
-  seedInbound(
-    fromParty: string,
-    amountCC: bigint | string,
-    status = "completed",
-    extra: Partial<TransferRow> = {},
-  ): TransferRow {
+  seedInbound(fromParty: string, amountCC: bigint | string, status = "completed", extra: Partial<TransferRow> = {}): TransferRow {
     this.tick += 1;
     const row: TransferRow = {
       instrumentId: "Amulet",
@@ -352,45 +311,31 @@ export class FakeEnterpriseWallet {
   }
 
   async transferHistory(partyId: string): Promise<TransferRow[]> {
-    return this.rows
-      .filter((r) => r.partyId === partyId || r.partyId2 === partyId)
-      .map((r) => ({ ...r }));
+    return this.rows.filter((r) => r.partyId === partyId || r.partyId2 === partyId).map((r) => ({ ...r }));
   }
 
   totalReceivedFrom(rows: TransferRow[], partyId: string, counterparty: string): bigint {
     return totalReceivedFrom(rows, partyId, counterparty);
   }
 
-  async transferStatus(
-    _partyId: string,
-    commandId: string,
-  ): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
+  async transferStatus(_partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
     if (this.statusReadsFail) return { known: false, submitted: false, status: null };
     const status = this.statuses.get(commandId);
     if (status === undefined) return { known: true, submitted: false, status: "not_found" };
     return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
   }
 
-  async commandStatus(
-    _partyId: string,
-    commandId: string,
-  ): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
+  async commandStatus(_partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
     if (this.statusReadsFail) return { known: false, submitted: false, status: null };
     const status = this.unknownCommandIds ? undefined : this.commandStatuses.get(commandId);
     if (status === undefined) return { known: false, submitted: false, status: "not_found" };
     return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
   }
 
-  async externalSubmit(args: {
-    commandId: string;
-    commands: unknown[];
-    disclosedContracts?: unknown[];
-  }): Promise<{ commandId: string; status: string }> {
+  async externalSubmit(args: { commandId: string; commands: unknown[]; disclosedContracts?: unknown[] }): Promise<{ commandId: string; status: string }> {
     this.consumeFailNext();
     if (this.commandStatuses.has(args.commandId)) {
-      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, {
-        upstreamStatus: 409,
-      });
+      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, { upstreamStatus: 409 });
     }
     const submit = { commandId: args.commandId, commands: args.commands };
     if (this.lagLedger) {
@@ -419,22 +364,13 @@ export class FakeEnterpriseWallet {
 
   /** `lagLedger`: the ledger rejects every accepted command (stale contract id, assertion) — nothing lands. */
   rejectPending(): void {
-    for (const submit of this.pending.splice(0))
-      this.commandStatuses.set(submit.commandId, "failed");
+    for (const submit of this.pending.splice(0)) this.commandStatuses.set(submit.commandId, "failed");
   }
 
-  async transfer(args: {
-    to: string;
-    amountCC: bigint;
-    reason: string;
-    commandId: string;
-    metadata?: Record<string, string>;
-  }): Promise<{ commandId: string; status: string }> {
+  async transfer(args: { to: string; amountCC: bigint; reason: string; commandId: string; metadata?: Record<string, string> }): Promise<{ commandId: string; status: string }> {
     this.consumeFailNext();
     if (this.statuses.has(args.commandId)) {
-      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, {
-        upstreamStatus: 409,
-      });
+      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, { upstreamStatus: 409 });
     }
     this.transfers.push({ ...args });
     this.statuses.set(args.commandId, "completed");
@@ -477,23 +413,15 @@ export class FakeEnterpriseWallet {
   private apply(command: unknown): void {
     const c = command as {
       CreateCommand?: { templateId: string; createArguments: Record<string, unknown> };
-      ExerciseCommand?: {
-        templateId: string;
-        contractId: string;
-        choice: string;
-        choiceArgument: Record<string, unknown>;
-      };
+      ExerciseCommand?: { templateId: string; contractId: string; choice: string; choiceArgument: Record<string, unknown> };
     };
     if (c.CreateCommand) {
       const { templateId, createArguments: a } = c.CreateCommand;
-      if (!templateId.endsWith(":UserWallet"))
-        throw new Error(`fake ledger: cannot create ${templateId}`);
+      if (!templateId.endsWith(":UserWallet")) throw new Error(`fake ledger: cannot create ${templateId}`);
       const owner = asString(a.owner);
-      if (this.ledger.wallets.has(owner))
-        throw new Error(`fake ledger: UserWallet already exists for ${owner}`);
+      if (this.ledger.wallets.has(owner)) throw new Error(`fake ledger: UserWallet already exists for ${owner}`);
       // `depositRefs : [Text]` is mandatory on truthoracle-v16: the real ledger rejects a Create without it.
-      if (!Array.isArray(a.depositRefs))
-        throw new Error("fake ledger: UserWallet.depositRefs is mandatory (missing or not a list)");
+      if (!Array.isArray(a.depositRefs)) throw new Error("fake ledger: UserWallet.depositRefs is mandatory (missing or not a list)");
       this.ledger.seedUserWallet(owner, {
         balanceCC: asString(a.balanceCC, "0"),
         depositedCC: asString(a.depositedCC, "0"),
@@ -518,8 +446,7 @@ export class FakeEnterpriseWallet {
         return;
       }
       if (choice === "MarkPaid") {
-        if (!this.ledger.payouts.has(contractId))
-          throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
+        if (!this.ledger.payouts.has(contractId)) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
         this.ledger.archivePayout(contractId);
         return;
       }
@@ -528,11 +455,7 @@ export class FakeEnterpriseWallet {
         if (!payout) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
         const wallet = this.ledger.walletByCid(asString(arg.walletCid));
         if (!wallet) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${asString(arg.walletCid)}`);
-        this.ledger.wallets.set(wallet.owner, {
-          ...wallet,
-          contractId: this.ledger.nextCid("uw"),
-          balanceCC: wallet.balanceCC + payout.amountCC,
-        });
+        this.ledger.wallets.set(wallet.owner, { ...wallet, contractId: this.ledger.nextCid("uw"), balanceCC: wallet.balanceCC + payout.amountCC });
         this.ledger.archivePayout(contractId);
         return;
       }
@@ -569,27 +492,13 @@ export class FakeKycProvider implements KycProvider {
   }
 
   async healthCheck(): Promise<KycProviderHealth> {
-    return {
-      ok: this.configured,
-      message: this.configured ? "fake provider" : "fake provider unconfigured",
-      upstreamStatus: null,
-      checkedAt: new Date().toISOString(),
-      details: {},
-    };
+    return { ok: this.configured, message: this.configured ? "fake provider" : "fake provider unconfigured", upstreamStatus: null, checkedAt: new Date().toISOString(), details: {} };
   }
 
-  async createSession(
-    user: { id: string },
-    applicantId: string | null,
-    level: string,
-  ): Promise<KycSessionResult> {
+  async createSession(user: { id: string }, applicantId: string | null, level: string): Promise<KycSessionResult> {
     this.seq += 1;
     this.sessions.push({ userId: user.id, applicantId, level });
-    return {
-      accessToken: `fake-token-${this.seq}`,
-      expiresAt: new Date(Date.now() + 600_000),
-      applicantId: applicantId ?? `applicant-${user.id}`,
-    };
+    return { accessToken: `fake-token-${this.seq}`, expiresAt: new Date(Date.now() + 600_000), applicantId: applicantId ?? `applicant-${user.id}` };
   }
 
   verifyWebhook(): KycEvent | null {
@@ -654,9 +563,7 @@ export class FakeLedgerStream {
   async ledgerEnd(): Promise<number> {
     this.calls.push("ledgerEnd");
     if (this.end !== null) return this.end;
-    return this.transactions.length > 0
-      ? this.transactions[this.transactions.length - 1].offset
-      : 0;
+    return this.transactions.length > 0 ? this.transactions[this.transactions.length - 1].offset : 0;
   }
 
   async prunedOffset(): Promise<number> {

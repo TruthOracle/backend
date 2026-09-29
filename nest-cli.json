@@ -8,15 +8,6 @@
     "tsConfigPath": "tsconfig.build.json",
     "deleteOutDir": true,
     "assets": [],
-    "plugins": [
-      {
-        "name": "@nestjs/swagger",
-        "options": {
-          "dtoFileNameSuffix": [".dto.ts"],
-          "classValidatorShim": true,
-          "introspectComments": true
-        }
-      }
-    ]
+    "plugins": [{ "name": "@nestjs/swagger", "options": { "dtoFileNameSuffix": [".dto.ts"], "classValidatorShim": true, "introspectComments": true } }]
   }
 }

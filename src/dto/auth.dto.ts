@@ -41,9 +41,7 @@ export class WalletProofDto {
   signature!: string;
 
   /** Informational allowlist (`cantor8` in v1). */
-  @IsIn(WALLET_KIND_ALLOWLIST as readonly string[], {
-    message: `kind must be one of: ${WALLET_KIND_ALLOWLIST.join(", ")}`,
-  })
+  @IsIn(WALLET_KIND_ALLOWLIST as readonly string[], { message: `kind must be one of: ${WALLET_KIND_ALLOWLIST.join(", ")}` })
   kind!: WalletKind;
 }
 

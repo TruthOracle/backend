@@ -52,14 +52,9 @@ export class CandlesService {
     const firstBucket = periodStartSec(startTs, period);
     const lastBucket = periodStartSec(endTs, period);
     if ((lastBucket - firstBucket) / period + 1 > MAX_CANDLES)
-      throw new ApiError(
-        400,
-        "validation_failed",
-        `the window holds more than ${MAX_CANDLES} candles`,
-        {
-          maxCandles: MAX_CANDLES,
-        },
-      );
+      throw new ApiError(400, "validation_failed", `the window holds more than ${MAX_CANDLES} candles`, {
+        maxCandles: MAX_CANDLES,
+      });
 
     const rows = await this.dataSource.query<CandleRow[]>(
       `SELECT period_start, open::text, high::text, low::text, close::text, volume_cc::text, notional_cc::text,

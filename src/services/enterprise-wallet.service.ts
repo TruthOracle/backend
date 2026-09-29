@@ -23,15 +23,7 @@ const OUTBOUND = new Set(["out", "outgoing", "outbound", "send", "sent", "debit"
 // clearly-final states count toward what a user has sent in: crediting a pending or
 // failed transfer would mint balance for money that never arrived. A row without a
 // status is an unknown shape and is skipped (and reported) like an unknown status.
-const SETTLED = new Set([
-  "completed",
-  "complete",
-  "settled",
-  "success",
-  "succeeded",
-  "confirmed",
-  "final",
-]);
+const SETTLED = new Set(["completed", "complete", "settled", "success", "succeeded", "confirmed", "final"]);
 /** Non-final statuses the wallet is known to emit — skipped silently (the next reconcile picks them up once final). */
 const NOT_SETTLED = new Set(["failed", "rejected", "cancelled", "canceled", "expired", "pending"]);
 
@@ -51,15 +43,7 @@ export const HISTORY_MAX_PAGES = 200;
 // Statuses that mean "this transfer never happened" — a retry with the same commandId is safe.
 // Anything else (pending, settled, or a shape we don't recognise) counts as submitted: when in
 // doubt, do NOT move money again.
-const NEVER_HAPPENED = new Set([
-  "failed",
-  "rejected",
-  "error",
-  "cancelled",
-  "canceled",
-  "not_found",
-  "notfound",
-]);
+const NEVER_HAPPENED = new Set(["failed", "rejected", "error", "cancelled", "canceled", "not_found", "notfound"]);
 
 export interface HistoryEvent {
   eventType?: string;
@@ -78,10 +62,7 @@ export interface HistoryEvent {
  */
 export async function collectHistory<T extends { timestamp?: string }>(
   fetchPage: (cursor: string | undefined) => Promise<T[]>,
-  {
-    pageSize = HISTORY_PAGE_SIZE,
-    maxPages = HISTORY_MAX_PAGES,
-  }: { pageSize?: number; maxPages?: number } = {},
+  { pageSize = HISTORY_PAGE_SIZE, maxPages = HISTORY_MAX_PAGES }: { pageSize?: number; maxPages?: number } = {},
 ): Promise<T[]> {
   const all: T[] = [];
   let cursor: string | undefined;
@@ -118,9 +99,7 @@ export function totalReceivedFrom(
   for (const row of rows) {
     if (row?.instrumentId !== instrumentId) continue;
 
-    const status = String(row?.status ?? "")
-      .trim()
-      .toLowerCase();
+    const status = String(row?.status ?? "").trim().toLowerCase();
     if (!SETTLED.has(status)) {
       // Unknown (or missing) statuses are skipped too, and loudly: under-crediting is recoverable
       // (the next reconcile picks it up once the status is added), over-crediting is a mint.
@@ -128,9 +107,7 @@ export function totalReceivedFrom(
       continue;
     }
 
-    const direction = String(row?.direction ?? "")
-      .trim()
-      .toLowerCase();
+    const direction = String(row?.direction ?? "").trim().toLowerCase();
     if (!INBOUND.has(direction)) {
       if (!OUTBOUND.has(direction)) skipped += 1;
       continue;
@@ -167,16 +144,7 @@ export interface TransferStatusResult {
 export type CommandStatusResult = TransferStatusResult;
 
 /** Statuses the wallet reports for a command the ledger rejected or that never ran. */
-const COMMAND_FAILED = new Set([
-  "failed",
-  "rejected",
-  "error",
-  "cancelled",
-  "canceled",
-  "aborted",
-  "timeout",
-  "timed_out",
-]);
+const COMMAND_FAILED = new Set(["failed", "rejected", "error", "cancelled", "canceled", "aborted", "timeout", "timed_out"]);
 
 @Injectable()
 export class EnterpriseWalletService {
@@ -192,17 +160,9 @@ export class EnterpriseWalletService {
     return Boolean(this.config.enterpriseWalletUrl && this.config.treasuryPartyId);
   }
 
-  private async wallet<T>(
-    path: string,
-    options: { method?: "GET" | "POST"; body?: unknown } = {},
-  ): Promise<T> {
+  private async wallet<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}): Promise<T> {
     const base = this.config.enterpriseWalletUrl;
-    if (!base)
-      throw new ApiError(
-        502,
-        "upstream_failed",
-        "Enterprise wallet URL is not configured (ENTERPRISE_WALLET_URL)",
-      );
+    if (!base) throw new ApiError(502, "upstream_failed", "Enterprise wallet URL is not configured (ENTERPRISE_WALLET_URL)");
     const token = await this.keycloak.bearerFor("wallet");
     return authedJson<T>(base, path, { ...options, token, timeoutMs: 60_000 });
   }
@@ -219,10 +179,7 @@ export class EnterpriseWalletService {
    * an upstream failure (wrong wallet version or URL), never a reason to try an older shape.
    * Cached in Redis for `ledgerCacheMs` unless `uncached` (the reconcile route).
    */
-  async transferHistory(
-    partyId: string,
-    opts: { uncached?: boolean; pageSize?: number } = {},
-  ): Promise<TransferRow[]> {
+  async transferHistory(partyId: string, opts: { uncached?: boolean; pageSize?: number } = {}): Promise<TransferRow[]> {
     const cacheKey = `wallet:history:${partyId}`;
     if (!opts.uncached && this.config.ledgerCacheMs > 0) {
       const hit = await this.redis.getJson<TransferRow[]>(cacheKey).catch(() => null);
@@ -241,9 +198,7 @@ export class EnterpriseWalletService {
       const events = await collectHistory<HistoryEvent>(
         async (cursor) => {
           const qs = `limit=${pageSize}${cursor ? `&startDate=${encodeURIComponent(cursor)}` : ""}`;
-          const response = await this.wallet<{ events?: unknown } | unknown[]>(
-            `/api/v1/history/${party}?${qs}`,
-          );
+          const response = await this.wallet<{ events?: unknown } | unknown[]>(`/api/v1/history/${party}?${qs}`);
           if (Array.isArray(response)) return response as HistoryEvent[];
           return Array.isArray(response?.events) ? (response.events as HistoryEvent[]) : [];
         },
@@ -258,9 +213,7 @@ export class EnterpriseWalletService {
   /** Fixed-point total of settled Amulet inbound from `counterparty` to `partyId`. */
   totalReceivedFrom(rows: TransferRow[], partyId: string, counterparty: string): bigint {
     return totalReceivedFrom(rows, partyId, counterparty, "Amulet", (skipped) =>
-      this.logger.warn(
-        `${skipped} transfer row(s) had an unrecognised direction or status and were ignored`,
-      ),
+      this.logger.warn(`${skipped} transfer row(s) had an unrecognised direction or status and were ignored`),
     );
   }
 
@@ -277,18 +230,13 @@ export class EnterpriseWalletService {
    */
   async transferStatus(partyId: string, commandId: string): Promise<TransferStatusResult> {
     try {
-      const row = await this.wallet<unknown>(
-        `/api/v1/transfer/${encodeURIComponent(partyId)}/${encodeURIComponent(commandId)}`,
-      );
+      const row = await this.wallet<unknown>(`/api/v1/transfer/${encodeURIComponent(partyId)}/${encodeURIComponent(commandId)}`);
       if (!row || typeof row !== "object") return { known: true, submitted: false, status: null };
       const r = row as { status?: unknown; state?: unknown };
-      const status = asString(r.status ?? r.state)
-        .trim()
-        .toLowerCase();
+      const status = asString(r.status ?? r.state).trim().toLowerCase();
       return { known: true, submitted: !NEVER_HAPPENED.has(status), status: status || null };
     } catch (e) {
-      if (e instanceof UpstreamError && e.status === 404)
-        return { known: true, submitted: false, status: "not_found" };
+      if (e instanceof UpstreamError && e.status === 404) return { known: true, submitted: false, status: "not_found" };
       this.logger.warn(`transfer status check failed for ${commandId}: ${(e as Error).message}`);
       return { known: false, submitted: false, status: null };
     }
@@ -302,19 +250,14 @@ export class EnterpriseWalletService {
    */
   async commandStatus(partyId: string, commandId: string): Promise<CommandStatusResult> {
     try {
-      const row = await this.wallet<unknown>(
-        `/api/v1/command/${encodeURIComponent(partyId)}/${encodeURIComponent(commandId)}`,
-      );
+      const row = await this.wallet<unknown>(`/api/v1/command/${encodeURIComponent(partyId)}/${encodeURIComponent(commandId)}`);
       if (!row || typeof row !== "object") return { known: false, submitted: false, status: null };
       const r = row as { status?: unknown; state?: unknown };
-      const status = asString(r.status ?? r.state)
-        .trim()
-        .toLowerCase();
+      const status = asString(r.status ?? r.state).trim().toLowerCase();
       if (!status) return { known: false, submitted: false, status: null };
       return { known: true, submitted: !COMMAND_FAILED.has(status), status };
     } catch (e) {
-      if (e instanceof UpstreamError && e.status === 404)
-        return { known: false, submitted: false, status: "not_found" };
+      if (e instanceof UpstreamError && e.status === 404) return { known: false, submitted: false, status: "not_found" };
       this.logger.warn(`command status check failed for ${commandId}: ${(e as Error).message}`);
       return { known: false, submitted: false, status: null };
     }
@@ -337,10 +280,7 @@ export class EnterpriseWalletService {
           disclosedContracts: args.disclosedContracts ?? [],
         },
       });
-      return {
-        commandId: args.commandId,
-        status: asString(res?.status ?? res?.state, "submitted"),
-      };
+      return { commandId: args.commandId, status: asString(res?.status ?? res?.state, "submitted") };
     } catch (e) {
       throw this.asApiError(e, "wallet external submit failed");
     }
@@ -368,10 +308,7 @@ export class EnterpriseWalletService {
           metadata: args.metadata,
         },
       });
-      return {
-        commandId: args.commandId,
-        status: asString(res?.status ?? res?.state, "submitted"),
-      };
+      return { commandId: args.commandId, status: asString(res?.status ?? res?.state, "submitted") };
     } catch (e) {
       throw this.asApiError(e, "wallet transfer failed");
     }
@@ -381,11 +318,6 @@ export class EnterpriseWalletService {
     if (e instanceof ApiError) return e;
     const status = e instanceof UpstreamError ? e.status : 0;
     this.logger.warn(`${what}: ${(e as Error).message}`);
-    return new ApiError(
-      502,
-      "upstream_failed",
-      `${what} (${status || "network"})`,
-      status ? { upstreamStatus: status } : undefined,
-    );
+    return new ApiError(502, "upstream_failed", `${what} (${status || "network"})`, status ? { upstreamStatus: status } : undefined);
   }
 }

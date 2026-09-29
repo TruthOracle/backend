@@ -24,12 +24,9 @@ export function resolveDbSslCa(raw: string | undefined): string | undefined {
  */
 export function resolveDbSsl(databaseUrl: string, mode: DbSslMode, ca?: string): DbSslOptions {
   if (mode === "false") return false;
-  if (mode === "verify")
-    return ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true };
+  if (mode === "verify") return ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true };
   if (mode === "true") return { rejectUnauthorized: false };
-  return /(localhost|127\.0\.0\.1|@postgres[:/])/.test(databaseUrl)
-    ? false
-    : { rejectUnauthorized: false };
+  return /(localhost|127\.0\.0\.1|@postgres[:/])/.test(databaseUrl) ? false : { rejectUnauthorized: false };
 }
 
 /** Shared by the Nest TypeOrmModule and the TypeORM CLI so both see the same options. */

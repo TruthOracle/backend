@@ -18,11 +18,7 @@ import { ApiError } from "../util/errors";
 import { DUST, formatCC, parseCC } from "../util/money";
 import { AuditService } from "./audit.service";
 import { EnterpriseWalletService } from "./enterprise-wallet.service";
-import {
-  LedgerClientService,
-  userWalletCreateCommand,
-  walletCreateCommandIdFor,
-} from "./ledger-client.service";
+import { LedgerClientService, userWalletCreateCommand, walletCreateCommandIdFor } from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { PayoutService } from "./payout.service";
 import { RedisService } from "./redis.service";
@@ -75,11 +71,7 @@ export interface CreditPlan {
  * and ANY deviation beyond DUST — negative owed, negative delta, positive delta — is drift the
  * backend refuses to paper over: nothing is credited, an operator is notified.
  */
-export function planCredit(input: {
-  wallets: WalletLedgerInput[];
-  primaryPartyId: string;
-  ledgerDepositedCC: bigint;
-}): CreditPlan {
+export function planCredit(input: { wallets: WalletLedgerInput[]; primaryPartyId: string; ledgerDepositedCC: bigint }): CreditPlan {
   const primary = input.wallets.find((w) => w.partyId === input.primaryPartyId);
   if (!primary) throw new Error("planCredit: the primary party has no wallet row");
 
@@ -90,14 +82,7 @@ export function planCredit(input: {
     expected += w.creditedCC;
   }
   const delta = input.ledgerDepositedCC - expected;
-  const base = {
-    owed,
-    expected,
-    ledgerDepositedCC: input.ledgerDepositedCC,
-    delta,
-    amount: 0n,
-    attribution: [] as DepositAttribution[],
-  };
+  const base = { owed, expected, ledgerDepositedCC: input.ledgerDepositedCC, delta, amount: 0n, attribution: [] as DepositAttribution[] };
 
   // Step 3: a wallet attributed more than it ever sent is an over-credit → hard error.
   for (const w of input.wallets) {
@@ -105,16 +90,8 @@ export function planCredit(input: {
     if (o < -DUST) return { ...base, drift: { kind: "over_credit", walletId: w.id, amountCC: o } };
   }
   // Step 4: the ledger must hold exactly what was attributed — in either direction.
-  if (delta < -DUST)
-    return {
-      ...base,
-      drift: { kind: "ledger_below_expected", walletId: primary.id, amountCC: delta },
-    };
-  if (delta > DUST)
-    return {
-      ...base,
-      drift: { kind: "ledger_above_expected", walletId: primary.id, amountCC: delta },
-    };
+  if (delta < -DUST) return { ...base, drift: { kind: "ledger_below_expected", walletId: primary.id, amountCC: delta } };
+  if (delta > DUST) return { ...base, drift: { kind: "ledger_above_expected", walletId: primary.id, amountCC: delta } };
   // Step 5: every owed_w is already an exact 10-dp value; the sum is exact too.
   let amount = 0n;
   const attribution: DepositAttribution[] = [];
@@ -133,16 +110,9 @@ export function planCredit(input: {
  * write-ahead row reject all but one) while a legitimate later deposit sees new state and gets a
  * new id.
  */
-export function depositCommandId(
-  primaryPartyId: string,
-  walletCid: string | null,
-  amountCC: bigint,
-  depositedCC: bigint,
-): string {
+export function depositCommandId(primaryPartyId: string, walletCid: string | null, amountCC: bigint, depositedCC: bigint): string {
   const stateHash = createHash("sha256")
-    .update(
-      `${primaryPartyId}|${walletCid ?? "create"}|${formatCC(amountCC)}|${formatCC(depositedCC)}`,
-    )
+    .update(`${primaryPartyId}|${walletCid ?? "create"}|${formatCC(amountCC)}|${formatCC(depositedCC)}`)
     .digest("hex")
     .slice(0, 40);
   return `deposit-${stateHash}`;
@@ -172,8 +142,7 @@ export class DepositService {
     private readonly config: Config,
     private readonly dataSource: DataSource,
     @InjectRepository(WalletEntity) private readonly wallets: Repository<WalletEntity>,
-    @InjectRepository(DepositCreditEntity)
-    private readonly credits: Repository<DepositCreditEntity>,
+    @InjectRepository(DepositCreditEntity) private readonly credits: Repository<DepositCreditEntity>,
     private readonly users: UserService,
     private readonly ledger: LedgerClientService,
     private readonly wallet: EnterpriseWalletService,
@@ -187,8 +156,7 @@ export class DepositService {
 
   private get treasury(): string {
     const treasury = this.config.treasuryPartyId;
-    if (!treasury)
-      throw new ApiError(502, "upstream_failed", "TREASURY_PARTY_ID is not configured");
+    if (!treasury) throw new ApiError(502, "upstream_failed", "TREASURY_PARTY_ID is not configured");
     return treasury;
   }
 
@@ -197,30 +165,16 @@ export class DepositService {
   async reconcile(userId: string, actor: Actor): Promise<ReconcileResult> {
     const user = await this.users.findById(userId);
     if (!user) throw new ApiError(404, "not_found", "user not found");
-    if (user.status !== "active")
-      throw new ApiError(403, "user_suspended", "this account is suspended");
-    if (!user.partyId)
-      throw new ApiError(409, "no_primary_wallet", "link a Canton wallet before depositing");
+    if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
+    if (!user.partyId) throw new ApiError(409, "no_primary_wallet", "link a Canton wallet before depositing");
     if (user.kycStatus === "blocked_duplicate") {
-      throw new ApiError(
-        409,
-        "kyc_duplicate_identity",
-        "deposits are disabled while an identity verification conflict is open",
-      );
+      throw new ApiError(409, "kyc_duplicate_identity", "deposits are disabled while an identity verification conflict is open");
     }
 
     // TTL sits above the worst-case history walk; correctness never depends on it (the
     // write-ahead row and ledger command-dedup do that) — it cheapens the common race to a 409.
-    const lock = await this.redis.acquireLock(
-      `lock:deposit:${userId}`,
-      this.config.depositLockTtlMs,
-    );
-    if (!lock.acquired)
-      throw new ApiError(
-        409,
-        "deposit_in_progress",
-        "a reconciliation for this account is already in progress",
-      );
+    const lock = await this.redis.acquireLock(`lock:deposit:${userId}`, this.config.depositLockTtlMs);
+    if (!lock.acquired) throw new ApiError(409, "deposit_in_progress", "a reconciliation for this account is already in progress");
 
     try {
       const primary = user.partyId;
@@ -230,15 +184,10 @@ export class DepositService {
       //    neither on the ledger nor attributed yet, so a new derivation would double count).
       const pass = await this.confirmForUser(userId);
       if (pass.pending.length > 0) {
-        throw new ApiError(
-          409,
-          "deposit_in_progress",
-          "a previous deposit credit is still being confirmed; try again shortly",
-          {
-            submitted: pass.pending.length,
-            commandIds: pass.pending.map((r) => r.commandId),
-          },
-        );
+        throw new ApiError(409, "deposit_in_progress", "a previous deposit credit is still being confirmed; try again shortly", {
+          submitted: pass.pending.length,
+          commandIds: pass.pending.map((r) => r.commandId),
+        });
       }
 
       // 2. the COMPLETE treasury history, uncached on this route (paged as walletClient.mjs).
@@ -247,8 +196,7 @@ export class DepositService {
       // 3–5. per-wallet attribution over every row (active AND revoked) in exact fixed point.
       const rows = await this.wallets.find({ where: { userId }, order: { createdAt: "ASC" } });
       const primaryRow = rows.find((w) => w.partyId === primary);
-      if (!primaryRow)
-        throw new ApiError(409, "no_primary_wallet", "the primary party has no linked wallet row");
+      if (!primaryRow) throw new ApiError(409, "no_primary_wallet", "the primary party has no linked wallet row");
       const ledgerBefore = await this.ledger.fetchUserWallet(primary, { uncached: true });
       const plan = planCredit({
         wallets: rows.map((w) => ({
@@ -263,25 +211,15 @@ export class DepositService {
 
       if (plan.drift) {
         await this.reportDrift(userId, primaryRow, plan, actor);
-        throw new ApiError(
-          409,
-          "deposit_attribution_drift",
-          "the in-app balance does not match the attributed deposits; an operator has been notified",
-          {
-            kind: plan.drift.kind,
-            walletId: plan.drift.walletId,
-            amountCC: formatCC(plan.drift.amountCC),
-          },
-        );
+        throw new ApiError(409, "deposit_attribution_drift", "the in-app balance does not match the attributed deposits; an operator has been notified", {
+          kind: plan.drift.kind,
+          walletId: plan.drift.walletId,
+          amountCC: formatCC(plan.drift.amountCC),
+        });
       }
 
       if (plan.amount <= DUST) {
-        return {
-          credited: formatCC(0n),
-          status: "nothing_outstanding",
-          perWallet: [],
-          ledger: ledgerBefore ? ledgerWalletToApi(ledgerBefore) : null,
-        };
+        return { credited: formatCC(0n), status: "nothing_outstanding", perWallet: [], ledger: ledgerBefore ? ledgerWalletToApi(ledgerBefore) : null };
       }
 
       // 6. the primary's UserWallet must exist BEFORE the write-ahead: it is created empty
@@ -292,12 +230,7 @@ export class DepositService {
       const ledgerWallet = ledgerBefore ?? (await this.ensureUserWallet(primary));
 
       // 7. write-ahead row keyed by the deterministic command id.
-      const commandId = depositCommandId(
-        primary,
-        ledgerWallet.contractId,
-        plan.amount,
-        ledgerWallet.depositedCC,
-      );
+      const commandId = depositCommandId(primary, ledgerWallet.contractId, plan.amount, ledgerWallet.depositedCC);
       const txRef = depositTxRef(commandId);
       const credit = await this.writeAhead(userId, {
         ownerParty: primary,
@@ -313,10 +246,7 @@ export class DepositService {
       // 8. submit as treasury.
       let submitError: unknown = null;
       try {
-        await this.wallet.externalSubmit({
-          commandId,
-          commands: [this.depositCommand(ledgerWallet, plan.amount, txRef)],
-        });
+        await this.wallet.externalSubmit({ commandId, commands: [this.depositCommand(ledgerWallet, plan.amount, txRef)] });
       } catch (err) {
         // The command may or may not have reached the ledger: the row stays `submitted` and the
         // confirm pass below (or the next one) decides — never resubmit blindly.
@@ -328,58 +258,30 @@ export class DepositService {
       //    status — a row the pass could not confirm is `submitted` (the processor finishes it),
       //    never a guess.
       await this.confirmForUser(userId).catch((err: unknown) => {
-        this.logger.warn(
-          `post-submit confirm pass failed for ${commandId}: ${(err as Error).message}`,
-        );
+        this.logger.warn(`post-submit confirm pass failed for ${commandId}: ${(err as Error).message}`);
       });
       const row = (await this.credits.findOne({ where: { id: credit.id } })) ?? credit;
-      const ledgerAfter = await this.ledger
-        .fetchUserWallet(primary, { uncached: true })
-        .catch(() => ledgerWallet);
-      const perWallet = plan.attribution.map((a) => ({
-        walletId: a.walletId,
-        partyId: a.partyId,
-        amountCC: a.amountCC,
-      }));
+      const ledgerAfter = await this.ledger.fetchUserWallet(primary, { uncached: true }).catch(() => ledgerWallet);
+      const perWallet = plan.attribution.map((a) => ({ walletId: a.walletId, partyId: a.partyId, amountCC: a.amountCC }));
       const ledger = ledgerAfter ? ledgerWalletToApi(ledgerAfter) : null;
 
       if (row.status === "confirmed") {
-        return {
-          credited: formatCC(plan.amount),
-          status: "confirmed",
-          commandId,
-          perWallet,
-          ledger,
-        };
+        return { credited: formatCC(plan.amount), status: "confirmed", commandId, perWallet, ledger };
       }
       if (row.status === "failed") {
-        throw new ApiError(
-          502,
-          "upstream_failed",
-          "the deposit credit was not accepted by the ledger; retry the reconciliation",
-          {
-            commandId,
-            creditStatus: row.status,
-            creditId: row.id,
-          },
-        );
+        throw new ApiError(502, "upstream_failed", "the deposit credit was not accepted by the ledger; retry the reconciliation", {
+          commandId,
+          creditStatus: row.status,
+          creditId: row.id,
+        });
       }
       if (submitError) {
         // Whatever the transport threw, the answer is an upstream failure that names the row: the
         // credit is written ahead and the confirm pass owns it from here.
         const base = ApiError.is(submitError)
           ? submitError
-          : new ApiError(
-              502,
-              "upstream_failed",
-              `deposit submit failed: ${submitError instanceof Error ? submitError.message : "unknown error"}`,
-            );
-        throw new ApiError(base.status, base.code, base.message, {
-          ...(base.details ?? {}),
-          commandId,
-          creditStatus: row.status,
-          creditId: row.id,
-        });
+          : new ApiError(502, "upstream_failed", `deposit submit failed: ${submitError instanceof Error ? submitError.message : "unknown error"}`);
+        throw new ApiError(base.status, base.code, base.message, { ...(base.details ?? {}), commandId, creditStatus: row.status, creditId: row.id });
       }
       return { credited: formatCC(plan.amount), status: "submitted", commandId, perWallet, ledger };
     } finally {
@@ -395,10 +297,7 @@ export class DepositService {
    * holding it runs its own pass. Transitions are atomic (`WHERE status = 'submitted'`), so a
    * concurrent confirmer can never apply the attribution twice.
    */
-  async confirmPending(
-    userId?: string,
-    opts: { lockHeld?: boolean } = {},
-  ): Promise<{ confirmed: number; failed: number }> {
+  async confirmPending(userId?: string, opts: { lockHeld?: boolean } = {}): Promise<{ confirmed: number; failed: number }> {
     const rows = await this.credits.find({
       where: userId ? { userId, status: "submitted" } : { status: "submitted" },
       order: { createdAt: "ASC" },
@@ -432,14 +331,9 @@ export class DepositService {
     return { confirmed, failed };
   }
 
-  private async confirmForUser(
-    userId: string,
-  ): Promise<{ confirmed: number; failed: number; pending: DepositCreditEntity[] }> {
+  private async confirmForUser(userId: string): Promise<{ confirmed: number; failed: number; pending: DepositCreditEntity[] }> {
     const result = await this.confirmPending(userId, { lockHeld: true });
-    const pending = await this.credits.find({
-      where: { userId, status: "submitted" },
-      order: { createdAt: "ASC" },
-    });
+    const pending = await this.credits.find({ where: { userId, status: "submitted" }, order: { createdAt: "ASC" } });
     return { ...result, pending };
   }
 
@@ -459,20 +353,12 @@ export class DepositService {
     if (status.known && status.submitted) {
       // The wallet says it went through but the ledger disagrees past the grace period: an
       // operator must look — nothing is credited and nothing is re-armed.
-      this.logger.warn(
-        `deposit ${row.commandId}: wallet reports "${status.status ?? "submitted"}" but the ledger still shows the pre-state after ${Math.round(ageMs / 1000)} s`,
-      );
-      this.sentry.captureMessage(
-        "deposit credit accepted by the wallet but absent from the ledger",
-        "warning",
-        { commandId: row.commandId },
-      );
+      this.logger.warn(`deposit ${row.commandId}: wallet reports "${status.status ?? "submitted"}" but the ledger still shows the pre-state after ${Math.round(ageMs / 1000)} s`);
+      this.sentry.captureMessage("deposit credit accepted by the wallet but absent from the ledger", "warning", { commandId: row.commandId });
       return "pending";
     }
     if (!status.known && status.status !== "not_found") return "pending";
-    const reason = status.known
-      ? `wallet reports the command as ${status.status ?? "failed"}`
-      : "wallet does not know the command after the grace period";
+    const reason = status.known ? `wallet reports the command as ${status.status ?? "failed"}` : "wallet does not know the command after the grace period";
     return (await this.markFailed(row, reason)) ? "failed" : "pending";
   }
 
@@ -504,27 +390,14 @@ export class DepositService {
     try {
       await this.wallet.externalSubmit({
         commandId,
-        commands: [
-          userWalletCreateCommand({
-            templateId: this.ledger.templateId("UserWallet"),
-            admin: this.treasury,
-            owner,
-          }),
-        ],
+        commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: this.treasury, owner })],
       });
     } catch (err) {
-      this.logger.warn(
-        `UserWallet create ${commandId} did not succeed (${(err as Error).message}); re-reading the ledger`,
-      );
+      this.logger.warn(`UserWallet create ${commandId} did not succeed (${(err as Error).message}); re-reading the ledger`);
     }
     const created = await this.ledger.fetchUserWallet(owner, { uncached: true });
     if (!created) {
-      throw new ApiError(
-        502,
-        "upstream_failed",
-        "the in-app wallet is not yet visible on the ledger; try again shortly",
-        { commandId },
-      );
+      throw new ApiError(502, "upstream_failed", "the in-app wallet is not yet visible on the ledger; try again shortly", { commandId });
     }
     return created;
   }
@@ -535,17 +408,11 @@ export class DepositService {
     const done = await this.dataSource.transaction(async (manager) => {
       const res = await manager
         .getRepository(DepositCreditEntity)
-        .update(
-          { id: row.id, status: "submitted" },
-          { status: "confirmed", confirmedAt: new Date(), error: null },
-        );
+        .update({ id: row.id, status: "submitted" }, { status: "confirmed", confirmedAt: new Date(), error: null });
       if (!res.affected) return false;
       const walletRepo = manager.getRepository(WalletEntity);
       for (const a of row.attribution) {
-        const w = await walletRepo.findOne({
-          where: { id: a.walletId },
-          lock: { mode: "pessimistic_write" },
-        });
+        const w = await walletRepo.findOne({ where: { id: a.walletId }, lock: { mode: "pessimistic_write" } });
         if (!w) throw new Error(`attribution wallet ${a.walletId} of credit ${row.id} is missing`);
         await walletRepo.update({ id: w.id }, { creditedCC: w.creditedCC + parseCC(a.amountCC) });
       }
@@ -555,41 +422,22 @@ export class DepositService {
           action: "deposit.credited",
           subjectType: "deposit_credit",
           subjectId: row.id,
-          metadata: {
-            userId: row.userId,
-            commandId: row.commandId,
-            amountCC: formatCC(row.amountCC),
-            walletIds,
-            attribution: row.attribution,
-          },
+          metadata: { userId: row.userId, commandId: row.commandId, amountCC: formatCC(row.amountCC), walletIds, attribution: row.attribution },
         },
         manager,
       );
       return true;
     });
     if (done) {
-      this.logger.log(
-        `deposit ${row.commandId} confirmed: ${formatCC(row.amountCC)} CC across ${walletIds.length} wallet(s)`,
-      );
-      void this.nats.publishSafe(NatsSubjects.depositCredited, {
-        userId: row.userId,
-        depositCreditId: row.id,
-        commandId: row.commandId,
-        amountCC: formatCC(row.amountCC),
-        walletIds,
-      });
+      this.logger.log(`deposit ${row.commandId} confirmed: ${formatCC(row.amountCC)} CC across ${walletIds.length} wallet(s)`);
+      void this.nats.publishSafe(NatsSubjects.depositCredited, { userId: row.userId, depositCreditId: row.id, commandId: row.commandId, amountCC: formatCC(row.amountCC), walletIds });
     }
     return done;
   }
 
   private async markFailed(row: DepositCreditEntity, error: string): Promise<boolean> {
     return this.dataSource.transaction(async (manager) => {
-      const res = await manager
-        .getRepository(DepositCreditEntity)
-        .update(
-          { id: row.id, status: "submitted" },
-          { status: "failed", error: error.slice(0, 500) },
-        );
+      const res = await manager.getRepository(DepositCreditEntity).update({ id: row.id, status: "submitted" }, { status: "failed", error: error.slice(0, 500) });
       if (!res.affected) return false;
       await this.audit.record(
         {
@@ -597,19 +445,12 @@ export class DepositService {
           action: "deposit.failed",
           subjectType: "deposit_credit",
           subjectId: row.id,
-          metadata: {
-            userId: row.userId,
-            commandId: row.commandId,
-            amountCC: formatCC(row.amountCC),
-            error: error.slice(0, 200),
-          },
+          metadata: { userId: row.userId, commandId: row.commandId, amountCC: formatCC(row.amountCC), error: error.slice(0, 200) },
         },
         manager,
       );
       this.logger.warn(`deposit ${row.commandId} marked failed: ${error}`);
-      this.sentry.captureMessage("deposit credit marked failed", "warning", {
-        commandId: row.commandId,
-      });
+      this.sentry.captureMessage("deposit credit marked failed", "warning", { commandId: row.commandId });
       return true;
     });
   }
@@ -668,9 +509,7 @@ export class DepositService {
       if (!inserted) {
         const clash = await repo.findOne({ where: { commandId: input.commandId } });
         if (!clash || clash.status !== "failed") {
-          throw new ApiError(409, "deposit_in_progress", "this deposit is already being credited", {
-            commandId: input.commandId,
-          });
+          throw new ApiError(409, "deposit_in_progress", "this deposit is already being credited", { commandId: input.commandId });
         }
         const res = await repo.update(
           { id: clash.id, status: "failed" },
@@ -687,10 +526,7 @@ export class DepositService {
             txRef: input.txRef,
           },
         );
-        if (!res.affected)
-          throw new ApiError(409, "deposit_in_progress", "this deposit is already being credited", {
-            commandId: input.commandId,
-          });
+        if (!res.affected) throw new ApiError(409, "deposit_in_progress", "this deposit is already being credited", { commandId: input.commandId });
         rearmed = true;
       }
       const row = await repo.findOne({ where: { commandId: input.commandId } });
@@ -734,12 +570,7 @@ export class DepositService {
   }
 
   /** Audit + Sentry + NATS for a refused reconciliation; the audit row is written outside the (absent) transaction so it survives the 409. */
-  private async reportDrift(
-    userId: string,
-    primaryRow: WalletEntity,
-    plan: CreditPlan,
-    actor: Actor,
-  ): Promise<void> {
+  private async reportDrift(userId: string, primaryRow: WalletEntity, plan: CreditPlan, actor: Actor): Promise<void> {
     const drift = plan.drift;
     if (!drift) return;
     const subjectId = drift.walletId ?? primaryRow.id;
@@ -760,20 +591,9 @@ export class DepositService {
       },
       ip: actor.ip ?? null,
     });
-    this.logger.error(
-      `deposit attribution drift for user ${userId}: ${drift.kind} ${formatCC(drift.amountCC)} CC (ledger ${formatCC(plan.ledgerDepositedCC)}, expected ${formatCC(plan.expected)})`,
-    );
-    this.sentry.captureMessage(`deposit attribution drift: ${drift.kind}`, "error", {
-      userId,
-      walletId: subjectId,
-      kind: drift.kind,
-    });
-    void this.nats.publishSafe(NatsSubjects.depositDrift, {
-      userId,
-      walletId: subjectId,
-      kind: drift.kind,
-      amountCC: formatCC(drift.amountCC),
-    });
+    this.logger.error(`deposit attribution drift for user ${userId}: ${drift.kind} ${formatCC(drift.amountCC)} CC (ledger ${formatCC(plan.ledgerDepositedCC)}, expected ${formatCC(plan.expected)})`);
+    this.sentry.captureMessage(`deposit attribution drift: ${drift.kind}`, "error", { userId, walletId: subjectId, kind: drift.kind });
+    void this.nats.publishSafe(NatsSubjects.depositDrift, { userId, walletId: subjectId, kind: drift.kind, amountCC: formatCC(drift.amountCC) });
   }
 
   // ── GET /in-app-wallet ────────────────────────────────────────────────────────────────────
@@ -798,9 +618,7 @@ export class DepositService {
     const wallets = rows.map((w) =>
       walletToApi(w, {
         ownLedgerWallet: own.get(w.id) ?? null,
-        ...(history
-          ? { receivedCC: this.wallet.totalReceivedFrom(history, this.treasury, w.partyId) }
-          : {}),
+        ...(history ? { receivedCC: this.wallet.totalReceivedFrom(history, this.treasury, w.partyId) } : {}),
       }),
     );
 
@@ -831,4 +649,5 @@ export class DepositService {
       payouts: payoutRows.map((p) => this.payouts.toApi(p, active.has(p.pendingPayoutCid))),
     };
   }
+
 }

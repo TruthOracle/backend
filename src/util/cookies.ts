@@ -29,10 +29,7 @@ function serialize(name: string, value: string, opts: CookieOptions): string {
   return parts.join("; ");
 }
 
-function optionsFrom(
-  config: Pick<Config, "cookieSecure" | "cookieDomain">,
-  maxAgeMs: number,
-): CookieOptions {
+function optionsFrom(config: Pick<Config, "cookieSecure" | "cookieDomain">, maxAgeMs: number): CookieOptions {
   return { secure: config.cookieSecure, domain: config.cookieDomain, maxAgeMs };
 }
 
@@ -44,9 +41,7 @@ export function sessionCookie(
   return serialize(SESSION_COOKIE, token, optionsFrom(config, maxAgeMs));
 }
 
-export function clearedSessionCookie(
-  config: Pick<Config, "cookieSecure" | "cookieDomain">,
-): string {
+export function clearedSessionCookie(config: Pick<Config, "cookieSecure" | "cookieDomain">): string {
   return serialize(SESSION_COOKIE, "", optionsFrom(config, 0));
 }
 

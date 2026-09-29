@@ -190,12 +190,7 @@ export class QuoteService {
   }
 
   /** Mirrors the asserts of the Daml choices so a user learns why before signing (docs/MARKETS.md §7). */
-  assertTradable(
-    market: MarketEntity,
-    action: OrderAction,
-    phase: MarketPhase,
-    nowSec: number,
-  ): void {
+  assertTradable(market: MarketEntity, action: OrderAction, phase: MarketPhase, nowSec: number): void {
     const refuse = (reason: string): never => {
       throw new ApiError(409, "market_not_tradable", reason, { phase, action });
     };
@@ -222,19 +217,14 @@ export class QuoteService {
           refuse("dynamic-pool liquidity is locked until resolution");
         return;
       case "redeem":
-        if (market.status !== "Resolved" && market.status !== "Voided")
-          refuse("market not settled");
+        if (market.status !== "Resolved" && market.status !== "Voided") refuse("market not settled");
         return;
     }
   }
 
   // ───────────────────────────────────────────── orders ─────────────────────────────────────────────
 
-  async prepare(
-    user: UserEntity,
-    market: MarketEntity,
-    req: QuoteRequest,
-  ): Promise<ApiPreparedOrder> {
+  async prepare(user: UserEntity, market: MarketEntity, req: QuoteRequest): Promise<ApiPreparedOrder> {
     const nowSec = Math.floor(Date.now() / 1000);
     const party = user.partyId;
     if (!party) throw new ApiError(409, "no_primary_wallet", "link a wallet before trading");
@@ -248,11 +238,7 @@ export class QuoteService {
     const phase = this.markets.phaseOf(market, nowSec);
     this.assertTradable(market, req.action, phase, nowSec);
     if (!market.createdEventBlob)
-      throw new ApiError(
-        409,
-        "quote_unavailable",
-        "the market's disclosed-contract blob is not indexed yet",
-      );
+      throw new ApiError(409, "quote_unavailable", "the market's disclosed-contract blob is not indexed yet");
 
     const [wallet, position, lpPosition] = await Promise.all([
       this.dataSource
@@ -260,23 +246,13 @@ export class QuoteService {
         .findOne({ where: { owner: party, active: true }, order: { createdOffset: "DESC" } }),
       this.dataSource
         .getRepository(PositionEntity)
-        .findOne({
-          where: { holder: party, marketId: market.marketId, active: true },
-          order: { createdOffset: "DESC" },
-        }),
+        .findOne({ where: { holder: party, marketId: market.marketId, active: true }, order: { createdOffset: "DESC" } }),
       this.dataSource
         .getRepository(LiquidityPositionEntity)
-        .findOne({
-          where: { provider: party, marketId: market.marketId, active: true },
-          order: { createdOffset: "DESC" },
-        }),
+        .findOne({ where: { provider: party, marketId: market.marketId, active: true }, order: { createdOffset: "DESC" } }),
     ]);
     if (!wallet)
-      throw new ApiError(
-        409,
-        "no_in_app_wallet",
-        "deposit first: this account has no in-app wallet on the ledger",
-      );
+      throw new ApiError(409, "no_in_app_wallet", "deposit first: this account has no in-app wallet on the ledger");
 
     const slippageBps = clampSlippage(req.slippageBps);
     const quote = ["buy", "sell", "swap", "provide_liquidity"].includes(req.action)
@@ -499,11 +475,7 @@ export class QuoteService {
 function clampSlippage(bps: number | undefined): number {
   if (bps === undefined) return DEFAULT_SLIPPAGE_BPS;
   if (!Number.isInteger(bps) || bps < 0 || bps > MAX_SLIPPAGE_BPS)
-    throw new ApiError(
-      400,
-      "validation_failed",
-      `slippageBps must be an integer in 0..${MAX_SLIPPAGE_BPS}`,
-    );
+    throw new ApiError(400, "validation_failed", `slippageBps must be an integer in 0..${MAX_SLIPPAGE_BPS}`);
   return bps;
 }
 

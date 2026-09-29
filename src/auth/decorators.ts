@@ -11,5 +11,4 @@ export const Public = (): MethodDecorator & ClassDecorator => SetMetadata(IS_PUB
  * SessionGuard refuses admin sessions with `403 forbidden`: an operator's session is a credential
  * for `/admin` and its own housekeeping, never for account routes.
  */
-export const AllowAdminSession = (): MethodDecorator & ClassDecorator =>
-  SetMetadata(ALLOW_ADMIN_SESSION_KEY, true);
+export const AllowAdminSession = (): MethodDecorator & ClassDecorator => SetMetadata(ALLOW_ADMIN_SESSION_KEY, true);

@@ -39,22 +39,16 @@ export class LoginService {
     private readonly nats: NatsService,
   ) {}
 
-  async completeLogin(
-    res: Response,
-    claim: IdentityClaim,
-    ctx: LoginContext,
-  ): Promise<ApiLoginResult> {
+  async completeLogin(res: Response, claim: IdentityClaim, ctx: LoginContext): Promise<ApiLoginResult> {
     const req = ctx.req;
     const currentUser = ctx.currentUser === undefined ? (req.user ?? null) : ctx.currentUser;
     const currentSession = currentUser ? (req.session ?? null) : null;
     const ip = req.clientIp ?? null;
-    const userAgent =
-      typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null;
+    const userAgent = typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null;
 
     // §6.8 / §7.4: admin sessions come only from an admin-sign-in by an operator wallet, never in link mode.
     if (ctx.kind === "admin") {
-      if (currentUser)
-        throw new ApiError(403, "forbidden", "admin sign-in cannot run in link mode");
+      if (currentUser) throw new ApiError(403, "forbidden", "admin sign-in cannot run in link mode");
       if (claim.provider !== "canton_wallet" || !this.config.adminOperators.has(claim.subject)) {
         throw new ApiError(403, "forbidden", "admin sessions are issued only to operator wallets");
       }
@@ -76,8 +70,7 @@ export class LoginService {
     const locked = await this.identities.lockedIdentityId(user.id);
 
     if (resolution.mode === "link") {
-      if (!currentSession)
-        throw new ApiError(401, "unauthenticated", "link mode requires a session");
+      if (!currentSession) throw new ApiError(401, "unauthenticated", "link mode requires a session");
       return {
         mode: "link",
         user: this.users.toApi(user),
@@ -104,24 +97,16 @@ export class LoginService {
       action: ctx.kind === "admin" ? "auth.admin_login" : "auth.login",
       subjectType: "user",
       subjectId: user.id,
-      metadata: {
-        provider: claim.provider,
-        identityId: identity.id,
-        created: resolution.created,
-        client: ctx.client,
-      },
+      metadata: { provider: claim.provider, identityId: identity.id, created: resolution.created, client: ctx.client },
       ip,
     });
-    void this.nats.publishSafe(
-      ctx.kind === "admin" ? NatsSubjects.authAdminLogin : NatsSubjects.authLogin,
-      {
-        userId: user.id,
-        identityId: identity.id,
-        sessionId: session.id,
-        provider: claim.provider,
-        created: resolution.created,
-      },
-    );
+    void this.nats.publishSafe(ctx.kind === "admin" ? NatsSubjects.authAdminLogin : NatsSubjects.authLogin, {
+      userId: user.id,
+      identityId: identity.id,
+      sessionId: session.id,
+      provider: claim.provider,
+      created: resolution.created,
+    });
     if (ctx.client !== "native") res.append("Set-Cookie", this.sessions.cookieFor(token, ctx.kind));
 
     const result: ApiLoginResult = {

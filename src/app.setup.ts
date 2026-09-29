@@ -38,11 +38,7 @@ export function jsonBodyMiddleware(): (req: Request, res: Response, next: NextFu
 
 /** The `{ error: "not_found" }` envelope for a route nothing handled (ARCHITECTURE §11). */
 export function notFoundHandler(req: Request, res: Response): void {
-  const body = new ApiError(
-    404,
-    "not_found",
-    `Cannot ${req.method} ${req.originalUrl ?? req.url}`,
-  ).toBody();
+  const body = new ApiError(404, "not_found", `Cannot ${req.method} ${req.originalUrl ?? req.url}`).toBody();
   res.status(404);
   res.setHeader("Cache-Control", "no-store");
   const id = (req as Request & { id?: string }).id;

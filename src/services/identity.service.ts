@@ -5,14 +5,7 @@ import { DataSource, type EntityManager, Repository } from "typeorm";
 
 import { AuthIdentityEntity } from "../entities/auth-identity.entity";
 import { UserEntity } from "../entities/user.entity";
-import {
-  type Actor,
-  type ApiIdentity,
-  type IdentityClaim,
-  KYC_LOCK_LOOKUP,
-  type KycLockLookup,
-  NatsSubjects,
-} from "../types";
+import { type Actor, type ApiIdentity, type IdentityClaim, KYC_LOCK_LOOKUP, type KycLockLookup, NatsSubjects } from "../types";
 import { ApiError } from "../util/errors";
 import { AuditService } from "./audit.service";
 import { NatsService } from "./nats.service";
@@ -44,8 +37,7 @@ export interface LoginResolution {
 export class IdentityService {
   constructor(
     private readonly dataSource: DataSource,
-    @InjectRepository(AuthIdentityEntity)
-    private readonly identities: Repository<AuthIdentityEntity>,
+    @InjectRepository(AuthIdentityEntity) private readonly identities: Repository<AuthIdentityEntity>,
     private readonly users: UserService,
     private readonly sessions: SessionService,
     private readonly audit: AuditService,
@@ -90,12 +82,7 @@ export class IdentityService {
     if (!subject) throw new ApiError(400, "validation_failed", "identity subject is empty");
     const profile = pickProfile(claim.profile);
     const email = claim.provider === "google" ? (claim.email ?? null) : null;
-    const actor: Actor = {
-      type: "user",
-      userId: ctx.currentUser?.id ?? null,
-      sessionId: ctx.sessionId ?? null,
-      ip: ctx.ip ?? null,
-    };
+    const actor: Actor = { type: "user", userId: ctx.currentUser?.id ?? null, sessionId: ctx.sessionId ?? null, ip: ctx.ip ?? null };
 
     return this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(AuthIdentityEntity);
@@ -106,13 +93,7 @@ export class IdentityService {
         if (existing.status === "unlinked") {
           if (ctx.currentUser && ctx.currentUser.id === existing.userId) {
             // (a) link-mode re-attachment by the original owner.
-            const identity = await this.reattachRow(
-              manager,
-              existing,
-              { ...actor, type: "user" },
-              profile,
-              email,
-            );
+            const identity = await this.reattachRow(manager, existing, { ...actor, type: "user" }, profile, email);
             const user = await this.requireActiveUser(manager, existing.userId);
             return { user, identity, mode: "link", created: false };
           }
@@ -132,25 +113,13 @@ export class IdentityService {
           });
           if (ctx.currentUser) {
             // Link mode by another account: the identity is bound to its first account (§6.2).
-            throw new ApiError(
-              409,
-              "identity_already_linked",
-              "this sign-in method is linked to another account",
-            );
+            throw new ApiError(409, "identity_already_linked", "this sign-in method is linked to another account");
           }
-          throw new ApiError(
-            403,
-            "identity_unlinked",
-            "this sign-in method was unlinked from its account; the original account owner or an operator can re-attach it",
-          );
+          throw new ApiError(403, "identity_unlinked", "this sign-in method was unlinked from its account; the original account owner or an operator can re-attach it");
         }
 
         if (ctx.currentUser && ctx.currentUser.id !== existing.userId) {
-          throw new ApiError(
-            409,
-            "identity_already_linked",
-            "this sign-in method is linked to another account",
-          );
+          throw new ApiError(409, "identity_already_linked", "this sign-in method is linked to another account");
         }
 
         existing.lastUsedAt = now;
@@ -174,12 +143,7 @@ export class IdentityService {
       } else {
         user = await this.users.create(
           {
-            displayName:
-              typeof profile.name === "string"
-                ? profile.name
-                : typeof profile.username === "string"
-                  ? profile.username
-                  : null,
+            displayName: typeof profile.name === "string" ? profile.name : typeof profile.username === "string" ? profile.username : null,
             avatarUrl: typeof profile.picture === "string" ? profile.picture : null,
             email,
           },
@@ -205,16 +169,7 @@ export class IdentityService {
 
       if (created) {
         await this.audit.record(
-          {
-            actorType: "user",
-            actorUserId: user.id,
-            actorSessionId: null,
-            action: "user.created",
-            subjectType: "user",
-            subjectId: user.id,
-            metadata: { provider: claim.provider },
-            ip: ctx.ip ?? null,
-          },
+          { actorType: "user", actorUserId: user.id, actorSessionId: null, action: "user.created", subjectType: "user", subjectId: user.id, metadata: { provider: claim.provider }, ip: ctx.ip ?? null },
           manager,
         );
       }
@@ -226,11 +181,7 @@ export class IdentityService {
           action: "identity.linked",
           subjectType: "identity",
           subjectId: identity.id,
-          metadata: {
-            provider: claim.provider,
-            userId: user.id,
-            mode: ctx.currentUser ? "link" : "login",
-          },
+          metadata: { provider: claim.provider, userId: user.id, mode: ctx.currentUser ? "link" : "login" },
           ip: ctx.ip ?? null,
         },
         manager,
@@ -255,28 +206,18 @@ export class IdentityService {
     await this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(AuthIdentityEntity);
       const identity = await repo.findOne({ where: { id: identityId, userId } });
-      if (!identity || identity.status !== "active")
-        throw new ApiError(404, "not_found", "identity not found");
+      if (!identity || identity.status !== "active") throw new ApiError(404, "not_found", "identity not found");
 
       // Refusal precedence: §6.5 KYC lock (users only) → §6.3 last identity.
       if (actor.type !== "admin") {
         const locked = await this.lockedIdentityId(userId);
         if (locked && locked === identity.id) {
-          throw new ApiError(
-            409,
-            "identity_locked_by_kyc",
-            "this sign-in method is attached to your identity verification and cannot be unlinked",
-          );
+          throw new ApiError(409, "identity_locked_by_kyc", "this sign-in method is attached to your identity verification and cannot be unlinked");
         }
       }
 
       const others = await repo.count({ where: { userId, status: "active" } });
-      if (others <= 1)
-        throw new ApiError(
-          409,
-          "last_identity",
-          "an account must keep at least one sign-in method",
-        );
+      if (others <= 1) throw new ApiError(409, "last_identity", "an account must keep at least one sign-in method");
 
       identity.status = "unlinked";
       identity.unlinkedAt = new Date();
@@ -304,34 +245,19 @@ export class IdentityService {
    * Re-attach an unlinked identity (§6.4). A user must be the original owner and present a fresh
    * proof for the same provider/subject; an admin needs no proof (`claim` may then be null).
    */
-  async reattach(
-    userId: string,
-    identityId: string,
-    claim: IdentityClaim | null,
-    actor: Actor,
-  ): Promise<AuthIdentityEntity> {
+  async reattach(userId: string, identityId: string, claim: IdentityClaim | null, actor: Actor): Promise<AuthIdentityEntity> {
     return this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(AuthIdentityEntity);
       const identity = await repo.findOne({ where: { id: identityId, userId } });
       if (!identity) throw new ApiError(404, "not_found", "identity not found");
       if (identity.status === "active") return identity;
       if (actor.type !== "admin") {
-        if (
-          !claim ||
-          claim.provider !== identity.provider ||
-          claim.subject.trim() !== identity.subject
-        ) {
+        if (!claim || claim.provider !== identity.provider || claim.subject.trim() !== identity.subject) {
           throw new ApiError(403, "forbidden", "a fresh proof for this sign-in method is required");
         }
       }
       await this.requireActiveUser(manager, userId);
-      return this.reattachRow(
-        manager,
-        identity,
-        actor,
-        pickProfile(claim?.profile),
-        claim?.provider === "google" ? (claim.email ?? null) : null,
-      );
+      return this.reattachRow(manager, identity, actor, pickProfile(claim?.profile), claim?.provider === "google" ? (claim.email ?? null) : null);
     });
   }
 
@@ -376,26 +302,20 @@ export class IdentityService {
       },
       manager,
     );
-    void this.nats.publishSafe(NatsSubjects.identityReattached, {
-      userId: identity.userId,
-      identityId: identity.id,
-    });
+    void this.nats.publishSafe(NatsSubjects.identityReattached, { userId: identity.userId, identityId: identity.id });
     return identity;
   }
 
   private async requireActiveUser(manager: EntityManager, userId: string): Promise<UserEntity> {
     const user = await manager.getRepository(UserEntity).findOne({ where: { id: userId } });
     if (!user) throw new ApiError(404, "not_found", "user not found");
-    if (user.status !== "active")
-      throw new ApiError(403, "user_suspended", "this account is suspended");
+    if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
     return user;
   }
 }
 
 /** Only the documented profile keys survive (never tokens or unexpected provider fields). */
-export function pickProfile(
-  profile: Record<string, unknown> | null | undefined,
-): Record<string, unknown> {
+export function pickProfile(profile: Record<string, unknown> | null | undefined): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (!profile) return out;
   for (const k of PROFILE_KEYS) {

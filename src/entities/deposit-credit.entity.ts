@@ -1,12 +1,4 @@
-import {
-  Column,
-  CreateDateColumn,
-  Entity,
-  Index,
-  JoinColumn,
-  ManyToOne,
-  PrimaryGeneratedColumn,
-} from "typeorm";
+import { Column, CreateDateColumn, Entity, Index, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from "typeorm";
 
 import { moneyTransformer } from "../util/money";
 import { UserEntity } from "./user.entity";
@@ -43,25 +35,13 @@ export class DepositCreditEntity {
   @Column({ name: "tx_ref", type: "text" })
   txRef!: string;
 
-  @Column({
-    name: "amount_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    transformer: moneyTransformer,
-  })
+  @Column({ name: "amount_cc", type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
   amountCC!: bigint;
 
   @Column({ type: "jsonb", default: () => "'[]'::jsonb" })
   attribution!: DepositAttribution[];
 
-  @Column({
-    name: "deposited_cc_before",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    transformer: moneyTransformer,
-  })
+  @Column({ name: "deposited_cc_before", type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
   depositedCCBefore!: bigint;
 
   @Column({ name: "wallet_cid_before", type: "text", nullable: true })

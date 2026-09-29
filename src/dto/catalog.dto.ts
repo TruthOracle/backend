@@ -22,12 +22,7 @@ import {
   ValidateNested,
 } from "class-validator";
 
-import {
-  EVENT_STATUS_FILTERS,
-  SERIES_FREQUENCIES,
-  type EventStatus,
-  type SeriesFrequency,
-} from "../types";
+import { EVENT_STATUS_FILTERS, SERIES_FREQUENCIES, type EventStatus, type SeriesFrequency } from "../types";
 import { REASON_MAX_LENGTH } from "./admin.dto";
 import { PageQueryDto } from "./common.dto";
 

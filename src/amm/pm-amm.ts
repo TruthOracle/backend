@@ -36,7 +36,8 @@ export function normCdf(z: number): number {
   const t = 1 / (1 + 0.2316419 * z);
   const poly =
     t *
-    (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    (0.31938153 +
+      t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
   return 1 - normPdf(z) * poly;
 }
 
@@ -53,8 +54,7 @@ export function normInvCdf(pRaw: number): number {
           4.374664141) *
           q +
         2.938163983
-      ) /
-      ((((0.007784696 * q + 0.322467129) * q + 2.445134137) * q + 3.754408662) * q + 1);
+      ) / ((((0.007784696 * q + 0.322467129) * q + 2.445134137) * q + 3.754408662) * q + 1);
   } else if (p > 1 - pLow) {
     const q = Math.sqrt(-2 * Math.log(1 - p));
     x =
@@ -221,8 +221,7 @@ export function quoteBuy(
   const { x, y } = optimalReserves(m.currentPrice, l);
   const feeCC = collateralCC * feeFraction(m.feeBps);
   const netCC = collateralCC - feeCC;
-  const sharesOut =
-    side === "Yes" ? solveBuyShares(x, y, l, netCC) : solveBuyShares(y, x, l, netCC);
+  const sharesOut = side === "Yes" ? solveBuyShares(x, y, l, netCC) : solveBuyShares(y, x, l, netCC);
   if (sharesOut <= 0) return null;
   const diff = y - x;
   const newDiff = side === "Yes" ? diff + sharesOut : diff - sharesOut;

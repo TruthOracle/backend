@@ -38,10 +38,7 @@ function header(req: Pick<MinimalRequest, "headers">, name: string): string {
 }
 
 /** Timing-safe: does this request carry the proxy secret? False whenever none is configured. */
-export function isTrustedProxyRequest(
-  req: Pick<MinimalRequest, "headers">,
-  config: Pick<Config, "backendProxySecret">,
-): boolean {
+export function isTrustedProxyRequest(req: Pick<MinimalRequest, "headers">, config: Pick<Config, "backendProxySecret">): boolean {
   const secret = config.backendProxySecret;
   if (!secret) return false;
   const presented = header(req, "x-truthoracle-proxy");
@@ -53,10 +50,7 @@ export function isTrustedProxyRequest(
  * Client IP per the proxy contract: `x-real-ip` (Vercel's platform header) only when the
  * proxy secret matches; otherwise the socket address. `x-forwarded-for` is never consulted.
  */
-export function clientIpOf(
-  req: MinimalRequest,
-  config: Pick<Config, "backendProxySecret">,
-): string {
+export function clientIpOf(req: MinimalRequest, config: Pick<Config, "backendProxySecret">): string {
   if (isTrustedProxyRequest(req, config)) {
     const real = header(req, "x-real-ip");
     if (real) return real;
@@ -65,10 +59,7 @@ export function clientIpOf(
 }
 
 /** The host the browser addressed: `x-forwarded-host` when proxied, else `Host`. */
-export function requestHostOf(
-  req: MinimalRequest,
-  config: Pick<Config, "backendProxySecret">,
-): string {
+export function requestHostOf(req: MinimalRequest, config: Pick<Config, "backendProxySecret">): string {
   if (isTrustedProxyRequest(req, config)) {
     const fwd = header(req, "x-forwarded-host");
     if (fwd) return fwd.split(",")[0].trim().toLowerCase();
@@ -76,10 +67,7 @@ export function requestHostOf(
   return header(req, "host").toLowerCase();
 }
 
-export function requestProtoOf(
-  req: MinimalRequest,
-  config: Pick<Config, "backendProxySecret">,
-): string {
+export function requestProtoOf(req: MinimalRequest, config: Pick<Config, "backendProxySecret">): string {
   if (isTrustedProxyRequest(req, config)) {
     const proto = header(req, "x-forwarded-proto").split(",")[0].trim().toLowerCase();
     if (proto === "https" || proto === "http") return proto;
@@ -111,25 +99,17 @@ export function originMatchesPattern(origin: string, pattern: string): boolean {
  * are set on every non-@Public route; the 401 is a belt-and-braces guard for misuse.
  */
 export function principalOf(req: AuthedRequest): { user: UserEntity; session: SessionEntity } {
-  if (!req.user || !req.session)
-    throw new ApiError(401, "unauthenticated", "authentication required");
+  if (!req.user || !req.session) throw new ApiError(401, "unauthenticated", "authentication required");
   return { user: req.user, session: req.session };
 }
 
 /** The session on a @Public route, when the browser presented one (the login routes' "link mode"). */
-export function optionalPrincipalOf(
-  req: AuthedRequest,
-): { user: UserEntity; session: SessionEntity } | null {
+export function optionalPrincipalOf(req: AuthedRequest): { user: UserEntity; session: SessionEntity } | null {
   return req.user && req.session ? { user: req.user, session: req.session } : null;
 }
 
 /** The audit actor behind a session-only request (admin sessions act as `admin`). */
 export function actorOf(req: AuthedRequest): Actor {
   const { user, session } = principalOf(req);
-  return {
-    type: session.kind === "admin" ? "admin" : "user",
-    userId: user.id,
-    sessionId: session.id,
-    ip: req.clientIp ?? null,
-  };
+  return { type: session.kind === "admin" ? "admin" : "user", userId: user.id, sessionId: session.id, ip: req.clientIp ?? null };
 }

@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  type OnApplicationBootstrap,
-  type OnModuleDestroy,
-} from "@nestjs/common";
+import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from "@nestjs/common";
 
 import { KycEventProcessingError, KycService } from "../services/kyc.service";
 import { type ConsumedMessage, NatsService } from "../services/nats.service";
@@ -30,10 +25,7 @@ export const KYC_WEBHOOK_SWEEP_MIN_AGE_MS = 2 * 60_000;
 
 /** NAK delay for the attempt that just failed (`attempt` ≥ 1). */
 export function kycWebhookNakDelayMs(attempt: number): number {
-  return Math.min(
-    KYC_WEBHOOK_NAK_DELAY_MAX_MS,
-    KYC_WEBHOOK_NAK_DELAY_MS * 2 ** Math.max(0, attempt - 1),
-  );
+  return Math.min(KYC_WEBHOOK_NAK_DELAY_MAX_MS, KYC_WEBHOOK_NAK_DELAY_MS * 2 ** Math.max(0, attempt - 1));
 }
 
 /**
@@ -64,13 +56,9 @@ export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDest
     this.timer = setInterval(() => void this.sweep(), KYC_WEBHOOK_SWEEP_MS);
     this.timer.unref();
     try {
-      await this.nats.consume(KYC_WEBHOOK_CONSUMER, KYC_WEBHOOK_FILTER, (msg) =>
-        this.onWebhook(msg),
-      );
+      await this.nats.consume(KYC_WEBHOOK_CONSUMER, KYC_WEBHOOK_FILTER, (msg) => this.onWebhook(msg));
     } catch (err) {
-      this.logger.error(
-        `could not start the ${KYC_WEBHOOK_FILTER} consumer: ${(err as Error).message}`,
-      );
+      this.logger.error(`could not start the ${KYC_WEBHOOK_FILTER} consumer: ${(err as Error).message}`);
       this.sentry.captureException(err, { processor: "kyc-webhook" });
     }
   }
@@ -81,10 +69,7 @@ export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDest
 
   /** Payload `{ eventId }` only (ids, never PII). */
   async onWebhook(msg: ConsumedMessage): Promise<void> {
-    const data = (typeof msg.data === "object" && msg.data !== null ? msg.data : {}) as Record<
-      string,
-      unknown
-    >;
+    const data = (typeof msg.data === "object" && msg.data !== null ? msg.data : {}) as Record<string, unknown>;
     const eventId = typeof data.eventId === "string" ? data.eventId : null;
     if (!eventId) {
       this.logger.warn(`ignoring malformed ${msg.subject} event`);
@@ -94,24 +79,18 @@ export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDest
     try {
       const outcome = await this.kyc.applyEvent(eventId);
       if (outcome.outcome === "applied" && outcome.changed) {
-        this.logger.log(
-          `event ${eventId}: verification ${outcome.verificationId} → ${outcome.status}`,
-        );
+        this.logger.log(`event ${eventId}: verification ${outcome.verificationId} → ${outcome.status}`);
       }
       msg.ack();
     } catch (err) {
       if (err instanceof KycEventProcessingError) {
         if (err.retryable && err.attempts < KYC_WEBHOOK_MAX_ATTEMPTS) {
           const delay = kycWebhookNakDelayMs(err.attempts);
-          this.logger.warn(
-            `event ${eventId}: attempt ${err.attempts} failed (${err.message}); retrying in ${delay} ms`,
-          );
+          this.logger.warn(`event ${eventId}: attempt ${err.attempts} failed (${err.message}); retrying in ${delay} ms`);
           msg.nak(delay);
           return;
         }
-        this.logger.error(
-          `event ${eventId}: giving up after ${err.attempts} attempt(s): ${err.message}`,
-        );
+        this.logger.error(`event ${eventId}: giving up after ${err.attempts} attempt(s): ${err.message}`);
         this.sentry.captureException(err, { processor: "kyc-webhook", eventId });
         msg.term();
         return;
@@ -134,24 +113,15 @@ export class KycWebhookProcessor implements OnApplicationBootstrap, OnModuleDest
     }
     let republished = 0;
     try {
-      const rows = await this.kyc.unprocessedWebhookEvents(
-        KYC_WEBHOOK_SWEEP_MIN_AGE_MS,
-        KYC_WEBHOOK_MAX_ATTEMPTS,
-        KYC_WEBHOOK_RETRY_COOLDOWN_MS,
-      );
+      const rows = await this.kyc.unprocessedWebhookEvents(KYC_WEBHOOK_SWEEP_MIN_AGE_MS, KYC_WEBHOOK_MAX_ATTEMPTS, KYC_WEBHOOK_RETRY_COOLDOWN_MS);
       for (const row of rows) {
         const provider: KycProviderName = row.provider === "sumsub" ? "sumsub" : "mock";
         // A distinct msgId per sweep: the original publish used the bare event key and JetStream
         // would otherwise drop the re-publish as a duplicate inside its window.
-        await this.kyc.publishWebhookTrigger(
-          provider,
-          row.id,
-          `${row.eventKey}:sweep:${Date.now()}`,
-        );
+        await this.kyc.publishWebhookTrigger(provider, row.id, `${row.eventKey}:sweep:${Date.now()}`);
         republished += 1;
       }
-      if (republished > 0)
-        this.logger.log(`sweep: re-published ${republished} unprocessed webhook event(s)`);
+      if (republished > 0) this.logger.log(`sweep: re-published ${republished} unprocessed webhook event(s)`);
     } catch (err) {
       this.logger.error(`sweep failed: ${(err as Error).message}`);
       this.sentry.captureException(err, { processor: "kyc-webhook" });

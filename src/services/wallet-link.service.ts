@@ -112,21 +112,13 @@ export class WalletLinkService {
   }
 
   /** §8.1. `verified` comes from WalletChallengeService.verify (never from the client). No ledger I/O, no identity. */
-  async link(
-    userId: string,
-    verified: VerifiedWallet,
-    opts: { label?: string | null; actor: Actor },
-  ): Promise<LinkResult> {
+  async link(userId: string, verified: VerifiedWallet, opts: { label?: string | null; actor: Actor }): Promise<LinkResult> {
     const partyId = verified.partyId.trim();
     if (!WALLET_KIND_ALLOWLIST.includes(verified.kind)) {
       throw new ApiError(400, "validation_failed", `wallet kind ${verified.kind} is not supported`);
     }
     if (this.config.treasuryPartyId && partyId === this.config.treasuryPartyId) {
-      throw new ApiError(
-        400,
-        "validation_failed",
-        "the treasury party cannot be linked as a user wallet",
-      );
+      throw new ApiError(400, "validation_failed", "the treasury party cannot be linked as a user wallet");
     }
 
     // The party → first-account binding IS this row (active or revoked).
@@ -138,8 +130,7 @@ export class WalletLinkService {
 
     const user = await this.users.findById(userId);
     if (!user) throw new ApiError(404, "not_found", "user not found");
-    if (user.status !== "active")
-      throw new ApiError(403, "user_suspended", "this account is suspended");
+    if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
 
     const now = new Date();
     const label = opts.label === undefined ? undefined : clipLabel(opts.label);
@@ -149,9 +140,7 @@ export class WalletLinkService {
       const repo = manager.getRepository(WalletEntity);
       const fresh = await manager.getRepository(UserEntity).findOne({ where: { id: userId } });
       if (!fresh) throw new ApiError(404, "not_found", "user not found");
-      const currentPrimary = await repo.findOne({
-        where: { userId, isPrimary: true, status: "active" },
-      });
+      const currentPrimary = await repo.findOne({ where: { userId, isPrimary: true, status: "active" } });
 
       // The first wallet becomes primary and sets users.party_id (§8.1–8.2); a party that IS
       // users.party_id is the primary by definition (relink of the primary after an admin unlink).
@@ -159,12 +148,7 @@ export class WalletLinkService {
 
       let row = await repo.findOne({ where: { partyId } });
       if (row) {
-        if (row.userId !== userId)
-          throw new ApiError(
-            409,
-            "wallet_already_linked",
-            "this wallet is linked to another account",
-          );
+        if (row.userId !== userId) throw new ApiError(409, "wallet_already_linked", "this wallet is linked to another account");
         row.status = "active";
         row.revokedAt = null;
         row.publicKey = verified.publicKeyBase64;
@@ -250,11 +234,7 @@ export class WalletLinkService {
       return row;
     });
 
-    void this.nats.publishSafe(NatsSubjects.walletLinked, {
-      userId,
-      walletId: wallet.id,
-      relinked: Boolean(existing),
-    });
+    void this.nats.publishSafe(NatsSubjects.walletLinked, { userId, walletId: wallet.id, relinked: Boolean(existing) });
     return { wallet };
   }
 
@@ -266,25 +246,15 @@ export class WalletLinkService {
    */
   async unlink(userId: string, walletId: string, actor: Actor): Promise<void> {
     const wallet = await this.wallets.findOne({ where: { id: walletId, userId } });
-    if (!wallet || wallet.status !== "active")
-      throw new ApiError(404, "not_found", "wallet not found");
+    if (!wallet || wallet.status !== "active") throw new ApiError(404, "not_found", "wallet not found");
 
     const user = await this.users.findById(userId);
     if (user?.partyId && user.partyId === wallet.partyId) {
-      throw new ApiError(
-        409,
-        "primary_wallet_in_use",
-        "the primary wallet owns the in-app balance and cannot be unlinked",
-      );
+      throw new ApiError(409, "primary_wallet_in_use", "the primary wallet owns the in-app balance and cannot be unlinked");
     }
 
     await this.dataSource.transaction(async (manager) => {
-      await manager
-        .getRepository(WalletEntity)
-        .update(
-          { id: walletId, status: "active" },
-          { status: "revoked", isPrimary: false, revokedAt: new Date() },
-        );
+      await manager.getRepository(WalletEntity).update({ id: walletId, status: "active" }, { status: "revoked", isPrimary: false, revokedAt: new Date() });
       await this.audit.record(
         {
           actorType: actor.type,
@@ -308,67 +278,36 @@ export class WalletLinkService {
    * therefore permanent once a deposit exists.
    */
   async setPrimary(userId: string, walletId: string, actor: Actor): Promise<WalletEntity> {
-    const lock = await this.redis.acquireLock(
-      `lock:deposit:${userId}`,
-      this.config.depositLockTtlMs,
-    );
-    if (!lock.acquired)
-      throw new ApiError(
-        409,
-        "deposit_in_progress",
-        "a deposit reconciliation is in progress; try again shortly",
-      );
+    const lock = await this.redis.acquireLock(`lock:deposit:${userId}`, this.config.depositLockTtlMs);
+    if (!lock.acquired) throw new ApiError(409, "deposit_in_progress", "a deposit reconciliation is in progress; try again shortly");
     try {
       const wallet = await this.wallets.findOne({ where: { id: walletId, userId } });
       if (!wallet) throw new ApiError(404, "not_found", "wallet not found");
-      if (wallet.status !== "active")
-        throw new ApiError(
-          409,
-          "primary_wallet_in_use",
-          "a revoked wallet cannot become primary; relink it first",
-        );
+      if (wallet.status !== "active") throw new ApiError(409, "primary_wallet_in_use", "a revoked wallet cannot become primary; relink it first");
 
       const user = await this.users.findById(userId);
       if (!user) throw new ApiError(404, "not_found", "user not found");
-      if (user.status !== "active")
-        throw new ApiError(403, "user_suspended", "this account is suspended");
+      if (user.status !== "active") throw new ApiError(403, "user_suspended", "this account is suspended");
       if (wallet.isPrimary && user.partyId === wallet.partyId) return wallet;
 
       if (user.partyId) {
         const onLedger = await this.ledger.fetchUserWallet(user.partyId, { uncached: true });
         if (onLedger) {
-          throw new ApiError(
-            409,
-            "primary_wallet_in_use",
-            "the primary wallet already owns an on-ledger in-app balance and is permanent",
-            {
-              primaryPartyId: user.partyId,
-            },
-          );
+          throw new ApiError(409, "primary_wallet_in_use", "the primary wallet already owns an on-ledger in-app balance and is permanent", {
+            primaryPartyId: user.partyId,
+          });
         }
         const pending = await this.ledger.fetchPendingPayouts({ uncached: true });
         if (pending.some((p) => p.user === user.partyId)) {
-          throw new ApiError(
-            409,
-            "primary_wallet_in_use",
-            "payouts addressed to the primary wallet are still pending",
-          );
+          throw new ApiError(409, "primary_wallet_in_use", "payouts addressed to the primary wallet are still pending");
         }
       }
       const pinned = await this.dataSource
         .getRepository(PayoutEntity)
         .count({ where: { userId, status: In([...PAYOUT_PINNING_STATUSES]) } });
-      if (pinned > 0)
-        throw new ApiError(
-          409,
-          "primary_wallet_in_use",
-          "payouts addressed to the primary wallet are still queued",
-        );
-      const inFlight = await this.dataSource
-        .getRepository(DepositCreditEntity)
-        .count({ where: { userId, status: "submitted" } });
-      if (inFlight > 0)
-        throw new ApiError(409, "deposit_in_progress", "a deposit credit is still being confirmed");
+      if (pinned > 0) throw new ApiError(409, "primary_wallet_in_use", "payouts addressed to the primary wallet are still queued");
+      const inFlight = await this.dataSource.getRepository(DepositCreditEntity).count({ where: { userId, status: "submitted" } });
+      if (inFlight > 0) throw new ApiError(409, "deposit_in_progress", "a deposit credit is still being confirmed");
 
       const from = user.partyId;
       const updated = await this.dataSource.transaction(async (manager) => {
@@ -396,12 +335,7 @@ export class WalletLinkService {
         );
         return (await repo.findOne({ where: { id: wallet.id } })) ?? { ...wallet, isPrimary: true };
       });
-      void this.nats.publishSafe(NatsSubjects.walletPrimaryChanged, {
-        userId,
-        walletId: wallet.id,
-        from,
-        to: wallet.partyId,
-      });
+      void this.nats.publishSafe(NatsSubjects.walletPrimaryChanged, { userId, walletId: wallet.id, from, to: wallet.partyId });
       return updated;
     } finally {
       await lock.release();
@@ -433,10 +367,7 @@ export class WalletLinkService {
     return out;
   }
 
-  toApi(
-    wallet: WalletEntity,
-    extras?: { ownLedgerWallet?: LedgerWallet | null; receivedCC?: bigint },
-  ): ApiWallet {
+  toApi(wallet: WalletEntity, extras?: { ownLedgerWallet?: LedgerWallet | null; receivedCC?: bigint }): ApiWallet {
     return walletToApi(wallet, extras ?? {});
   }
 }

@@ -48,9 +48,7 @@ export class LedgerClientService {
   }
 
   isConfigured(): boolean {
-    return Boolean(
-      this.baseUrl && this.config.treasuryPartyId && this.config.truthoraclePackageName,
-    );
+    return Boolean(this.baseUrl && this.config.treasuryPartyId && this.config.truthoraclePackageName);
   }
 
   /** Package-id form, for Create/Exercise commands (pins the exact package version). */
@@ -72,10 +70,7 @@ export class LedgerClientService {
     return `#${name}:${module}:${entity}`;
   }
 
-  private async ledger<T>(
-    path: string,
-    options: { method?: "GET" | "POST"; body?: unknown } = {},
-  ): Promise<T> {
+  private async ledger<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}): Promise<T> {
     const base = this.baseUrl;
     if (!base) throw new ApiError(502, "upstream_failed", "Ledger API URL is not configured");
     const token = await this.keycloak.bearerFor("ledger");
@@ -84,11 +79,7 @@ export class LedgerClientService {
     } catch (err) {
       if (err instanceof UpstreamError) {
         this.logger.warn(`ledger ${options.method ?? "GET"} ${path} → ${err.status || "network"}`);
-        throw new ApiError(
-          502,
-          "upstream_failed",
-          `ledger read failed (${err.status || "network"})`,
-        );
+        throw new ApiError(502, "upstream_failed", `ledger read failed (${err.status || "network"})`);
       }
       throw err;
     }
@@ -124,10 +115,7 @@ export class LedgerClientService {
                 {
                   identifierFilter: {
                     TemplateFilter: {
-                      value: {
-                        templateId: this.filterTemplateId(entity, module),
-                        includeCreatedEventBlob: false,
-                      },
+                      value: { templateId: this.filterTemplateId(entity, module), includeCreatedEventBlob: false },
                     },
                   },
                 },
@@ -143,27 +131,18 @@ export class LedgerClientService {
     const items: unknown[] = Array.isArray(r)
       ? r
       : Array.isArray((r as { activeContracts?: unknown }).activeContracts)
-        ? (r as { activeContracts: unknown[] }).activeContracts
+        ? ((r as { activeContracts: unknown[] }).activeContracts)
         : Array.isArray((r as { contracts?: unknown }).contracts)
-          ? (r as { contracts: unknown[] }).contracts
+          ? ((r as { contracts: unknown[] }).contracts)
           : [];
     const out: ActiveContract[] = [];
     for (const item of items) {
-      const event = (
-        item as {
-          contractEntry?: {
-            JsActiveContract?: {
-              createdEvent?: { contractId?: unknown; createArgument?: unknown };
-            };
-          };
-        }
-      )?.contractEntry?.JsActiveContract?.createdEvent;
+      const event = (item as { contractEntry?: { JsActiveContract?: { createdEvent?: { contractId?: unknown; createArgument?: unknown } } } })
+        ?.contractEntry?.JsActiveContract?.createdEvent;
       if (!event?.contractId) continue;
       out.push({
         contractId: asString(event.contractId),
-        payload: (event.createArgument && typeof event.createArgument === "object"
-          ? event.createArgument
-          : {}) as Record<string, unknown>,
+        payload: (event.createArgument && typeof event.createArgument === "object" ? event.createArgument : {}) as Record<string, unknown>,
       });
     }
     if (this.config.ledgerCacheMs > 0) {
@@ -184,15 +163,8 @@ export class LedgerClientService {
     try {
       depositRefs = parseDepositRefs(p.depositRefs);
     } catch (err) {
-      this.logger.error(
-        `UserWallet ${row.contractId} (owner ${asString(p.owner)}): ${(err as Error).message}; is TRUTHORACLE_PACKAGE_ID the deployed truthoracle-v16?`,
-      );
-      throw new ApiError(
-        502,
-        "upstream_failed",
-        "ledger returned a UserWallet without depositRefs",
-        { contractId: row.contractId },
-      );
+      this.logger.error(`UserWallet ${row.contractId} (owner ${asString(p.owner)}): ${(err as Error).message}; is TRUTHORACLE_PACKAGE_ID the deployed truthoracle-v16?`);
+      throw new ApiError(502, "upstream_failed", "ledger returned a UserWallet without depositRefs", { contractId: row.contractId });
     }
     return {
       contractId: row.contractId,
@@ -220,19 +192,11 @@ export class LedgerClientService {
     if (mine.length > 1) {
       const cids = mine.map((r) => r.contractId);
       this.logger.error(`${mine.length} active UserWallets for ${ownerParty}: ${cids.join(", ")}`);
-      this.sentry.captureMessage("duplicate UserWallet contracts for one owner", "error", {
-        owner: ownerParty,
-        count: String(mine.length),
+      this.sentry.captureMessage("duplicate UserWallet contracts for one owner", "error", { owner: ownerParty, count: String(mine.length) });
+      throw new ApiError(409, "deposit_attribution_drift", "more than one in-app wallet exists for this party; an operator has been notified", {
+        kind: "duplicate_user_wallet",
+        contractIds: cids,
       });
-      throw new ApiError(
-        409,
-        "deposit_attribution_drift",
-        "more than one in-app wallet exists for this party; an operator has been notified",
-        {
-          kind: "duplicate_user_wallet",
-          contractIds: cids,
-        },
-      );
     }
     return mine.length === 1 ? this.walletFrom(mine[0]) : null;
   }
@@ -246,10 +210,7 @@ export class LedgerClientService {
     const p = row.payload;
     // Field names mirror truthoracle-contracts/daml/daml/Truthoracle.daml (PendingPayout) — the payee is `user`.
     const createdAtRaw = p.createdAt ?? p.created_at;
-    const createdAt =
-      typeof createdAtRaw === "string" && !Number.isNaN(Date.parse(createdAtRaw))
-        ? new Date(createdAtRaw)
-        : null;
+    const createdAt = typeof createdAtRaw === "string" && !Number.isNaN(Date.parse(createdAtRaw)) ? new Date(createdAtRaw) : null;
     return {
       contractId: row.contractId,
       user: asString(p.user),
@@ -266,10 +227,7 @@ export class LedgerClientService {
   }
 
   /** One PendingPayout by contract id, or null when it is already archived. */
-  async fetchPendingPayout(
-    cid: string,
-    opts: ReadOptions = {},
-  ): Promise<PendingPayoutRecord | null> {
+  async fetchPendingPayout(cid: string, opts: ReadOptions = {}): Promise<PendingPayoutRecord | null> {
     const rows = await this.activeContracts(this.config.treasuryPartyId, "PendingPayout", opts);
     for (const row of rows) {
       if (row.contractId !== cid) continue;
@@ -287,11 +245,7 @@ export class LedgerClientService {
  * credit itself is always an `Exercise Deposit { amountCC, txRef }` on the wallet that exists,
  * which is what appends `txRef` to `depositRefs` (mandatory `[Text]` on truthoracle-v16).
  */
-export function userWalletCreateCommand(input: {
-  templateId: string;
-  admin: string;
-  owner: string;
-}): unknown {
+export function userWalletCreateCommand(input: { templateId: string; admin: string; owner: string }): unknown {
   const zero = formatCC(0n);
   return {
     CreateCommand: {
@@ -321,9 +275,7 @@ export function walletCreateCommandIdFor(ownerParty: string): string {
  */
 export function parseDepositRefs(value: unknown): string[] {
   if (!Array.isArray(value)) {
-    throw new Error(
-      `UserWallet.depositRefs is ${value === undefined ? "missing" : `not a list (${JSON.stringify(value)})`}`,
-    );
+    throw new Error(`UserWallet.depositRefs is ${value === undefined ? "missing" : `not a list (${JSON.stringify(value)})`}`);
   }
   return value.map((v) => String(v));
 }

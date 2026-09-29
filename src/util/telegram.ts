@@ -66,10 +66,7 @@ function hashMatches(expectedHex: string, actual: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-function checkFreshness(
-  authDateRaw: string | undefined,
-  opts: TelegramVerifyOptions,
-): string | null {
+function checkFreshness(authDateRaw: string | undefined, opts: TelegramVerifyOptions): string | null {
   if (!authDateRaw || !/^\d{1,12}$/.test(authDateRaw)) return "auth_date missing or malformed";
   const authDate = Number(authDateRaw);
   const now = opts.now ?? Math.floor(Date.now() / 1000);
@@ -79,15 +76,7 @@ function checkFreshness(
 }
 
 /** Only the documented widget fields are considered; anything else is dropped before hashing. */
-const WIDGET_FIELDS = [
-  "id",
-  "first_name",
-  "last_name",
-  "username",
-  "photo_url",
-  "auth_date",
-  "hash",
-] as const;
+const WIDGET_FIELDS = ["id", "first_name", "last_name", "username", "photo_url", "auth_date", "hash"] as const;
 
 /** Normalise a JSON body (numbers → strings, unknown keys dropped) into widget fields. */
 export function parseWidgetPayload(body: unknown): Record<string, string> {
@@ -160,8 +149,7 @@ export function verifyMiniAppInitData(
   } catch {
     return { ok: false, reason: "user field is not JSON" };
   }
-  if (!userJson || typeof userJson !== "object")
-    return { ok: false, reason: "user field is not an object" };
+  if (!userJson || typeof userJson !== "object") return { ok: false, reason: "user field is not an object" };
   const u = userJson as Record<string, unknown>;
   const id = typeof u.id === "number" || typeof u.id === "string" ? String(u.id) : "";
   if (!/^\d{1,20}$/.test(id)) return { ok: false, reason: "user id missing" };

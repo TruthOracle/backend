@@ -69,11 +69,9 @@ export class AuditService {
     limit: number;
   }): Promise<{ items: AuditEventEntity[]; total: number }> {
     const qb = this.repo.createQueryBuilder("a").orderBy("a.id", "DESC");
-    if (filter.subjectType)
-      qb.andWhere("a.subject_type = :subjectType", { subjectType: filter.subjectType });
+    if (filter.subjectType) qb.andWhere("a.subject_type = :subjectType", { subjectType: filter.subjectType });
     if (filter.subjectId) qb.andWhere("a.subject_id = :subjectId", { subjectId: filter.subjectId });
-    if (filter.actorUserId)
-      qb.andWhere("a.actor_user_id = :actorUserId", { actorUserId: filter.actorUserId });
+    if (filter.actorUserId) qb.andWhere("a.actor_user_id = :actorUserId", { actorUserId: filter.actorUserId });
     const page = Math.max(1, filter.page);
     const limit = Math.min(100, Math.max(1, filter.limit));
     const [items, total] = await qb
@@ -84,21 +82,14 @@ export class AuditService {
   }
 
   /** The user's own trail: events they performed OR that concern them. */
-  async listForUser(
-    userId: string,
-    page: number,
-    limit: number,
-  ): Promise<{ items: AuditEventEntity[]; total: number }> {
+  async listForUser(userId: string, page: number, limit: number): Promise<{ items: AuditEventEntity[]; total: number }> {
     const p = Math.max(1, page);
     const l = Math.min(100, Math.max(1, limit));
     const [items, total] = await this.repo
       .createQueryBuilder("a")
       // Two parameters on purpose: one placeholder compared with a uuid AND a text column makes
       // Postgres refuse the statement ("inconsistent types deduced for parameter").
-      .where(
-        "a.actor_user_id = :actorUserId OR (a.subject_type = 'user' AND a.subject_id = :subjectId)",
-        { actorUserId: userId, subjectId: userId },
-      )
+      .where("a.actor_user_id = :actorUserId OR (a.subject_type = 'user' AND a.subject_id = :subjectId)", { actorUserId: userId, subjectId: userId })
       .orderBy("a.id", "DESC")
       .skip((p - 1) * l)
       .take(l)

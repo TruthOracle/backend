@@ -36,8 +36,7 @@ export function parseCC(input: string | number | bigint): bigint {
   const negative = m[1] === "-";
   const whole = m[2] || "0";
   const frac = m[3] ?? "";
-  let units =
-    BigInt(whole) * CC_SCALE + BigInt((frac + "0".repeat(CC_DECIMALS)).slice(0, CC_DECIMALS));
+  let units = BigInt(whole) * CC_SCALE + BigInt((frac + "0".repeat(CC_DECIMALS)).slice(0, CC_DECIMALS));
   if (frac.length > CC_DECIMALS) {
     const nextDigit = Number(frac[CC_DECIMALS]);
     if (nextDigit >= 5) units += 1n;
@@ -47,8 +46,7 @@ export function parseCC(input: string | number | bigint): bigint {
 
 /** `null` instead of throwing — for upstream rows whose shape is not pinned. */
 export function tryParseCC(input: unknown): bigint | null {
-  if (typeof input !== "string" && typeof input !== "number" && typeof input !== "bigint")
-    return null;
+  if (typeof input !== "string" && typeof input !== "number" && typeof input !== "bigint") return null;
   try {
     return parseCC(input);
   } catch {

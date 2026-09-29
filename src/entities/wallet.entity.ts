@@ -58,14 +58,7 @@ export class WalletEntity {
   status!: WalletStatus;
 
   /** In-app credits attributed to this wallet by the backend (the only attribution there is — §8.3). */
-  @Column({
-    name: "credited_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
+  @Column({ name: "credited_cc", type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
   creditedCC!: bigint;
 
   @Column({ name: "verified_at", type: "timestamptz" })

@@ -1,16 +1,4 @@
-import {
-  Body,
-  Controller,
-  Get,
-  HttpCode,
-  Inject,
-  Param,
-  ParseUUIDPipe,
-  Post,
-  Query,
-  Req,
-  UseGuards,
-} from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Inject, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { AdminGuard } from "../auth/admin.guard";
@@ -186,12 +174,7 @@ export class AdminController {
     @Body() body: AdminPersonTransferDto,
     @Req() req: AuthedRequest,
   ): Promise<{ ok: true }> {
-    return this.admin.transferPerson(
-      params.fingerprint,
-      body.toUserId,
-      body.reason,
-      adminActorOf(req),
-    );
+    return this.admin.transferPerson(params.fingerprint, body.toUserId, body.reason, adminActorOf(req));
   }
 
   /** Operator escape hatch for a stored webhook the durable consumer gave up on (RUNBOOK §4). */
@@ -219,11 +202,7 @@ export class AdminController {
     @Body() body: AdminPayoutSettleDto,
     @Req() req: AuthedRequest,
   ): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
-    return this.admin.settlePayout(
-      params.cid,
-      { force: body.force === true, reason: body.reason },
-      adminActorOf(req),
-    );
+    return this.admin.settlePayout(params.cid, { force: body.force === true, reason: body.reason }, adminActorOf(req));
   }
 
   // ──────────────────────────────────────────── audit ──────────────────────────────────────────

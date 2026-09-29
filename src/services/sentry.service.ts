@@ -21,12 +21,9 @@ export class SentryService {
     Sentry.captureException(err, tags ? { tags } : undefined);
   }
 
-  captureMessage(
-    message: string,
-    level: "info" | "warning" | "error" = "warning",
-    tags?: Record<string, string>,
-  ): void {
+  captureMessage(message: string, level: "info" | "warning" | "error" = "warning", tags?: Record<string, string>): void {
     if (!this.enabled) return;
     Sentry.captureMessage(message, { level, ...(tags ? { tags } : {}) });
   }
+
 }

@@ -152,7 +152,9 @@ export class MarketsController {
   }
 
   @Get(":market/attestations")
-  async attestations(@Param("market") ref: string): Promise<{ attestations: ApiAttestation[] }> {
+  async attestations(
+    @Param("market") ref: string,
+  ): Promise<{ attestations: ApiAttestation[] }> {
     const market = await this.markets.resolve(ref);
     return this.markets.attestations(market.marketId).then((attestations) => ({ attestations }));
   }

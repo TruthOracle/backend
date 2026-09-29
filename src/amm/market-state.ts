@@ -21,7 +21,8 @@ export type AmmMarketRow = Pick<
 
 export const decimalToNumber = (units: bigint): number => Number(formatCC(units));
 /** Doubles → 1e-10 units, rounded half away from zero at the 10th decimal (never truncated). */
-export const numberToDecimal = (n: number): bigint => parseCC(Number.isFinite(n) ? n : 0);
+export const numberToDecimal = (n: number): bigint =>
+  parseCC(Number.isFinite(n) ? n : 0);
 
 export function ammStateOf(m: AmmMarketRow): AmmMarketState {
   return {

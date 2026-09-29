@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  type OnApplicationBootstrap,
-  type OnModuleDestroy,
-} from "@nestjs/common";
+import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from "@nestjs/common";
 
 import { Config } from "../config";
 import { type ConsumedMessage, NatsService } from "../services/nats.service";
@@ -43,14 +38,10 @@ export class PayoutSettlementProcessor implements OnApplicationBootstrap, OnModu
     this.timer = setInterval(() => void this.tick(), this.config.payoutScanMs);
     this.timer.unref();
     try {
-      await this.nats.consume(KYC_STATUS_CONSUMER, NatsSubjects.kycStatusChanged, (msg) =>
-        this.onKycStatusChanged(msg),
-      );
+      await this.nats.consume(KYC_STATUS_CONSUMER, NatsSubjects.kycStatusChanged, (msg) => this.onKycStatusChanged(msg));
     } catch (err) {
       // Scanning still works without the consumer; approvals then take effect on the next user retry.
-      this.logger.error(
-        `could not start the ${NatsSubjects.kycStatusChanged} consumer: ${(err as Error).message}`,
-      );
+      this.logger.error(`could not start the ${NatsSubjects.kycStatusChanged} consumer: ${(err as Error).message}`);
       this.sentry.captureException(err, { processor: "payout-settlement" });
     }
   }
@@ -87,17 +78,9 @@ export class PayoutSettlementProcessor implements OnApplicationBootstrap, OnModu
    * message is NAKed and retried.
    */
   async onKycStatusChanged(msg: ConsumedMessage): Promise<void> {
-    const data = (typeof msg.data === "object" && msg.data !== null ? msg.data : {}) as Record<
-      string,
-      unknown
-    >;
+    const data = (typeof msg.data === "object" && msg.data !== null ? msg.data : {}) as Record<string, unknown>;
     const userId = typeof data.userId === "string" ? data.userId : null;
-    const status =
-      typeof data.status === "string"
-        ? data.status
-        : typeof data.kycStatus === "string"
-          ? data.kycStatus
-          : null;
+    const status = typeof data.status === "string" ? data.status : typeof data.kycStatus === "string" ? data.kycStatus : null;
     if (!userId || !status) {
       this.logger.warn(`ignoring malformed ${msg.subject} event`);
       msg.term();

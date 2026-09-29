@@ -57,30 +57,20 @@ export class GoogleAuthService {
    * Verifies the credential and returns the identity claim. The nonce is consumed BEFORE the
    * token is verified, so a bad token burns it (same rule as wallet challenges).
    */
-  async verifyCredential(
-    credential: string,
-    nonce: string | null | undefined,
-  ): Promise<IdentityClaim> {
+  async verifyCredential(credential: string, nonce: string | null | undefined): Promise<IdentityClaim> {
     this.requireConfigured();
     const idToken = typeof credential === "string" ? credential.trim() : "";
     if (!idToken) throw new ApiError(400, "validation_failed", "credential is required");
 
     const presented = typeof nonce === "string" ? nonce.trim() : "";
     if (this.config.googleNonceRequired && !presented) {
-      throw new ApiError(
-        400,
-        "validation_failed",
-        "nonce is required: call POST /auth/google/nonce first",
-      );
+      throw new ApiError(400, "validation_failed", "nonce is required: call POST /auth/google/nonce first");
     }
     if (presented) await this.consumeNonce(presented);
 
     let payload: TokenPayload | undefined;
     try {
-      const ticket = await this.client.verifyIdToken({
-        idToken,
-        audience: this.config.googleClientIds,
-      });
+      const ticket = await this.client.verifyIdToken({ idToken, audience: this.config.googleClientIds });
       payload = ticket.getPayload();
     } catch (err) {
       this.logger.warn(`google credential rejected: ${safeMessage(err)}`);
@@ -92,10 +82,7 @@ export class GoogleAuthService {
     if (payload.email_verified !== true) {
       throw new ApiError(401, "invalid_credential", "google account email is not verified");
     }
-    if (
-      presented &&
-      (typeof payload.nonce !== "string" || !timingSafeStringEqual(payload.nonce, presented))
-    ) {
+    if (presented && (typeof payload.nonce !== "string" || !timingSafeStringEqual(payload.nonce, presented))) {
       throw new ApiError(401, "invalid_credential", "google credential nonce does not match");
     }
 
@@ -109,11 +96,7 @@ export class GoogleAuthService {
 
   private requireConfigured(): void {
     if (!this.isConfigured()) {
-      throw new ApiError(
-        503,
-        "upstream_failed",
-        "google sign-in is not configured (GOOGLE_CLIENT_IDS)",
-      );
+      throw new ApiError(503, "upstream_failed", "google sign-in is not configured (GOOGLE_CLIENT_IDS)");
     }
   }
 
@@ -125,11 +108,9 @@ export class GoogleAuthService {
     if (!NONCE_RE.test(nonce)) throw new ApiError(401, "invalid_credential", "nonce is malformed");
     const key = nonceKey(nonce);
     const issued = await this.redis.get(`gnonce:${key}`);
-    if (!issued)
-      throw new ApiError(401, "invalid_credential", "nonce unknown, expired or already used");
+    if (!issued) throw new ApiError(401, "invalid_credential", "nonce unknown, expired or already used");
     const claimed = await this.redis.claimOnce(`gnonce_used:${key}`, GOOGLE_NONCE_TTL_MS);
     await this.redis.del(`gnonce:${key}`);
-    if (!claimed)
-      throw new ApiError(401, "invalid_credential", "nonce unknown, expired or already used");
+    if (!claimed) throw new ApiError(401, "invalid_credential", "nonce unknown, expired or already used");
   }
 }

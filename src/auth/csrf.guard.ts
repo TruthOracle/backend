@@ -27,17 +27,12 @@ export class CsrfGuard implements CanActivate {
     if (SAFE_METHODS.has(req.method.toUpperCase())) return true;
     if (req.authKind === "bearer") return true;
 
-    const isPublic =
-      this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
-        context.getHandler(),
-        context.getClass(),
-      ]) === true;
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [context.getHandler(), context.getClass()]) === true;
     const path = (req.originalUrl ?? req.url ?? "").split("?")[0];
     if (isPublic && /^\/api\/v1\/webhooks(\/|$)/.test(path)) return true;
 
     const originHeader = firstHeader(req.headers.origin) || firstHeader(req.headers.referer);
-    if (!originHeader)
-      throw new ApiError(403, "csrf_rejected", "Origin header is required on non-GET requests");
+    if (!originHeader) throw new ApiError(403, "csrf_rejected", "Origin header is required on non-GET requests");
     const origin = originOf(originHeader);
     if (!origin || !this.originAllowed(origin, req)) {
       throw new ApiError(403, "csrf_rejected", "request origin is not allowed");
@@ -47,11 +42,7 @@ export class CsrfGuard implements CanActivate {
     const requestedWith = firstHeader(req.headers["x-requested-with"]).toLowerCase();
     const isJson = contentType.startsWith("application/json");
     if (!isJson && requestedWith !== "truthoracle") {
-      throw new ApiError(
-        403,
-        "csrf_rejected",
-        "non-GET requests must be application/json or carry x-requested-with: truthoracle",
-      );
+      throw new ApiError(403, "csrf_rejected", "non-GET requests must be application/json or carry x-requested-with: truthoracle");
     }
     return true;
   }

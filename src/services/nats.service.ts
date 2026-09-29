@@ -1,10 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  type BeforeApplicationShutdown,
-  type OnApplicationShutdown,
-  type OnModuleInit,
-} from "@nestjs/common";
+import { Injectable, Logger, type BeforeApplicationShutdown, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import {
   AckPolicy,
   DeliverPolicy,
@@ -83,9 +77,7 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
       reconnectTimeWait: 2_000,
     });
     this.healthy = true;
-    this.logger.log(
-      `connected to ${this.nc.getServer()} (nats-server v${this.nc.info?.version ?? "?"})`,
-    );
+    this.logger.log(`connected to ${this.nc.getServer()} (nats-server v${this.nc.info?.version ?? "?"})`);
     void this.nc.closed().then((err) => {
       this.healthy = false;
       if (err) this.logger.error(`connection closed: ${err.message}`);
@@ -165,22 +157,14 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
 
   /** Publish a JSON domain event; JetStream acks once the stream has persisted it. */
   async publish(subject: NatsSubject, payload: object, opts?: { msgId?: string }): Promise<void> {
-    await this.jetstream.publish(
-      subject,
-      JSON.stringify(payload),
-      opts?.msgId ? { msgID: opts.msgId } : undefined,
-    );
+    await this.jetstream.publish(subject, JSON.stringify(payload), opts?.msgId ? { msgID: opts.msgId } : undefined);
   }
 
   /**
    * Best-effort publish for events that describe a change which is ALREADY committed: a bus
    * outage must not fail the request that made the change, so the error is logged and swallowed.
    */
-  async publishSafe(
-    subject: NatsSubject,
-    payload: object,
-    opts?: { msgId?: string },
-  ): Promise<void> {
+  async publishSafe(subject: NatsSubject, payload: object, opts?: { msgId?: string }): Promise<void> {
     try {
       await this.publish(subject, payload, opts);
     } catch (err) {
@@ -198,14 +182,7 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
   async consume(durable: string, filterSubject: string, handler: ConsumeHandler): Promise<void> {
     const name = sanitizeDurable(durable);
     if (this.loops.has(name)) return;
-    const loop: ConsumerLoop = {
-      filterSubject,
-      handler,
-      messages: null,
-      done: null,
-      restarts: 0,
-      timer: null,
-    };
+    const loop: ConsumerLoop = { filterSubject, handler, messages: null, done: null, restarts: 0, timer: null };
     this.loops.set(name, loop);
     await this.startLoop(name, loop);
     this.logger.log(`consumer ${name} on ${filterSubject} started`);
@@ -223,18 +200,14 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
           await this.dispatch(name, m, loop.handler);
         }
       } catch (err) {
-        if (!this.stopping)
-          this.logger.error(`consumer ${name} loop ended: ${(err as Error).message}`);
+        if (!this.stopping) this.logger.error(`consumer ${name} loop ended: ${(err as Error).message}`);
       }
       if (!this.stopping) this.scheduleRestart(name, loop);
     })();
   }
 
   private scheduleRestart(name: string, loop: ConsumerLoop): void {
-    const delay = Math.min(
-      CONSUMER_RESTART_MAX_MS,
-      CONSUMER_RESTART_MIN_MS * 2 ** Math.min(loop.restarts, 10),
-    );
+    const delay = Math.min(CONSUMER_RESTART_MAX_MS, CONSUMER_RESTART_MIN_MS * 2 ** Math.min(loop.restarts, 10));
     loop.restarts += 1;
     this.logger.warn(`consumer ${name}: restarting in ${delay} ms (restart #${loop.restarts})`);
     loop.timer = setTimeout(() => {
@@ -279,9 +252,7 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
       await handler(wrapped);
       if (!settled) m.ack();
     } catch (err) {
-      this.logger.warn(
-        `consumer ${name}: handler failed on ${m.subject}: ${(err as Error).message}`,
-      );
+      this.logger.warn(`consumer ${name}: handler failed on ${m.subject}: ${(err as Error).message}`);
       if (!settled) m.nak(NAK_DELAY_MS);
     }
   }
@@ -352,9 +323,7 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
 function isSubjectOverlap(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const e = err as { err_code?: unknown; message?: unknown };
-  return (
-    e.err_code === 10065 || (typeof e.message === "string" && /subjects overlap/i.test(e.message))
-  );
+  return e.err_code === 10065 || (typeof e.message === "string" && /subjects overlap/i.test(e.message));
 }
 
 /** Consumer names may not contain `.`, `*`, `>`, whitespace or path separators. */
