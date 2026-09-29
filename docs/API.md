@@ -1,5 +1,8 @@
 # TruthOracle backend — HTTP API contract (v1)
 
+All times are UTC: ISO 8601 strings end in `Z`, epoch fields are seconds since the Unix epoch, and daily candles are UTC days.
+
+
 Shared contract between `truthoracle-backend` and the `truthoracle-canton` frontend. Every
 route is under `/api/v1` (frontend reaches it as `/__backend/api/v1/...`). Bodies and
 responses are JSON. Money is a **string with exactly 10 decimals** (`"12.5000000000"`),

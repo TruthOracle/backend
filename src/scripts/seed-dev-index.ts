@@ -13,6 +13,7 @@
  * the same shape the projection produces (docs/MARKETS.md §5), with one creation candle at the
  * market's first period.
  */
+import "../util/utc";
 import { join } from "node:path";
 import { DataSource, type QueryRunner } from "typeorm";
 

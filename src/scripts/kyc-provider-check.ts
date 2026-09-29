@@ -5,6 +5,7 @@
  * vendor dashboard must be configured with. Exit code 0 only when the probe passes. No
  * applicant data is read.
  */
+import "../util/utc";
 import { join } from "node:path";
 
 import { getConfiguration } from "../config";

@@ -966,3 +966,14 @@ frontend are designed greenfield:
 | Stack | ioredis 6, CJS jest, TS 6.0.x, Node ≥22.12 | ioredis 5.11.1, Jest ESM mode, TS 6.0.3 exact, Node ^22.18 ‖ ≥24.11, explicit rootDir, migrations via dist |
 | CI | "root workflow" | own workflow in this repo |
 | Frontend providers | AuthProvider in main.tsx | duplicate WalletProvider removed; AuthProvider inside Wallet + Router; three wallet/account UI states |
+
+## Time
+
+UTC is the platform's only time zone. The ledger speaks epoch seconds (Daml `Int`), the database
+stores `timestamptz`, the API emits ISO 8601 strings ending in `Z` (and epoch seconds where the
+ledger does), and candle buckets are epoch-aligned, so a daily candle is a UTC day. Every backend
+entrypoint (`main.ts`, `data-source.ts`, `src/scripts/*`) imports `src/util/utc.ts` first, which
+pins `process.env.TZ = "UTC"`: no Date is formatted or computed in the host's zone, and logs carry
+UTC timestamps (`src/util/utc.spec.ts` proves it from three non-UTC host zones). SQL keeps to
+`timestamptz` and epoch arithmetic and never casts to `date` or calls `date_trunc` in the session's
+zone. The frontend renders every instant in UTC and reads every date input as UTC.
