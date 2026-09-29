@@ -28,10 +28,10 @@ export interface StoredProposal {
  * The current version of every `PredictionMarket` (docs/INDEXER.md §3 `to_markets`): one row
  * per `marketId`, overwritten by each successor contract; the version history lives in
  * `to_market_snapshots`. `contract_id` is the ACTIVE contract (what a trade must exercise).
+ * Only what the ledger holds is here — presentation lives in `to_market_metadata`.
  */
 @Entity({ name: "to_markets" })
 @Index("ix_to_markets_status", ["status"])
-@Index("ix_to_markets_category", ["category"])
 @Index("ix_to_markets_expires_at", ["expiresAtSec"])
 @Index("ix_to_markets_event_ticker", ["eventTicker"])
 export class MarketEntity {
@@ -48,17 +48,12 @@ export class MarketEntity {
   @Column({ type: "text" })
   question!: string;
 
-  @Column({ name: "image_url", type: "text", default: "" })
-  imageUrl!: string;
-
-  @Column({ type: "text", default: "" })
-  description!: string;
-
+  /** The resolution terms — part of what a trader signs for, so the contract's own. */
   @Column({ name: "resolution_description", type: "text", default: "" })
   resolutionDescription!: string;
 
-  @Column({ type: "text", default: "" })
-  category!: string;
+  // Presentation (image, description) is NOT here: it is `to_market_metadata`, backend-owned
+  // (docs/MARKETS.md §1); the category is the series' through the event.
 
   // ── identity (docs/MARKETS.md §2): the contract's own ticker, event and side labels, nothing else ──
 

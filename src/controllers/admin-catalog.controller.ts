@@ -10,18 +10,20 @@ import {
   CreateSeriesDto,
   ExchangeHaltDto,
   UpdateEventDto,
+  UpdateMarketMetadataDto,
   UpdateSeriesDto,
 } from "../dto/catalog.dto";
 import { CatalogService } from "../services/catalog.service";
 import { ExchangeService } from "../services/exchange.service";
 import { MarketOperatorService } from "../services/market-operator.service";
-import type { ApiCreateMarketResult, ApiEvent, ApiExchangeHalt, ApiSeries } from "../types";
+import type { ApiCreateMarketResult, ApiEvent, ApiExchangeHalt, ApiMarket, ApiSeries } from "../types";
 import { adminActorOf } from "./admin.controller";
 
 /**
  * Operator side of the catalog and the exchange (docs/API.md "Admin — catalog"; docs/MARKETS.md
- * §4, §8): series and events CRUD, on-ledger market creation through the treasury, and the
- * trading halt. A market's own identity (ticker, event, side labels) is the contract's and has no
+ * §4, §8): series and events CRUD, on-ledger market creation through the treasury, a market's
+ * backend-owned presentation (image, description — never on the contract, §1), and the trading
+ * halt. A market's own identity (ticker, event, side labels) is the contract's and has no
  * operator route. Same guard chain as AdminController; every mutation is audited with actorType
  * `admin`.
  */
@@ -80,6 +82,18 @@ export class AdminCatalogController {
   createMarket(@Body() body: CreateMarketDto, @Req() req: AuthedRequest): Promise<ApiCreateMarketResult> {
     const { reason, ...input } = body;
     return this.operator.createMarket(input, adminActorOf(req), reason);
+  }
+
+  /** The market's image / description (`to_market_metadata`); `:market` is an id or a ticker. */
+  @Patch("markets/:market/metadata")
+  @HttpCode(200)
+  updateMarketMetadata(
+    @Param("market") ref: string,
+    @Body() body: UpdateMarketMetadataDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ market: ApiMarket }> {
+    const { reason, ...patch } = body;
+    return this.catalog.updateMarketMetadata(ref, patch, adminActorOf(req), reason).then((market) => ({ market }));
   }
 
   @Post("exchange/halt")

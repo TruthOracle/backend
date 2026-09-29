@@ -176,7 +176,9 @@ type MarketEventKind = "market_created" | "buy" | "sell" | "swap" | "split" | "m
 interface Market {
   marketId: number; ticker: string; eventTicker: string; yesSubTitle; noSubTitle: string;   // the contract's own identity (docs/MARKETS.md §2)
   seriesTicker: string | null;                                                               // through the event's catalog row (null only for a placeholder event without a series)
-  contractId: string; templateId: string | null; admin: string; question; imageUrl; description; resolutionDescription; category: string;
+  contractId: string; templateId: string | null; admin: string; question; resolutionDescription: string;
+  imageUrl; description; category: string;                                                   // backend-owned presentation (docs/MARKETS.md §1): own image else the event's; the series' category
+  metadata: { imageUrl; description; updatedAt: string } | null;                             // the operator's own presentation row, null when the market shows its event's image
   createdAt; expiresAt; tradingStartsAt: string; gracePeriodSecs; liquidityPeriodSecs: number; isDynamic: boolean;
   reserveYes; reserveNo; liquidityL; lpTokenSupply; currentPrice: Decimal; feeBps; prizeFeeShareBps: number;
   accumulatedFeesCC; prizePoolCC; totalVolumeCC: Decimal; status: MarketStatus; outcome: Outcome | null; resolvedAt: string | null;
@@ -214,7 +216,7 @@ interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt
 ### Markets (public)
 `:market` is a numeric `marketId` or a ticker (case-insensitive) on every route below (docs/MARKETS.md §2).
 - `GET /markets?status=Trading|Proposed|Resolved|Voided|active|settled&category=&event=&series=&tickers=A,B&q=&sort=newest|oldest|volume|expiry|activity&includeArchived=&page=&limit=` → `{ items: Market[], page, limit, total }` (archived markets excluded unless asked; `event` / `series` filter by catalog membership)
-- `GET /markets/categories` → `{ category, markets }[]`
+- `GET /markets/categories` → `{ category, markets }[]` (series categories through the event; uncategorised series left out)
 - `GET /markets/:market` → `{ market: Market }` (with `createdEventBlob`) | `404 not_found`
 - `GET /markets/:market/activity?kind=&page=&limit=` → `{ items: MarketEvent[], … }` newest first
 - `GET /markets/:market/trades?kind=&page=&limit=` → the `buy sell swap split merge` subset
@@ -299,5 +301,6 @@ The account's parties = the primary party + every active linked wallet.
 - `PATCH /admin/series/:ticker` `{ …any of the above, status?: active | archived }` → `{ series }`
 - `POST /admin/events` `{ ticker, seriesTicker, title, subTitle?, imageUrl?, description?, mutuallyExclusive?, strikeDate?, strikePeriod?, settlementSources?, productMetadata?, reason? }` → `{ event }` | `404 not_found` (series) | `409 catalog_conflict`
 - `PATCH /admin/events/:ticker` `{ …, archived? }` → `{ event }`
-- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, category?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars) | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract. A blank `imageUrl` takes the event's image (the event carries the catalog artwork; a market only overrides it).
+- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars) | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract. `imageUrl` / `description` are backend-owned presentation written to `to_market_metadata` before the submit, never to the ledger (a blank `imageUrl` shows the event's image); the category is the series'.
+- `PATCH /admin/markets/:market/metadata` `{ imageUrl?, description?, reason? }` → `{ market }` | `400 validation_failed` (neither field) | `404 not_found`. Audited `catalog.market_metadata_updated`; publishes `truthoracle.catalog.changed { kind: "market" }`.
 - `POST /admin/exchange/halt` `{ active: boolean, reason, estimatedResumeAt? }` → `{ halt }`

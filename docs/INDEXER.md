@@ -113,9 +113,10 @@ account's view is resolved at read time through `to_users.party_id` and `to_wall
 | `to_ledger_transfers` | Canton Coin transfer involving the treasury | §6 |
 | `to_market_candles` | (market, period ∈ 1 min / 1 h / 1 d, period start) | OHLC of the pool price, Σ Δvolume, Σ price × Δvolume, trade count, open interest and L after the period's last version — folded per market version in the same transaction (docs/MARKETS.md §5) |
 | `to_series` · `to_events` | operator catalog rows (not ledger data; the projection writes placeholder rows when a market names an event that has none) | the series → event hierarchy markets are grouped into; membership is `to_markets.event_ticker` (docs/MARKETS.md §2) |
+| `to_market_metadata` | operator row per market ticker (not ledger data; the projection never writes it) | the market's image and description — v16 contracts carry no presentation (docs/MARKETS.md §1) |
 
 `to_markets` also carries the market's identity (`ticker`, `event_ticker`, `yes_sub_title`,
-`no_sub_title` — the contract's own, mandatory on truthoracle-v15, NOT NULL in the index), the
+`no_sub_title` — the contract's own, mandatory on truthoracle-v16, NOT NULL in the index), the
 active version's `template_id`, and `open_interest_yes / _no` (outstanding shares across the
 active positions, ± per Position create / archive, recomputed after a snapshot).
 

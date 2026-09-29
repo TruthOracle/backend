@@ -165,9 +165,8 @@ export class LedgerFixture {
     liquidityPeriodSecs?: number;
     feeBps?: number;
     prizeFeeShareBps?: number;
-    category?: string;
     policy?: Partial<Payload>;
-    /** The market's identity (mandatory Text on truthoracle-v15); defaults are `TEST-<marketId>` in event `TEST`, `Yes` / `No`. */
+    /** The market's identity (mandatory Text on truthoracle-v16); defaults are `TEST-<marketId>` in event `TEST`, `Yes` / `No`. */
     ticker?: string;
     eventTicker?: string;
     yesSubTitle?: string;
@@ -180,10 +179,8 @@ export class LedgerFixture {
       admin: this.admin,
       marketId: String(input.marketId),
       question: input.question ?? `Market ${input.marketId}?`,
-      imageUrl: "https://img.test/m.png",
-      description: "desc",
+      // no imageUrl / description / category: v16 contracts carry no presentation (docs/MARKETS.md §1)
       resolutionDescription: "resolves per source",
-      category: input.category ?? "crypto",
       createdAt: String(createdAt),
       expiresAt: String(input.expiresAt ?? createdAt + 7 * 86_400),
       gracePeriodSecs: "86400",
@@ -231,7 +228,6 @@ export class LedgerFixture {
     expiresAt?: number;
     liquidityPeriodSecs?: number;
     feeBps?: number;
-    category?: string;
     policy?: Partial<Payload>;
     ticker?: string;
     eventTicker?: string;
@@ -252,10 +248,7 @@ export class LedgerFixture {
       "CreateMarket",
       {
         question: payload.question,
-        imageUrl: payload.imageUrl,
-        description: payload.description,
         resolutionDescription: payload.resolutionDescription,
-        category: payload.category,
         createdAt: payload.createdAt,
         expiresAt: payload.expiresAt,
         gracePeriodSecs: payload.gracePeriodSecs,

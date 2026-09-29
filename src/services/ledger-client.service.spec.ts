@@ -9,7 +9,7 @@ const TREASURY = "treasury::1220" + "f".repeat(64);
 const OWNER = "alice::1220" + "a".repeat(64);
 
 function build(rows: ActiveContract[]): { service: LedgerClientService; sentry: { captureMessage: jest.Mock } } {
-  const config = { treasuryPartyId: TREASURY, truthoraclePackageId: "pkg", truthoraclePackageName: "truthoracle-v15", ledgerApiUrl: "http://ledger", isMainnet: false, ledgerCacheMs: 0 } as unknown as Config;
+  const config = { treasuryPartyId: TREASURY, truthoraclePackageId: "pkg", truthoraclePackageName: "truthoracle-v16", ledgerApiUrl: "http://ledger", isMainnet: false, ledgerCacheMs: 0 } as unknown as Config;
   const sentry = { captureMessage: jest.fn(), captureException: jest.fn() };
   const service = new LedgerClientService(config, {} as KeycloakTokenService, {} as RedisService, sentry as unknown as SentryService);
   jest.spyOn(service, "activeContracts").mockResolvedValue(rows);
@@ -45,7 +45,7 @@ describe("LedgerClientService.fetchUserWallet", () => {
 });
 
 describe("UserWallet Create command (shared by deposits and in-app payouts)", () => {
-  it("is always the empty wallet with depositRefs: [] (mandatory on truthoracle-v15), under one id per owner", () => {
+  it("is always the empty wallet with depositRefs: [] (mandatory on truthoracle-v16), under one id per owner", () => {
     const create = userWalletCreateCommand({ templateId: "pkg:Truthoracle:UserWallet", admin: TREASURY, owner: OWNER }) as { CreateCommand: { templateId: string; createArguments: Record<string, unknown> } };
     expect(create.CreateCommand.templateId).toBe("pkg:Truthoracle:UserWallet");
     expect(create.CreateCommand.createArguments).toEqual({ admin: TREASURY, owner: OWNER, balanceCC: "0.0000000000", depositedCC: "0.0000000000", withdrawnCC: "0.0000000000", depositRefs: [] });

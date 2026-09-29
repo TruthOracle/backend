@@ -199,23 +199,23 @@ describe("catalog", () => {
       question: "Cut of at least 25 bps?",
       ticker: "fed-26mar-cut25",
       eventTicker: "fed-26mar",
-      category: "Economics",
       createdAt: nowSec - 600,
       expiresAt: nowSec + 86_400,
     });
     f.createMarket({ marketId: 2, ticker: "FED-26MAR-CUT50", eventTicker: "FED-26MAR", createdAt: nowSec - 600, expiresAt: nowSec + 2 * 86_400 });
-    f.createMarket({ marketId: 3, ticker: "NODASH-1", eventTicker: "NODASH", category: "Misc" });
+    f.createMarket({ marketId: 3, ticker: "NODASH-1", eventTicker: "NODASH" });
     f.createMarket({ marketId: 4, ticker: "X-9-1", eventTicker: "X-9" });
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
 
     const event = bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/FED-26MAR").expect(200)).event;
+    // The contract carries no presentation (v16): the placeholders start without image and category.
     expect(event).toMatchObject({
       ticker: "FED-26MAR",
       seriesTicker: "FED",
       title: "FED-26MAR",
-      category: "Economics",
-      imageUrl: "https://img.test/m.png",
+      category: "",
+      imageUrl: "",
       strikeDate: new Date((nowSec + 86_400) * 1000).toISOString(),
       status: "open",
       marketCount: 2,
@@ -226,10 +226,10 @@ describe("catalog", () => {
       ["FED-26MAR-CUT50", "FED"],
     ]);
     const series = bodyOf<{ series: ApiSeries; events: ApiEvent[] }>(await ctx.agent.get("/api/v1/series/FED").expect(200));
-    expect(series.series).toMatchObject({ ticker: "FED", title: "FED", category: "Economics", status: "active", eventCount: 1, marketCount: 2 });
+    expect(series.series).toMatchObject({ ticker: "FED", title: "FED", category: "", status: "active", eventCount: 1, marketCount: 2 });
     expect(series.events.map((e) => e.ticker)).toEqual(["FED-26MAR"]);
     // No usable first segment: the series is the event ticker itself.
-    expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/NODASH").expect(200)).event).toMatchObject({ seriesTicker: "NODASH", category: "Misc" });
+    expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/NODASH").expect(200)).event).toMatchObject({ seriesTicker: "NODASH", category: "" });
     expect(bodyOf<{ event: ApiEvent }>(await ctx.agent.get("/api/v1/events/X-9").expect(200)).event).toMatchObject({ seriesTicker: "X-9" });
     expect(bodyOf<ApiPage<ApiSeries>>(await ctx.agent.get("/api/v1/series").expect(200)).items.map((s) => s.ticker)).toEqual(["FED", "NODASH", "X-9"]);
     // Ledger-derived rows are not audited; the operator's edits are.
@@ -241,15 +241,19 @@ describe("catalog", () => {
         await ctx.agent.post("/api/v1/admin/series").set(headers).send({ ticker: "FED", title: "Fed rate decisions" }).expect(409),
       ).error,
     ).toBe("catalog_conflict");
-    await ctx.agent.patch("/api/v1/admin/series/FED").set(headers).send({ title: "Fed rate decisions", frequency: "monthly" }).expect(200);
+    await ctx.agent.patch("/api/v1/admin/series/FED").set(headers).send({ title: "Fed rate decisions", frequency: "monthly", category: "Economics" }).expect(200);
     const edited = bodyOf<{ event: ApiEvent }>(
       await ctx.agent
         .patch("/api/v1/admin/events/FED-26MAR")
         .set(headers)
-        .send({ title: "Fed decision, March 2026", subTitle: "March meeting", mutuallyExclusive: true, reason: "fill in" })
+        .send({ title: "Fed decision, March 2026", subTitle: "March meeting", mutuallyExclusive: true, imageUrl: "https://img.example/fed-26mar.png", reason: "fill in" })
         .expect(200),
     ).event;
-    expect(edited).toMatchObject({ title: "Fed decision, March 2026", subTitle: "March meeting", mutuallyExclusive: true, marketCount: 2 });
+    expect(edited).toMatchObject({ title: "Fed decision, March 2026", subTitle: "March meeting", mutuallyExclusive: true, marketCount: 2, category: "Economics" });
+    // A ledger-first market has no metadata row: it shows its event's image, no description, and the series' category.
+    const ledgerFirst = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/FED-26MAR-CUT50").expect(200)).market;
+    expect(ledgerFirst).toMatchObject({ imageUrl: "https://img.example/fed-26mar.png", description: "", category: "Economics", metadata: null });
+    expect(bodyOf<{ category: string; markets: number }[]>(await ctx.agent.get("/api/v1/markets/categories").expect(200))).toEqual([{ category: "Economics", markets: 2 }]);
 
     // A later version of a market keeps its identity (the contract carries it; nothing off-ledger can change it).
     const w = f.createWallet(alice);
@@ -314,6 +318,8 @@ describe("catalog", () => {
           question: "Cut of at least 25 bps?",
           yesSubTitle: "Cut ≥ 25 bps",
           noSubTitle: "Smaller or none",
+          imageUrl: " https://img.example/cut25.png ",
+          description: "The March cut market",
           expiresAt,
           initialProbability: "0.35",
           initialValueCC: "200",
@@ -335,7 +341,6 @@ describe("catalog", () => {
     });
     expect(submitted.ExerciseCommand.choiceArgument).toMatchObject({
       question: "Cut of at least 25 bps?",
-      category: "Economics",
       initialProbability: dec("0.35"),
       initialValueCC: dec("200"),
       feeBps: "100",
@@ -350,14 +355,54 @@ describe("catalog", () => {
     });
     expect(submitted.ExerciseCommand.choiceArgument.expiresAt).toBe(String(Math.floor(Date.parse(expiresAt) / 1000)));
     expect((submitted.ExerciseCommand.choiceArgument.policy as { operatorResolution: boolean }).operatorResolution).toBe(true);
+    // Presentation never reaches the ledger: it is the backend's row, written before the submit.
+    expect(Object.keys(submitted.ExerciseCommand.choiceArgument)).toEqual(expect.not.arrayContaining(["imageUrl", "description", "category"]));
+    expect(await ctx.dataSource.query<{ image_url: string; description: string }[]>(`SELECT image_url, description FROM to_market_metadata WHERE ticker = 'FED-26MAR-CUT25'`)).toEqual([
+      { image_url: "https://img.example/cut25.png", description: "The March cut market" },
+    ]);
+    // Same ticker again (before the index knows it): the deterministic command id collides on the wallet's command dedup.
+    expect(
+      bodyOf<{ error: string }>(
+        await ctx.agent
+          .post("/api/v1/admin/markets")
+          .set(headers)
+          .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT25", question: "Cut?", expiresAt, initialProbability: "0.35", initialValueCC: "200" })
+          .expect(502),
+      ).error,
+    ).toBe("upstream_failed");
+    // Once the ledger create is indexed the market shows its own image and description, and the series' category.
+    ctx.stream.push(f.createMarket({ marketId: 2, ticker: "FED-26MAR-CUT25", eventTicker: "FED-26MAR", createdAt: Math.floor(Date.now() / 1000) - 60, expiresAt: Math.floor(Date.parse(expiresAt) / 1000) }).tx);
+    await ctx.get(IndexerService).runOnce();
+    const indexed = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/FED-26MAR-CUT25").expect(200)).market;
+    expect(indexed).toMatchObject({
+      marketId: 2,
+      imageUrl: "https://img.example/cut25.png",
+      description: "The March cut market",
+      category: "Economics",
+      metadata: { imageUrl: "https://img.example/cut25.png", description: "The March cut market" },
+    });
+    expect(bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets?q=march%20cut").expect(200)).items.map((m) => m.marketId)).toEqual([2]);
 
-    // The side labels default to the plain side names — the contract refuses an empty one —
-    // and a blank image means the event's image.
+    // The operator edits the presentation in place; a blank image falls back to the event's.
     await ctx.agent.patch("/api/v1/admin/events/FED-26MAR").set(headers).send({ imageUrl: "https://img.example/fed-26mar.png" }).expect(200);
+    const patched = bodyOf<{ market: ApiMarket }>(
+      await ctx.agent.patch("/api/v1/admin/markets/2/metadata").set(headers).send({ imageUrl: "", reason: "use the event artwork" }).expect(200),
+    ).market;
+    expect(patched).toMatchObject({ imageUrl: "https://img.example/fed-26mar.png", description: "The March cut market", metadata: { imageUrl: "", description: "The March cut market" } });
+    const described = bodyOf<{ market: ApiMarket }>(
+      await ctx.agent.patch("/api/v1/admin/markets/fed-26mar-cut25/metadata").set(headers).send({ description: "Edited" }).expect(200),
+    ).market;
+    expect(described.description).toBe("Edited");
+    expect(await ctx.dataSource.query<unknown[]>(`SELECT 1 FROM to_audit_events WHERE action = 'catalog.market_metadata_updated'`)).toHaveLength(2);
+    expect(bodyOf<{ error: string }>(await ctx.agent.patch("/api/v1/admin/markets/2/metadata").set(headers).send({ reason: "nothing" }).expect(400)).error).toBe("validation_failed");
+    expect(bodyOf<{ error: string }>(await ctx.agent.patch("/api/v1/admin/markets/NOPE-1/metadata").set(headers).send({ description: "x" }).expect(404)).error).toBe("not_found");
+
+    // The side labels default to the plain side names — the contract refuses an empty one; no
+    // presentation sent means no metadata row (the market will show its event's image).
     await ctx.agent
       .post("/api/v1/admin/markets")
       .set(headers)
-      .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT50", question: "Cut of at least 50 bps?", yesSubTitle: "  ", imageUrl: " ", expiresAt, initialProbability: "0.1", initialValueCC: "200" })
+      .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT50", question: "Cut of at least 50 bps?", yesSubTitle: "  ", expiresAt, initialProbability: "0.1", initialValueCC: "200" })
       .expect(200);
     expect(ctx.wallet.submits).toHaveLength(2);
     const second = ctx.wallet.submits[1].commands[0] as { ExerciseCommand: { choiceArgument: Record<string, unknown> } };
@@ -366,8 +411,8 @@ describe("catalog", () => {
       eventTicker: "FED-26MAR",
       yesSubTitle: "Yes",
       noSubTitle: "No",
-      imageUrl: "https://img.example/fed-26mar.png",
     });
+    expect(await ctx.dataSource.query<unknown[]>(`SELECT 1 FROM to_market_metadata WHERE ticker = 'FED-26MAR-CUT50'`)).toHaveLength(0);
     // The identity is required: no ticker, no event, an over-long label — nothing is submitted.
     for (const body of [
       { eventTicker: "FED-26MAR", question: "x" },
@@ -383,16 +428,6 @@ describe("catalog", () => {
     }
     expect(ctx.wallet.submits).toHaveLength(2);
 
-    // Same ticker again: the deterministic command id collides on the wallet's command dedup.
-    expect(
-      bodyOf<{ error: string }>(
-        await ctx.agent
-          .post("/api/v1/admin/markets")
-          .set(headers)
-          .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT25", question: "Cut?", expiresAt, initialProbability: "0.35", initialValueCC: "200" })
-          .expect(502),
-      ).error,
-    ).toBe("upstream_failed");
     // A ticker the index already knows is refused before anything is submitted.
     expect(
       bodyOf<{ error: string }>(

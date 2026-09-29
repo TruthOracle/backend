@@ -47,19 +47,19 @@ To rotate:
 
 The pepper itself is never stored; only its hash is.
 
-## 3. Daml package (truthoracle-v15) and deposit drift
+## 3. Daml package (truthoracle-v16) and deposit drift
 
-The backend is built against **truthoracle-v15 1.0.0**
+The backend is built against **truthoracle-v16 1.0.0**
 (`TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload in truthoracle-contracts>`,
-`TRUTHORACLE_PACKAGE_NAME=truthoracle-v15`), a fresh lineage deployed from scratch: its
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v16`), a fresh lineage deployed from scratch: its
 `UserWallet.depositRefs : [Text]` is mandatory and is the deposit confirm pass's only
 confirmation rule, and every `PredictionMarket` carries its identity (`ticker`, `eventTicker`,
 the side labels). There is no Daml feature flag and no upgrade path from an older package
-(ARCHITECTURE §18); a v15 deployment starts with an empty index and a fresh database.
+(ARCHITECTURE §18); a v16 deployment starts with an empty index and a fresh database.
 
 - `502 upstream_failed "ledger returned a UserWallet without depositRefs"` on any money route,
   with `UserWallet <cid> (owner …): UserWallet.depositRefs is missing; is TRUTHORACLE_PACKAGE_ID
-  the deployed truthoracle-v15?` in the log: the configured package id / name does not match
+  the deployed truthoracle-v16?` in the log: the configured package id / name does not match
   what is deployed. Fix the env; nothing was written.
 - `409 deposit_attribution_drift` (audit `deposit.attribution_drift`, Sentry, NATS
   `truthoracle.deposit.drift`): the primary's on-ledger `depositedCC` differs from

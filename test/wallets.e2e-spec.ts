@@ -591,7 +591,7 @@ describe("Wallets + deposits (e2e)", () => {
       expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(A.partyId), res.commandId]);
       const [create] = ctx.wallet.submits[0].commands as LedgerCommand[];
       expect(create.CreateCommand?.templateId).toMatch(/:UserWallet$/);
-      // depositRefs is mandatory on truthoracle-v15 and always sent (empty on the Create; the
+      // depositRefs is mandatory on truthoracle-v16 and always sent (empty on the Create; the
       // Deposit appends the txRef).
       expect(create.CreateCommand?.createArguments).toEqual({ admin: ctx.config.treasuryPartyId, owner: A.partyId, balanceCC: CC("0"), depositedCC: CC("0"), withdrawnCC: CC("0"), depositRefs: [] });
       const [deposit] = ctx.wallet.submits[1].commands as LedgerCommand[];

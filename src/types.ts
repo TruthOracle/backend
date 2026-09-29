@@ -296,7 +296,7 @@ export const NatsSubjects = {
   /** The indexer resynced from an ACS snapshot and lost the updates in between: `{ fromOffset, toOffset, reason }`. */
   indexerGap: "truthoracle.indexer.gap",
   // ── market catalog / exchange (docs/MARKETS.md) ──
-  /** A series or event row changed: `{ kind: "series" | "event", ticker }`. */
+  /** A series, event or market-metadata row changed: `{ kind: "series" | "event" | "market", ticker }`. */
   catalogChanged: "truthoracle.catalog.changed",
   /** The operator halted or resumed trading: `{ active, reason }`. */
   exchangeHaltChanged: "truthoracle.exchange.halt_changed",
@@ -351,6 +351,7 @@ export type AuditAction =
   | "catalog.series_updated"
   | "catalog.event_created"
   | "catalog.event_updated"
+  | "catalog.market_metadata_updated"
   | "market.create_submitted"
   | "exchange.halt_changed";
 
@@ -634,10 +635,16 @@ export interface ApiMarket {
   templateId: string | null;
   admin: string;
   question: string;
+  /** The market's own image when the operator set one (`metadata`), else its event's, else "". Backend-owned, never on the contract (docs/MARKETS.md §1). */
   imageUrl: string;
+  /** Backend-owned presentation (`to_market_metadata`); "" without a row. */
   description: string;
+  /** The resolution terms — the contract's own. */
   resolutionDescription: string;
+  /** The series' category through the event (the contract carries none); "" for a placeholder series. */
   category: string;
+  /** The operator's own presentation row, or null when the market shows its event's image — lets a UI tell an override from the fallback. */
+  metadata: ApiMarketMetadata | null;
   createdAt: string;
   expiresAt: string;
   /** `createdAt + liquidityPeriodSecs` — trading opens here. */
@@ -684,6 +691,12 @@ export interface ApiMarket {
 }
 
 /** The market fields a portfolio row is enriched with. */
+/** `to_market_metadata` on the wire: the operator's presentation for one market (docs/MARKETS.md §1). */
+export interface ApiMarketMetadata {
+  imageUrl: string;
+  description: string;
+  updatedAt: string;
+}
 export interface ApiMarketSummary {
   marketId: number;
   ticker: string;
@@ -692,7 +705,9 @@ export interface ApiMarketSummary {
   noSubTitle: string;
   contractId: string;
   question: string;
+  /** Same fallback as `Market.imageUrl` (own, else the event's). */
   imageUrl: string;
+  /** The series' category through the event. */
   category: string;
   status: MarketStatus;
   outcome: MarketOutcome | null;

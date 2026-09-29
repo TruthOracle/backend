@@ -430,11 +430,7 @@ export class CreateMarketDto extends CatalogReasonDto {
   @MaxLength(10_000)
   resolutionDescription?: string;
 
-  @IsOptional()
-  @trimmed()
-  @IsString()
-  @MaxLength(120)
-  category?: string;
+  // No `category`: a market's category is its series' through the event (docs/MARKETS.md §1).
 
   @IsISO8601()
   expiresAt!: string;
@@ -484,6 +480,21 @@ export class CreateMarketDto extends CatalogReasonDto {
 }
 
 /** `POST /admin/exchange/halt` */
+/** `PATCH /admin/markets/:market/metadata` — the backend-owned presentation of one market (docs/MARKETS.md §1). */
+export class UpdateMarketMetadataDto extends CatalogReasonDto {
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @MaxLength(2000)
+  imageUrl?: string;
+
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @MaxLength(10_000)
+  description?: string;
+}
+
 export class ExchangeHaltDto {
   @IsBoolean()
   active!: boolean;

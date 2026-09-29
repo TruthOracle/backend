@@ -80,12 +80,14 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (against a migrated database it must print "No changes in database schema") |
 | `npm run migration:run` · `migration:revert` | apply / roll back |
 
-Three migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
+Four migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
 an earlier layout is dropped and recreated, never upgraded), `LedgerIndex` (the fourteen
-ledger-index tables, additive) and `MarketCatalog` (series / events / candles tables plus the
+ledger-index tables, additive), `MarketCatalog` (series / events / candles tables plus the
 identity and open-interest columns on `to_markets`, additive; the identity columns are NOT NULL —
-a v15 index never writes a market without them, and a from-scratch deployment starts with an
-empty index). Regenerating against a migrated database proposes only the
+a v16 index never writes a market without them, and a from-scratch deployment starts with an
+empty index) and `MarketMetadata` (`to_market_metadata`, the backend-owned image / description
+per market; drops the presentation columns v16 contracts no longer carry, carrying any values
+over first). Regenerating against a migrated database proposes only the
 cosmetic `'{}'` vs `'{}'::jsonb` default rewrites, which are not drift.
 
 Jest runs in CommonJS with `test/esm-to-cjs.transformer.cjs` converting the ESM-only packages
@@ -98,11 +100,12 @@ its default and the boot refusal it participates in. Highlights: `APP_NETWORK` s
 key prefix, the NATS stream (`TRUTHORACLE_<NETWORK>`) and, on mainnet, the `ZKPC_*` ledger
 credentials; `BACKEND_PROXY_SECRET` is what lets the Vercel proxy's `x-real-ip` /
 `x-forwarded-host` be trusted; `KYC_PROVIDER=mock` is refused in prod and on mainnet;
-`KYC_ENFORCE_WITHDRAWALS` is a plain flag. The Daml package is **truthoracle-v15 1.0.0**
+`KYC_ENFORCE_WITHDRAWALS` is a plain flag. The Daml package is **truthoracle-v16 1.0.0**
 (`TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload in truthoracle-contracts>`,
-`TRUTHORACLE_PACKAGE_NAME=truthoracle-v15`), a fresh lineage deployed from scratch;
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v16`), a fresh lineage deployed from scratch;
 `UserWallet.depositRefs` is mandatory there and is what the deposit confirm pass keys on, and
-every `PredictionMarket` carries its identity (ticker, event, side labels).
+every `PredictionMarket` carries its identity (ticker, event, side labels) and nothing
+presentational — image, description and category are the backend's (docs/MARKETS.md §1).
 
 ## Ledger index
 
@@ -127,7 +130,7 @@ deposits and withdrawals require a signed-in account; linking never reads the le
 link succeeds while the ledger is down); deposit confirmation keys on
 `UserWallet.depositRefs`; attribution drift in either direction is a hard
 `409 deposit_attribution_drift`; one `Init` migration creates the final schema; package
-truthoracle-v15.
+truthoracle-v16.
 
 **Accounts and wallets (decided 2026-09-11, ARCHITECTURE §6.1 / §7.3 / §8.1):** Google and Telegram
 are the only user sign-in methods. A Cantor8 wallet is linked to an already signed-in account and
@@ -147,7 +150,7 @@ the first Sumsub sandbox session is still to be watched.
 
 **Markets like an exchange (2026-09-29, docs/MARKETS.md):** Kalshi-style series → event → market
 catalog (events group N binary pm-AMM markets; a market's `ticker` / `eventTicker` / side labels are
-the contract's own — mandatory on truthoracle-v15 — and the projection creates placeholder catalog
+the contract's own — mandatory on truthoracle-v16 — and the projection creates placeholder catalog
 rows for an event the ledger names first), candlesticks folded by the projection in the ledger transaction's own DB transaction
 (1 min / 1 h / 1 d, dense reads), open interest, 24 h figures and an AMM-implied book on every
 market, `GET /markets/:market/quote` (the PmAmmMath port) and `POST /markets/:market/orders/prepare`

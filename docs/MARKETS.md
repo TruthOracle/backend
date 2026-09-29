@@ -7,18 +7,27 @@ is the contract for the catalog, the candle pipeline, the quote / order routes a
 status; the wire shapes are in `docs/API.md` ("Catalog", "Candlesticks", "Quotes and orders",
 "Exchange"), the tables in `docs/INDEXER.md` §3, the seams in `docs/INTERNALS.md` (P7).
 
-## 1. What is on the ledger and what is not
+## 1. What lives where
 
-| Layer | Lives | Owner | Why |
+The rule: **on the ledger only what a trader signs for, what a choice reads, or what a
+resolution is judged against; everything else is the backend's.** Presentation is mutable and
+unsigned — a broken image link must not need a new market, and every successor version of a
+contract copies its fields into every trade transaction, so bytes nobody signs for are pure
+cost there. truthoracle-v16 applies that rule: `PredictionMarket` carries no `imageUrl`,
+`description` or `category` any more (v15 did; no choice ever read them).
+
+| What | Lives | Owner | Why |
 |---|---|---|---|
-| **Market** (`PredictionMarket`) — the pool, its price, fees, resolution, and its identity: `ticker`, `eventTicker`, `yesSubTitle`, `noSubTitle` (mandatory `Text` on truthoracle-v15) | Daml, indexed into `to_markets` | the treasury creates it, the ledger owns it | what a trader signs must name what it is: the ticker, the event it is one leg of, the two sides |
-| **Event** — one dated instance of a series that groups N binary markets ("Fed decision, March 2026" → "cut ≥ 25 bps", "cut ≥ 50 bps", "hold") | Postgres `to_events` | operator (`/admin/events`); the projection writes a placeholder row when a market names an event the operator has not created yet | presentation and grouping; a market's membership is its on-ledger `eventTicker`, nothing else |
-| **Series** — the recurring template ("Fed rate decisions", monthly, Economics) | Postgres `to_series` | operator (`/admin/series`) | catalog only |
+| **Market** (`PredictionMarket`) — the pool, its price, fees, timing, the resolution policy and terms (`resolutionDescription`), and its identity: `question`, `ticker`, `eventTicker`, `yesSubTitle`, `noSubTitle` (mandatory `Text`) | Daml, indexed into `to_markets` | the treasury creates it, the ledger owns it | what a trader signs must name what it is and how it settles; reporters and challengers judge against immutable terms |
+| **Market presentation** — `imageUrl`, `description` | Postgres `to_market_metadata`, keyed by ticker | operator (`POST /admin/markets` writes it, `PATCH /admin/markets/:market/metadata` edits it) | mutable, unsigned; a market without a row shows its event's image and no description |
+| **Event** — one dated instance of a series that groups N binary markets ("Fed decision, March 2026" → "cut ≥ 25 bps", "cut ≥ 50 bps", "hold"); carries the catalog artwork | Postgres `to_events` | operator (`/admin/events`); the projection writes a placeholder row when a market names an event the operator has not created yet | presentation and grouping; a market's membership is its on-ledger `eventTicker`, nothing else |
+| **Series** — the recurring template ("Fed rate decisions", monthly, Economics); carries the **category** | Postgres `to_series` | operator (`/admin/series`) | catalog only; a market's `category` is its series' through the event |
 | **Candles**, open interest, 24 h figures | Postgres `to_market_candles`, `to_markets.open_interest_*` | the projection, in the ledger transaction's own DB transaction | derived data: rebuildable from the raw event log |
 | **Quotes**, prepared orders | computed on request | backend, from the index | a pm-AMM has no order book; the quote is the AMM formula over the indexed market version |
 
 Nothing off-ledger can change what a market pays or when it resolves. The catalog decides how
-markets are *shown together*; the ledger decides what they *are*.
+markets are *shown together* and *shown*; the ledger decides what they *are*. If tamper-evidence
+of a long description ever matters, commit a hash of it on-ledger, not the text.
 
 ## 2. Identity: tickers and the event link
 
@@ -26,12 +35,12 @@ Kalshi-style tickers (`^[A-Z0-9][A-Z0-9._-]{1,63}$`, upper case): a series `FED`
 `FED-26MAR`, its markets `FED-26MAR-CUT25`, `FED-26MAR-CUT50`, `FED-26MAR-HOLD`. Every
 `/markets/:market` route accepts a ticker or the numeric `marketId`.
 
-A market's identity is **the contract's, and only the contract's**. truthoracle-v15 carries
+A market's identity is **the contract's, and only the contract's**. truthoracle-v16 carries
 `ticker`, `eventTicker`, `yesSubTitle` and `noSubTitle` as mandatory `Text` on
 `PredictionMarket` and on `MarketCounter.CreateMarket` (the contract refuses an empty one); the
 indexer writes them on every version, normalised the way every ticker input is (trimmed,
 upper-cased), and there is no operator route that edits them — what a trader signs is what the
-catalog shows. Nothing is synthesised and nothing is filled in off-ledger: a from-scratch v15
+catalog shows. Nothing is synthesised and nothing is filled in off-ledger: a from-scratch v16
 deployment never has a market without its identity.
 
 The index only protects itself, never the data:
@@ -43,15 +52,15 @@ The index only protects itself, never the data:
   addressable by id.
 
 `eventTicker` may name an event the operator has not written to the catalog yet (the market was
-created first, or straight from the frontend's admin console). The projection then creates a
-**placeholder event** in the same transaction — `title` = the ticker, `imageUrl` and
-`strikeDate` from the market — filed under a **placeholder series** named after the event
-ticker's first segment (`FED-26MAR` → `FED`, the whole ticker when there is no usable segment;
-`category` from the market). The catalog therefore never dangles: `GET /events/:ticker` answers
-at once, and the operator fills the rows in with `PATCH /admin/events/:ticker` (title, series,
-strike, …) and `PATCH /admin/series/:ticker`. Placeholders are not audited (they are
-ledger-derived); the operator's edits are. Creating a series or event the placeholder already
-exists for answers `409 catalog_conflict` — patch it instead.
+created first, or straight from a script). The projection then creates a **placeholder event**
+in the same transaction — `title` = the ticker, `strikeDate` from the market, no image — filed
+under a **placeholder series** named after the event ticker's first segment (`FED-26MAR` →
+`FED`, the whole ticker when there is no usable segment; no category). The catalog therefore
+never dangles: `GET /events/:ticker` answers at once, and the operator fills the rows in with
+`PATCH /admin/events/:ticker` (title, series, image, strike, …) and `PATCH /admin/series/:ticker`
+(category, …). Placeholders are not audited (they are ledger-derived); the operator's edits
+are. Creating a series or event the placeholder already exists for answers `409 catalog_conflict`
+— patch it instead.
 
 ## 3. Events and series
 
@@ -63,7 +72,8 @@ with the ledger:
 | `status` | `settled` when every market is resolved / voided; else `open` when any market's phase is `trading`; else `unopened` when any is still in its liquidity period (or there are no markets); else `closed` (expired / proposed, awaiting resolution) — Kalshi's `unopened / open / closed / settled` |
 | `marketCount`, `volumeCC` | count and Σ `totalVolumeCC` of the members |
 | `closeTime` | the latest `expiresAt` among the members |
-| `category`, `settlementSources` | the event's own sources when set, else the series' |
+| `category` | the series' |
+| `settlementSources` | the event's own sources when set, else the series' |
 
 `mutuallyExclusive` is **informational**: each market is its own pm-AMM pool with independent
 collateral, so nothing on-ledger nets positions across the legs (Kalshi's `MECNET`). The resolver
@@ -88,16 +98,25 @@ catalog and submits it treasury-signed through the Enterprise Wallet (`/api/v1/e
 - the command id is `create-market-<sha256(ticker)[:40]>`, so a retried request collides on
   ledger command-dedup instead of minting a second market (the Enterprise Wallet answers a
   duplicate as `502 upstream_failed`);
-- `category` defaults to the series', `gracePeriodSecs` to a day, `feeBps` to 30, the policy to
-  operator resolution with no sources; every bound the Daml choice asserts is pre-checked;
+- `imageUrl` / `description` never reach the ledger: they are written to `to_market_metadata`
+  (keyed by the ticker) before the submit, so the market shows them the moment the indexer
+  sees it; a blank `imageUrl` means "the event's image". If the submit fails the row stays
+  behind, harmless — the next attempt for the ticker overwrites it;
+- `gracePeriodSecs` defaults to a day, `feeBps` to 30, the policy to operator resolution with no
+  sources; every bound the Daml choice asserts is pre-checked;
 - the answer carries `expectedMarketId` (= counter value + 1); the market is readable once the
   indexer applies the transaction — clients poll `GET /markets/<ticker>` or wait on
   `GET /ledger/wait?offset=`.
 
-The frontend's admin console may keep submitting `CreateMarket` from the browser through the
-`/__proxy/wallet` relay; it must then send the four identity fields itself — `CreateMarket`
-requires them on truthoracle-v15, and the participant rejects a submission without them (the
-backend route would surface that as `502 upstream_failed`).
+Presentation after the fact: `PATCH /admin/markets/:market/metadata { imageUrl?, description?,
+reason? }` (id or ticker; `400 validation_failed` when neither field is sent, `404 not_found` for
+an unknown market) upserts the row, audits `catalog.market_metadata_updated` and publishes
+`truthoracle.catalog.changed { kind: "market", ticker }`. `Market.metadata` on the wire is the
+row (or null), so a UI can tell an operator's image from the event fallback.
+
+A `CreateMarket` submitted by any other client (a script, another wallet) must send the four
+identity fields itself — the contract requires them — and gets no presentation until an operator
+writes some.
 
 ## 5. Candles and open interest
 

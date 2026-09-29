@@ -5,8 +5,8 @@ import { DataSource } from "typeorm";
 import { Config } from "../config";
 import { CatalogEventEntity } from "../entities/catalog-event.entity";
 import { INDEXER_STATE_KEY, IndexerStateEntity } from "../entities/indexer-state.entity";
+import { MarketMetadataEntity } from "../entities/market-metadata.entity";
 import { MarketEntity } from "../entities/market.entity";
-import { SeriesEntity } from "../entities/series.entity";
 import { NatsSubjects, type Actor, type ApiCreateMarketResult } from "../types";
 import { ApiError } from "../util/errors";
 import { formatCC } from "../util/money";
@@ -22,10 +22,10 @@ export interface CreateMarketInput {
   question: string;
   yesSubTitle?: string;
   noSubTitle?: string;
+  /** Presentation — backend-owned (`to_market_metadata`), never sent to the ledger (docs/MARKETS.md §1). */
   imageUrl?: string;
   description?: string;
   resolutionDescription?: string;
-  category?: string;
   /** ISO-8601. */
   expiresAt: string;
   gracePeriodSecs?: number;
@@ -88,7 +88,6 @@ export class MarketOperatorService {
     const event = await this.dataSource.getRepository(CatalogEventEntity).findOneBy({ ticker: eventTicker });
     if (!event) throw new ApiError(404, "not_found", `event ${eventTicker} does not exist`);
     if (event.archived) throw new ApiError(409, "catalog_conflict", `event ${eventTicker} is archived`);
-    const series = await this.dataSource.getRepository(SeriesEntity).findOneBy({ ticker: event.seriesTicker });
     const taken = await this.dataSource.getRepository(MarketEntity).findOneBy({ ticker });
     if (taken) throw new ApiError(409, "catalog_conflict", `ticker ${ticker} is used by market ${taken.marketId}`);
 
@@ -118,14 +117,29 @@ export class MarketOperatorService {
     if (quorum > reporters.length)
       throw new ApiError(400, "validation_failed", "policy.quorum cannot exceed the reporter count");
 
+    // Presentation never reaches the ledger (v16 carries none): it is written to the backend's own
+    // table before the submit, keyed by ticker, so it is there the moment the indexer sees the
+    // market. If the submit fails the row stays behind — harmless, the next attempt for the same
+    // ticker overwrites it, and a ticker that is never minted shows nothing.
+    const imageUrl = input.imageUrl?.trim();
+    const description = input.description?.trim();
+    if (imageUrl !== undefined || description !== undefined)
+      await this.dataSource
+        .createQueryBuilder()
+        .insert()
+        .into(MarketMetadataEntity)
+        .values({
+          ticker,
+          imageUrl: imageUrl ?? "",
+          description: description ?? "",
+          updatedByUserId: actor.userId ?? null,
+        })
+        .orUpdate(["image_url", "description", "updated_by_user_id", "updated_at"], ["ticker"])
+        .execute();
+
     const choiceArgument = {
       question: input.question.trim(),
-      // Blank means "the event's image": the event is the catalog's artwork carrier, a market
-      // only overrides it when the operator sets one explicitly.
-      imageUrl: input.imageUrl?.trim() || event.imageUrl || "",
-      description: input.description ?? "",
       resolutionDescription: input.resolutionDescription ?? "",
-      category: (input.category ?? series?.category ?? "").trim(),
       createdAt: String(nowSec),
       expiresAt: String(expiresAtSec),
       gracePeriodSecs: String(input.gracePeriodSecs ?? 86_400),
@@ -173,7 +187,14 @@ export class MarketOperatorService {
       action: "market.create_submitted",
       subjectType: "market",
       subjectId: ticker,
-      metadata: { reason, eventTicker, commandId, expectedMarketId, status: res.status },
+      metadata: {
+        reason,
+        eventTicker,
+        commandId,
+        expectedMarketId,
+        status: res.status,
+        presentation: [imageUrl !== undefined ? "imageUrl" : null, description !== undefined ? "description" : null].filter(Boolean),
+      },
       ip: actor.ip ?? null,
     });
     await this.nats.publishSafe(

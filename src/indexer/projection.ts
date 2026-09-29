@@ -78,7 +78,7 @@ import {
 import { extractTreasuryTransfers } from "./splice";
 
 export interface ProjectionConfig {
-  /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v15`). */
+  /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v16`). */
   packageName: string;
   splicePackageName: string;
   treasury: string;
@@ -523,7 +523,7 @@ export class LedgerProjection {
 
   /**
    * A market's identity is the contract's own (`ticker`, `eventTicker`, `yesSubTitle`,
-   * `noSubTitle` — mandatory Text on truthoracle-v15, docs/MARKETS.md §2), normalised the way
+   * `noSubTitle` — mandatory Text on truthoracle-v16, docs/MARKETS.md §2), normalised the way
    * every ticker input is (trimmed, upper-cased). The index takes it as it is and only protects
    * itself: a ticker another market already holds is stored as `<ticker>~<marketId>` because
    * the column is unique and the index must never stall on operator data, and a malformed
@@ -557,30 +557,31 @@ export class LedgerProjection {
 
   /**
    * The contract may name an event the operator has not written to the catalog yet (the market
-   * was created first, or straight from the frontend's admin console). The catalog must never
-   * dangle, so the projection creates a placeholder event — and a placeholder series named after
-   * the event ticker's first segment — in the same transaction; an operator then edits them
-   * through `/admin/events` and `/admin/series` (docs/MARKETS.md §2). Ledger-derived rows are
-   * not audited.
+   * was created first, or straight from a script). The catalog must never dangle, so the
+   * projection creates a placeholder event — and a placeholder series named after the event
+   * ticker's first segment — in the same transaction; an operator then edits them through
+   * `/admin/events` and `/admin/series` (docs/MARKETS.md §2). The contract carries no
+   * presentation (v16), so the placeholders have no image and no category until the operator
+   * sets them. Ledger-derived rows are not audited.
    */
   private async ensureCatalogEvent(
     m: EntityManager,
     marketId: number,
     eventTicker: string,
-    market: { category: string; imageUrl: string; expiresAtSec: number },
+    market: { expiresAtSec: number },
   ): Promise<void> {
     const exists = await m.query<unknown[]>(`SELECT 1 FROM to_events WHERE ticker = $1`, [eventTicker]);
     if (exists.length > 0) return;
     const seriesTicker = placeholderSeriesTickerOf(eventTicker);
     await m.query(
-      `INSERT INTO to_series (ticker, title, category) VALUES ($1, $1, $2) ON CONFLICT (ticker) DO NOTHING`,
-      [seriesTicker, market.category],
+      `INSERT INTO to_series (ticker, title) VALUES ($1, $1) ON CONFLICT (ticker) DO NOTHING`,
+      [seriesTicker],
     );
     await m.query(
-      `INSERT INTO to_events (ticker, series_ticker, title, image_url, strike_date)
-         VALUES ($1, $2, $1, $3, to_timestamp($4))
+      `INSERT INTO to_events (ticker, series_ticker, title, strike_date)
+         VALUES ($1, $2, $1, to_timestamp($3))
        ON CONFLICT (ticker) DO NOTHING`,
-      [eventTicker, seriesTicker, market.imageUrl, market.expiresAtSec],
+      [eventTicker, seriesTicker, market.expiresAtSec],
     );
     this.logger.log(
       `market ${marketId}: event ${eventTicker} was not in the catalog — placeholder event (series ${seriesTicker}) created; edit it through /admin/events`,
@@ -628,10 +629,8 @@ export class LedgerProjection {
           openInterestNo: 0n,
           admin: asText(p.admin),
           question: asText(p.question),
-          imageUrl: asText(p.imageUrl),
-          description: asText(p.description),
+          // no presentation here: v16 contracts carry none (to_market_metadata is backend-owned)
           resolutionDescription: asText(p.resolutionDescription),
-          category: asText(p.category),
           createdAtSec: asInt(p.createdAt),
           expiresAtSec: asInt(p.expiresAt),
           gracePeriodSecs: asInt(p.gracePeriodSecs),
@@ -706,8 +705,6 @@ export class LedgerProjection {
           .orIgnore()
           .execute();
         await this.ensureCatalogEvent(m, marketId, identity.eventTicker, {
-          category: row.category ?? "",
-          imageUrl: row.imageUrl ?? "",
           expiresAtSec: row.expiresAtSec ?? 0,
         });
         const atLedger = e.createdAt ?? ctx.tx.effectiveAt;

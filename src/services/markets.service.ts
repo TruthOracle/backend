@@ -50,16 +50,33 @@ export interface MarketListQuery {
   limit: number;
 }
 
-/** Per-market figures the API adds on top of the row (docs/MARKETS.md §3): batch-loaded by `extrasFor`. */
+/**
+ * What the API adds on top of the ledger row (docs/MARKETS.md §1, §3), batch-loaded by
+ * `extrasFor`: the catalog side of a market (series through the event, the event's image and
+ * the series' category) and its backend-owned presentation (`to_market_metadata`).
+ */
 export interface MarketExtras {
   seriesTicker: string | null;
+  /** The series' category through the event ("" without a series or for a placeholder). */
+  category: string;
+  /** The event's own image ("" when unset) — the fallback for a market without metadata. */
+  eventImageUrl: string;
+  /** The operator's presentation row for this ticker, when there is one. */
+  metadata: { imageUrl: string; description: string; updatedAt: Date } | null;
   /** The price 24 h ago (the last hourly close before then), else the market's first price; null without candles. */
   previousPrice: bigint | null;
   /** Σ candle volume of the last 24 h. */
   volume24h: bigint;
 }
 
-const NO_EXTRAS: MarketExtras = { seriesTicker: null, previousPrice: null, volume24h: 0n };
+const NO_EXTRAS: MarketExtras = {
+  seriesTicker: null,
+  category: "",
+  eventImageUrl: "",
+  metadata: null,
+  previousPrice: null,
+  volume24h: 0n,
+};
 /** Collateral of the reference buy behind `ApiMarket.book` (one CC — a retail-sized order). */
 const BOOK_REFERENCE_CC = 1;
 
@@ -122,7 +139,12 @@ export class MarketsService {
       default:
         qb.andWhere("m.status = :status", { status: query.status });
     }
-    if (query.category) qb.andWhere("m.category = :category", { category: query.category });
+    // A market's category is its series' (through the event) — the contract carries none.
+    if (query.category)
+      qb.andWhere(
+        "m.event_ticker IN (SELECT e.ticker FROM to_events e JOIN to_series s ON s.ticker = e.series_ticker WHERE s.category ILIKE :category)",
+        { category: query.category },
+      );
     if (query.event)
       qb.andWhere("m.event_ticker = :event", { event: query.event.trim().toUpperCase() });
     if (query.series)
@@ -136,7 +158,7 @@ export class MarketsService {
       });
     if (query.q)
       qb.andWhere(
-        "(m.question ILIKE :q OR m.description ILIKE :q OR m.category ILIKE :q OR m.ticker ILIKE :q OR m.event_ticker ILIKE :q)",
+        "(m.question ILIKE :q OR m.ticker ILIKE :q OR m.event_ticker ILIKE :q OR m.ticker IN (SELECT md.ticker FROM to_market_metadata md WHERE md.description ILIKE :q))",
         { q: `%${escapeLike(query.q)}%` },
       );
     switch (query.sort ?? "newest") {
@@ -167,9 +189,15 @@ export class MarketsService {
     };
   }
 
+  /** Series categories with their live market counts (through the event); uncategorised series are left out. */
   async categories(): Promise<{ category: string; markets: number }[]> {
     const rows = await this.dataSource.query<{ category: string; markets: string }[]>(
-      `SELECT category, COUNT(*)::text AS markets FROM to_markets WHERE archived = false GROUP BY category ORDER BY COUNT(*) DESC, category ASC`,
+      `SELECT s.category, COUNT(m.market_id)::text AS markets
+         FROM to_markets m
+         JOIN to_events e ON e.ticker = m.event_ticker
+         JOIN to_series s ON s.ticker = e.series_ticker
+        WHERE m.archived = false AND s.category <> ''
+        GROUP BY s.category ORDER BY COUNT(m.market_id) DESC, s.category ASC`,
     );
     return rows.map((r) => ({ category: r.category, markets: Number(r.markets) }));
   }
@@ -215,8 +243,10 @@ export class MarketsService {
   }
 
   /**
-   * Series membership (through the event) and the 24 h figures, from the hourly candles the
-   * projection maintains (docs/MARKETS.md §5) — two set queries however long the list is.
+   * The catalog side (series and category through the event, the event's image), the
+   * backend-owned presentation (`to_market_metadata`, keyed by ticker) and the 24 h figures from
+   * the hourly candles the projection maintains (docs/MARKETS.md §5) — a fixed number of set
+   * queries however long the list is.
    */
   async extrasFor(
     rows: MarketEntity[],
@@ -226,13 +256,35 @@ export class MarketsService {
     if (rows.length === 0) return out;
     const ids = rows.map((m) => String(m.marketId));
     const eventTickers = [...new Set(rows.map((m) => m.eventTicker))];
-    const seriesByEvent = new Map<string, string>();
+    const catalogByEvent = new Map<string, { seriesTicker: string; category: string; imageUrl: string }>();
+    const metadataByTicker = new Map<string, { imageUrl: string; description: string; updatedAt: Date }>();
     if (eventTickers.length > 0) {
-      const events = await manager.query<{ ticker: string; series_ticker: string }[]>(
-        `SELECT ticker, series_ticker FROM to_events WHERE ticker = ANY($1::text[])`,
+      const events = await manager.query<
+        { ticker: string; series_ticker: string; image_url: string; category: string | null }[]
+      >(
+        `SELECT e.ticker, e.series_ticker, e.image_url, s.category
+           FROM to_events e LEFT JOIN to_series s ON s.ticker = e.series_ticker
+          WHERE e.ticker = ANY($1::text[])`,
         [eventTickers],
       );
-      for (const e of events) seriesByEvent.set(e.ticker, e.series_ticker);
+      for (const e of events)
+        catalogByEvent.set(e.ticker, {
+          seriesTicker: e.series_ticker,
+          category: e.category ?? "",
+          imageUrl: e.image_url,
+        });
+      const metadata = await manager.query<
+        { ticker: string; image_url: string; description: string; updated_at: Date }[]
+      >(
+        `SELECT ticker, image_url, description, updated_at FROM to_market_metadata WHERE ticker = ANY($1::text[])`,
+        [rows.map((m) => m.ticker)],
+      );
+      for (const md of metadata)
+        metadataByTicker.set(md.ticker, {
+          imageUrl: md.image_url,
+          description: md.description,
+          updatedAt: new Date(md.updated_at),
+        });
     }
     const since = new Date(Date.now() - 86_400_000).toISOString();
     const [volumes, previous, firsts] = await Promise.all([
@@ -259,8 +311,12 @@ export class MarketsService {
     const prevById = new Map(previous.map((r) => [Number(r.market_id), parseCC(r.close)]));
     const firstById = new Map(firsts.map((r) => [Number(r.market_id), parseCC(r.open)]));
     for (const m of rows) {
+      const catalog = catalogByEvent.get(m.eventTicker);
       out.set(m.marketId, {
-        seriesTicker: seriesByEvent.get(m.eventTicker) ?? null,
+        seriesTicker: catalog?.seriesTicker ?? null,
+        category: catalog?.category ?? "",
+        eventImageUrl: catalog?.imageUrl ?? "",
+        metadata: metadataByTicker.get(m.ticker) ?? null,
         previousPrice: prevById.get(m.marketId) ?? firstById.get(m.marketId) ?? null,
         volume24h: volumeById.get(m.marketId) ?? 0n,
       });
@@ -269,14 +325,21 @@ export class MarketsService {
   }
 
   async summaries(marketIds: number[]): Promise<Map<number, ApiMarketSummary>> {
-    const out = new Map<number, ApiMarketSummary>();
-    if (marketIds.length === 0) return out;
+    if (marketIds.length === 0) return new Map();
     const rows = await this.dataSource
       .getRepository(MarketEntity)
       .createQueryBuilder("m")
       .where("m.market_id IN (:...ids)", { ids: [...new Set(marketIds)] })
       .getMany();
-    for (const m of rows) out.set(m.marketId, this.toSummary(m));
+    return this.summariesOf(rows);
+  }
+
+  /** Summaries for rows already in hand (portfolio) — one batch of extras for the image and category. */
+  async summariesOf(rows: MarketEntity[]): Promise<Map<number, ApiMarketSummary>> {
+    const out = new Map<number, ApiMarketSummary>();
+    if (rows.length === 0) return out;
+    const extras = await this.extrasFor(rows);
+    for (const m of rows) out.set(m.marketId, this.toSummary(m, extras.get(m.marketId) ?? NO_EXTRAS));
     return out;
   }
 
@@ -579,10 +642,17 @@ export class MarketsService {
       templateId: m.templateId,
       admin: m.admin,
       question: m.question,
-      imageUrl: m.imageUrl,
-      description: m.description,
+      imageUrl: imageUrlOf(extras),
+      description: extras.metadata?.description ?? "",
       resolutionDescription: m.resolutionDescription,
-      category: m.category,
+      category: extras.category,
+      metadata: extras.metadata
+        ? {
+            imageUrl: extras.metadata.imageUrl,
+            description: extras.metadata.description,
+            updatedAt: extras.metadata.updatedAt.toISOString(),
+          }
+        : null,
       createdAt: secToIso(m.createdAtSec),
       expiresAt: secToIso(m.expiresAtSec),
       tradingStartsAt: secToIso(m.createdAtSec + m.liquidityPeriodSecs),
@@ -644,7 +714,7 @@ export class MarketsService {
     return api;
   }
 
-  toSummary(m: MarketEntity): ApiMarketSummary {
+  toSummary(m: MarketEntity, extras: MarketExtras = NO_EXTRAS): ApiMarketSummary {
     return {
       marketId: m.marketId,
       ticker: m.ticker,
@@ -653,8 +723,8 @@ export class MarketsService {
       noSubTitle: m.noSubTitle,
       contractId: m.contractId,
       question: m.question,
-      imageUrl: m.imageUrl,
-      category: m.category,
+      imageUrl: imageUrlOf(extras),
+      category: extras.category,
       status: m.status,
       outcome: m.outcome,
       currentPrice: formatCC(m.currentPrice),
@@ -775,4 +845,9 @@ export function whereParties<T extends object>(
   parties: string[],
 ): SelectQueryBuilder<T> {
   return qb.andWhere(`${column} IN (:...parties)`, { parties });
+}
+
+/** The market's own image when the operator set one, else its event's, else "" (docs/MARKETS.md §1). */
+function imageUrlOf(extras: MarketExtras): string {
+  return extras.metadata?.imageUrl || extras.eventImageUrl || "";
 }

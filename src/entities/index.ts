@@ -25,6 +25,7 @@ export * from "./prediction-model.entity";
 export * from "./ledger-transfer.entity";
 export * from "./series.entity";
 export * from "./catalog-event.entity";
+export * from "./market-metadata.entity";
 export * from "./market-candle.entity";
 
 import { AttestationEntity } from "./attestation.entity";
@@ -43,6 +44,7 @@ import { LedgerWalletEntity } from "./ledger-wallet.entity";
 import { LiquidityPositionEntity } from "./liquidity-position.entity";
 import { MarketCandleEntity } from "./market-candle.entity";
 import { MarketEventEntity } from "./market-event.entity";
+import { MarketMetadataEntity } from "./market-metadata.entity";
 import { MarketSnapshotEntity } from "./market-snapshot.entity";
 import { MarketEntity } from "./market.entity";
 import { ModelForecastEntity } from "./model-forecast.entity";
@@ -87,5 +89,6 @@ export const postgresEntities = [
   // market catalog + candles (docs/MARKETS.md) — catalog rows reference markets by ticker, never by FK
   SeriesEntity,
   CatalogEventEntity,
+  MarketMetadataEntity,
   MarketCandleEntity,
 ];

@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common";
 import { DataSource, type EntityManager } from "typeorm";
 
 import { CatalogEventEntity } from "../entities/catalog-event.entity";
+import { MarketMetadataEntity } from "../entities/market-metadata.entity";
 import { MarketEntity } from "../entities/market.entity";
 import { SeriesEntity } from "../entities/series.entity";
 import {
@@ -51,6 +52,12 @@ export interface EventInput {
   productMetadata?: Record<string, unknown>;
 }
 export type EventPatch = Partial<Omit<EventInput, "ticker">> & { archived?: boolean };
+
+/** The backend-owned presentation of a market (`to_market_metadata`); a field left out is untouched. */
+export interface MarketMetadataPatch {
+  imageUrl?: string;
+  description?: string;
+}
 
 export interface SeriesListQuery {
   category?: string;
@@ -335,6 +342,41 @@ export class CatalogService {
     });
   }
 
+  // ───────────────────────────────────────────── market metadata ─────────────────────────────────────────────
+
+  /**
+   * `PATCH /admin/markets/:market/metadata`: the market's image and description live here, not on
+   * the contract (docs/MARKETS.md §1), so an operator fixes them in place. `ref` is an id or a
+   * ticker; the row is keyed by the ticker the index holds for the market.
+   */
+  async updateMarketMetadata(
+    ref: string,
+    patch: MarketMetadataPatch,
+    actor: Actor,
+    reason?: string,
+  ): Promise<ApiMarket> {
+    if (patch.imageUrl === undefined && patch.description === undefined)
+      throw new ApiError(400, "validation_failed", "nothing to update: send imageUrl and/or description");
+    const market = await this.markets.resolve(ref);
+    await this.dataSource.transaction(async (manager) => {
+      const repo = manager.getRepository(MarketMetadataEntity);
+      const row =
+        (await repo.findOneBy({ ticker: market.ticker })) ??
+        repo.create({ ticker: market.ticker, imageUrl: "", description: "" });
+      if (patch.imageUrl !== undefined) row.imageUrl = patch.imageUrl;
+      if (patch.description !== undefined) row.description = patch.description;
+      row.updatedByUserId = actor.userId ?? null;
+      await repo.save(row);
+      await this.record(manager, actor, "catalog.market_metadata_updated", "market", market.ticker, {
+        reason,
+        marketId: market.marketId,
+        fields: Object.keys(patch).filter((k) => patch[k as keyof MarketMetadataPatch] !== undefined),
+      });
+    });
+    await this.announce("market", market.ticker);
+    return this.markets.get(market.marketId);
+  }
+
   // ───────────────────────────────────────────── shaping ─────────────────────────────────────────────
 
   private async toApiEvents(
@@ -458,7 +500,8 @@ export class CatalogService {
       | "catalog.series_created"
       | "catalog.series_updated"
       | "catalog.event_created"
-      | "catalog.event_updated",
+      | "catalog.event_updated"
+      | "catalog.market_metadata_updated",
     subjectType: string,
     subjectId: string,
     metadata: Record<string, unknown>,
@@ -478,7 +521,7 @@ export class CatalogService {
     );
   }
 
-  private async announce(kind: "series" | "event", ticker: string): Promise<void> {
+  private async announce(kind: "series" | "event" | "market", ticker: string): Promise<void> {
     await this.nats.publishSafe(NatsSubjects.catalogChanged, { kind, ticker });
   }
 }
