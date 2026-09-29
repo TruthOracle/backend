@@ -118,6 +118,14 @@ price-history,forecasts,attestations}`, `/me/{positions,liquidity,trades,activit
 `/in-app-wallet/{ledger,history,transfers}`, `/stats`, `/leaderboard`, `/ledger/{status,wait}`
 and `/admin/ledger/*` read it. Design, tables, derivations and operations: `docs/INDEXER.md`.
 
+## CI
+
+`.github/workflows/ci.yml` runs on every push to a pull request and on `main`, with Postgres 16
+and Redis 7 as service containers: typecheck, lint, the unit suite, `nest build`, a migration
+round trip (apply everything, roll everything back, fail if any `to_*` table survives, apply
+again), then the e2e suite. The ledger, the wallet and NATS are faked by the test helpers, so
+the run needs no credentials.
+
 ## Status
 
 Every package has landed and been reconciled: F (foundation) plus P1–P5 (auth + me, wallets +
