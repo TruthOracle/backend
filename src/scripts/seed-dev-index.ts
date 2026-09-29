@@ -37,7 +37,7 @@ interface DemoSeries {
   tags: string[];
   description: string;
 }
-interface DemoEvent {
+export interface DemoEvent {
   ticker: string;
   series: string;
   title: string;
@@ -45,9 +45,10 @@ interface DemoEvent {
   imageUrl: string;
   description: string;
   mutuallyExclusive: boolean;
-  expiresInDays: number;
+  /** Epoch seconds: the event's decisive moment (statement, kick-off, reference fix); trading stops here. */
+  closesAtSec: number;
 }
-interface DemoMarket {
+export interface DemoMarket {
   event: string;
   suffix: string;
   question: string;
@@ -67,20 +68,132 @@ const SERIES: DemoSeries[] = [
   { ticker: "DEMO-EPL", title: "Premier League match results", category: "Sports", frequency: "weekly", tags: ["football", "epl"], description: "Demo: full-time results of Premier League fixtures." },
   { ticker: "DEMO-BTC", title: "Bitcoin price levels", category: "Crypto", frequency: "monthly", tags: ["bitcoin", "crypto"], description: "Demo: BTC/USD reference price at month end." },
 ];
-const EVENTS: DemoEvent[] = [
-  { ticker: "DEMO-FED-26MAR", series: "DEMO-FED", title: "Fed decision, March 2026", subTitle: "March FOMC meeting", imageUrl: "https://placehold.co/640x360/0f172a/ffffff?text=FOMC+March+2026", description: "Demo event: what the FOMC does to the target range at its March 2026 meeting.", mutuallyExclusive: true, expiresInDays: 45 },
-  { ticker: "DEMO-EPL-26MAY13", series: "DEMO-EPL", title: "Liverpool vs Brighton, 13 May 2026", subTitle: "Anfield, matchday 37", imageUrl: "https://placehold.co/640x360/14532d/ffffff?text=LIV+v+BHA", description: "Demo event: the full-time result at Anfield.", mutuallyExclusive: true, expiresInDays: 60 },
-  { ticker: "DEMO-BTC-26JUN", series: "DEMO-BTC", title: "Bitcoin above $150k by 30 June 2026?", subTitle: "Month-end reference price", imageUrl: "https://placehold.co/640x360/78350f/ffffff?text=BTC+%24150k", description: "Demo event: one binary market on the June month-end reference price.", mutuallyExclusive: false, expiresInDays: 90 },
+/**
+ * FOMC policy statements, released at 2:00 pm ET on the second day of each meeting
+ * (federalreserve.gov/monetarypolicy/fomccalendars.htm; each date is tentative until the
+ * preceding meeting confirms it). UTC shifts with US daylight saving: 18:00 in EDT, 19:00 in EST.
+ * Extend the list when the Fed publishes the next year.
+ */
+const FOMC_MEETINGS: { days: string; statementUtc: string }[] = [
+  { days: "27–28 October 2026", statementUtc: "2026-10-28T18:00:00Z" },
+  { days: "8–9 December 2026", statementUtc: "2026-12-09T19:00:00Z" },
+  { days: "26–27 January 2027", statementUtc: "2027-01-27T19:00:00Z" },
+  { days: "16–17 March 2027", statementUtc: "2027-03-17T18:00:00Z" },
+  { days: "27–28 April 2027", statementUtc: "2027-04-28T18:00:00Z" },
+  { days: "8–9 June 2027", statementUtc: "2027-06-09T18:00:00Z" },
+  { days: "27–28 July 2027", statementUtc: "2027-07-28T18:00:00Z" },
+  { days: "14–15 September 2027", statementUtc: "2027-09-15T18:00:00Z" },
+  { days: "26–27 October 2027", statementUtc: "2027-10-27T18:00:00Z" },
+  { days: "7–8 December 2027", statementUtc: "2027-12-08T19:00:00Z" },
 ];
-const MARKETS: DemoMarket[] = [
-  { event: "DEMO-FED-26MAR", suffix: "CUT25", question: "Will the Fed cut by at least 25 bps in March 2026?", yes: "Cut ≥ 25 bps", no: "Smaller or none", rules: "Resolves Yes if the FOMC statement of the March 2026 meeting lowers the upper bound of the federal funds target range by 25 bps or more.", description: "The market on a March cut of a quarter point or more.", imageUrl: "https://placehold.co/96x96/2563eb/ffffff?text=CUT", startPrice: 0.42, tradesPerDay: 4, tradesLastDayPerHour: 1.4 },
-  { event: "DEMO-FED-26MAR", suffix: "HOLD", question: "Will the Fed hold rates in March 2026?", yes: "Hold", no: "Cut or hike", rules: "Resolves Yes if the FOMC statement of the March 2026 meeting leaves the target range unchanged.", description: "The market on the range staying where it is.", imageUrl: "https://placehold.co/96x96/16a34a/ffffff?text=HOLD", startPrice: 0.46, tradesPerDay: 3, tradesLastDayPerHour: 1.1 },
-  { event: "DEMO-FED-26MAR", suffix: "HIKE", question: "Will the Fed hike rates in March 2026?", yes: "Hike", no: "Hold or cut", rules: "Resolves Yes if the FOMC statement of the March 2026 meeting raises the upper bound of the target range.", description: "The tail: a March hike.", imageUrl: "https://placehold.co/96x96/d97706/ffffff?text=HIKE", startPrice: 0.08, tradesPerDay: 1.5, tradesLastDayPerHour: 0.5 },
-  { event: "DEMO-EPL-26MAY13", suffix: "LIV", question: "Will Liverpool beat Brighton on 13 May 2026?", yes: "Liverpool win", no: "Draw or Brighton", rules: "Resolves Yes on a Liverpool win at full time (90 minutes plus stoppage time) per the Premier League's official result.", description: "Home win at Anfield.", imageUrl: "https://placehold.co/96x96/c8102e/ffffff?text=LFC", startPrice: 0.55, tradesPerDay: 5, tradesLastDayPerHour: 1.6 },
-  { event: "DEMO-EPL-26MAY13", suffix: "DRAW", question: "Will Liverpool and Brighton draw on 13 May 2026?", yes: "Draw", no: "Either side wins", rules: "Resolves Yes on a draw at full time per the Premier League's official result.", description: "The draw.", imageUrl: "https://placehold.co/96x96/475569/ffffff?text=DRAW", startPrice: 0.24, tradesPerDay: 2, tradesLastDayPerHour: 0.8 },
-  { event: "DEMO-EPL-26MAY13", suffix: "BHA", question: "Will Brighton beat Liverpool on 13 May 2026?", yes: "Brighton win", no: "Draw or Liverpool", rules: "Resolves Yes on a Brighton win at full time per the Premier League's official result.", description: "The away win.", imageUrl: "https://placehold.co/96x96/0057b8/ffffff?text=BHA", startPrice: 0.21, tradesPerDay: 2, tradesLastDayPerHour: 0.7 },
-  { event: "DEMO-BTC-26JUN", suffix: "150K", question: "Will Bitcoin trade above $150,000 on 30 June 2026?", yes: "Above $150k", no: "At or below $150k", rules: "Resolves Yes if the CoinGecko BTC/USD reference price at 23:59 UTC on 30 June 2026 is above 150,000.", description: "The binary demo market: one event, one market.", imageUrl: "https://placehold.co/96x96/f7931a/ffffff?text=150K", startPrice: 0.31, tradesPerDay: 6, tradesLastDayPerHour: 2.2 },
-];
+/** Every demo event is at least this far ahead of the seed run, so its market has a real trading window. */
+const MIN_DAYS_AHEAD = 14;
+
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const date = (sec: number) => new Date(sec * 1000);
+const two = (n: number) => String(n).padStart(2, "0");
+/** `17 October 2026` */
+const longDate = (sec: number) => `${date(sec).getUTCDate()} ${MONTHS[date(sec).getUTCMonth()]} ${date(sec).getUTCFullYear()}`;
+/** `17 Oct 2026` */
+const shortDate = (sec: number) => `${date(sec).getUTCDate()} ${MONTHS[date(sec).getUTCMonth()].slice(0, 3)} ${date(sec).getUTCFullYear()}`;
+/** `26OCT` / `26OCT17`: the date code Kalshi-style tickers carry. */
+const tickerDate = (sec: number, withDay: boolean) =>
+  `${String(date(sec).getUTCFullYear()).slice(2)}${MONTHS[date(sec).getUTCMonth()].slice(0, 3).toUpperCase()}${withDay ? two(date(sec).getUTCDate()) : ""}`;
+const clockUtc = (sec: number) => `${two(date(sec).getUTCHours())}:${two(date(sec).getUTCMinutes())} UTC`;
+const banner = (bg: string, text: string) => `https://placehold.co/640x360/${bg}/ffffff?text=${encodeURIComponent(text).replace(/%20/g, "+")}`;
+
+/** Last Sunday of a month, 01:00 UTC: when UK clocks change (BST runs last Sunday of March to last Sunday of October). */
+function lastSundayOneUtc(year: number, month: number): number {
+  const lastDay = new Date(Date.UTC(year, month + 1, 0));
+  return Date.UTC(year, month, lastDay.getUTCDate() - lastDay.getUTCDay(), 1) / 1000;
+}
+/** The first Saturday at least `fromSec` away, at the traditional 15:00 UK kick-off, in epoch seconds. */
+function saturdayKickoff(fromSec: number): number {
+  const d = date(fromSec);
+  const day = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + ((6 - d.getUTCDay() + 7) % 7)));
+  const y = day.getUTCFullYear();
+  const noonSec = Date.UTC(y, day.getUTCMonth(), day.getUTCDate(), 12) / 1000;
+  const bst = noonSec >= lastSundayOneUtc(y, 2) && noonSec < lastSundayOneUtc(y, 9);
+  return Date.UTC(y, day.getUTCMonth(), day.getUTCDate(), bst ? 14 : 15) / 1000;
+}
+/** 23:59 UTC on the last day of the first month whose end is at least `fromSec` away. */
+function monthEndFix(fromSec: number): number {
+  const d = date(fromSec);
+  const end = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0, 23, 59) / 1000;
+  return end >= fromSec ? end : Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 2, 0, 23, 59) / 1000;
+}
+
+/**
+ * The demo catalog, dated from the run: the next FOMC decision, the next Saturday fixture and
+ * the next month-end fix, all at least MIN_DAYS_AHEAD out. Titles, tickers, questions, rules,
+ * descriptions, banners and close times all follow from those dates, so a fresh seed never shows
+ * an event that has already happened. Prices, volumes and the busier-first ordering come from
+ * the fixed parameters below (the Premier League fixture trades hardest in the last day, so it
+ * leads the trending board).
+ */
+export function demoCatalog(nowSec: number): { events: DemoEvent[]; markets: DemoMarket[] } {
+  const earliest = nowSec + MIN_DAYS_AHEAD * DAY;
+
+  const fomc = FOMC_MEETINGS.find((m) => Date.parse(m.statementUtc) / 1000 >= earliest);
+  if (!fomc) throw new Error("FOMC_MEETINGS has no meeting far enough ahead: add the next year's dates from federalreserve.gov");
+  const fedClose = Date.parse(fomc.statementUtc) / 1000;
+  const fedMonth = `${MONTHS[date(fedClose).getUTCMonth()]} ${date(fedClose).getUTCFullYear()}`;
+  const fed = `DEMO-FED-${tickerDate(fedClose, false)}`;
+  const statement = `the FOMC statement released at 2:00 pm ET (${clockUtc(fedClose)}) on ${longDate(fedClose)}`;
+
+  const kickoff = saturdayKickoff(earliest);
+  const epl = `DEMO-EPL-${tickerDate(kickoff, true)}`;
+  const matchDay = shortDate(kickoff);
+  const ftRule = "at full time (90 minutes plus stoppage time; extra time and penalties do not count) per the Premier League's official result. A match postponed or abandoned and not completed within 48 hours voids the market.";
+
+  const fix = monthEndFix(earliest);
+  const btc = `DEMO-BTC-${tickerDate(fix, false)}`;
+  const fixMonth = MONTHS[date(fix).getUTCMonth()];
+
+  const events: DemoEvent[] = [
+    {
+      ticker: fed,
+      series: "DEMO-FED",
+      title: `Fed decision, ${fedMonth}`,
+      subTitle: `FOMC meeting, ${fomc.days}`,
+      imageUrl: banner("0f172a", `FOMC ${fedMonth}`),
+      description: `Demo event. The Federal Open Market Committee meets on ${fomc.days} and publishes its decision at 2:00 pm ET (${clockUtc(fedClose)}) on ${longDate(fedClose)}. Three markets cover the move in the federal funds target range: a cut of 25 bps or more, a hold, or a hike. Exactly one resolves Yes, from the Federal Reserve's policy statement; trading stops when it is released.`,
+      mutuallyExclusive: true,
+      closesAtSec: fedClose,
+    },
+    {
+      ticker: epl,
+      series: "DEMO-EPL",
+      title: `Liverpool vs Brighton, ${matchDay}`,
+      subTitle: `Anfield · kick-off ${clockUtc(kickoff)}`,
+      imageUrl: banner("14532d", `LIV v BHA ${matchDay}`),
+      description: `Demo event. Liverpool host Brighton & Hove Albion at Anfield on ${longDate(kickoff)}, kick-off ${clockUtc(kickoff)}. Three markets cover the full-time result: a Liverpool win, a draw or a Brighton win, and exactly one resolves Yes. Only the 90 minutes plus stoppage time count, per the Premier League's official result. Trading stops at kick-off; a match postponed or abandoned and not completed within 48 hours voids all three markets and refunds the cost basis.`,
+      mutuallyExclusive: true,
+      closesAtSec: kickoff,
+    },
+    {
+      ticker: btc,
+      series: "DEMO-BTC",
+      title: `Bitcoin above $150k on ${shortDate(fix)}?`,
+      subTitle: "Month-end reference price",
+      imageUrl: banner("78350f", `BTC ${fixMonth} ${date(fix).getUTCFullYear()}`),
+      description: `Demo event. One binary market on where Bitcoin ends ${fixMonth}: it resolves Yes if the CoinGecko BTC/USD reference price at ${clockUtc(fix)} on ${longDate(fix)} is above $150,000, and No otherwise. Trading stops at that moment.`,
+      mutuallyExclusive: false,
+      closesAtSec: fix,
+    },
+  ];
+
+  const markets: DemoMarket[] = [
+    { event: fed, suffix: "CUT25", question: `Will the Fed cut rates by at least 25 bps in ${fedMonth}?`, yes: "Cut ≥ 25 bps", no: "Smaller cut, hold or hike", rules: `Resolves Yes if ${statement} lowers the upper bound of the federal funds target range by 25 bps or more versus the range in force before the meeting.`, description: `A cut of at least 25 bps at the ${MONTHS[date(fedClose).getUTCMonth()]} meeting.`, imageUrl: "https://placehold.co/96x96/2563eb/ffffff?text=CUT", startPrice: 0.42, tradesPerDay: 4, tradesLastDayPerHour: 1.4 },
+    { event: fed, suffix: "HOLD", question: `Will the Fed hold rates in ${fedMonth}?`, yes: "Hold", no: "Cut or hike", rules: `Resolves Yes if ${statement} leaves the federal funds target range unchanged.`, description: `The target range staying where it is at the ${MONTHS[date(fedClose).getUTCMonth()]} meeting.`, imageUrl: "https://placehold.co/96x96/16a34a/ffffff?text=HOLD", startPrice: 0.46, tradesPerDay: 3, tradesLastDayPerHour: 1.1 },
+    { event: fed, suffix: "HIKE", question: `Will the Fed hike rates in ${fedMonth}?`, yes: "Hike", no: "Hold or cut", rules: `Resolves Yes if ${statement} raises the upper bound of the federal funds target range.`, description: `Any increase in the target range at the ${MONTHS[date(fedClose).getUTCMonth()]} meeting.`, imageUrl: "https://placehold.co/96x96/d97706/ffffff?text=HIKE", startPrice: 0.08, tradesPerDay: 1.5, tradesLastDayPerHour: 0.5 },
+    { event: epl, suffix: "LIV", question: `Will Liverpool beat Brighton on ${matchDay}?`, yes: "Liverpool win", no: "Draw or Brighton", rules: `Resolves Yes on a Liverpool win ${ftRule}`, description: "Liverpool win at Anfield.", imageUrl: "https://placehold.co/96x96/c8102e/ffffff?text=LFC", startPrice: 0.55, tradesPerDay: 5, tradesLastDayPerHour: 3.2 },
+    { event: epl, suffix: "DRAW", question: `Will Liverpool and Brighton draw on ${matchDay}?`, yes: "Draw", no: "Either side wins", rules: `Resolves Yes on a draw ${ftRule}`, description: "The draw.", imageUrl: "https://placehold.co/96x96/475569/ffffff?text=DRAW", startPrice: 0.24, tradesPerDay: 2, tradesLastDayPerHour: 1.5 },
+    { event: epl, suffix: "BHA", question: `Will Brighton beat Liverpool on ${matchDay}?`, yes: "Brighton win", no: "Draw or Liverpool", rules: `Resolves Yes on a Brighton win ${ftRule}`, description: "Brighton win away at Anfield.", imageUrl: "https://placehold.co/96x96/0057b8/ffffff?text=BHA", startPrice: 0.21, tradesPerDay: 2, tradesLastDayPerHour: 1.4 },
+    { event: btc, suffix: "150K", question: `Will Bitcoin trade above $150,000 on ${longDate(fix)}?`, yes: "Above $150k", no: "At or below $150k", rules: `Resolves Yes if the CoinGecko BTC/USD reference price at ${clockUtc(fix)} on ${longDate(fix)} is above 150,000 USD; No otherwise.`, description: `Bitcoin above $150,000 at the end of ${fixMonth}.`, imageUrl: "https://placehold.co/96x96/f7931a/ffffff?text=150K", startPrice: 0.31, tradesPerDay: 6, tradesLastDayPerHour: 2.2 },
+  ];
+  return { events, markets };
+}
 
 /** Deterministic PRNG (mulberry32) — the same seed draws the same chart on every run. */
 function rng(seed: number): () => number {
@@ -225,11 +338,12 @@ async function clearDemo(q: QueryRunner): Promise<Record<string, number>> {
 async function seed(q: QueryRunner): Promise<Record<string, number>> {
   const nowSec = Math.floor(Date.now() / 1000);
   const startSec = periodStartSec(nowSec - DAYS * DAY, HOUR);
+  const { events: EVENTS, markets: MARKETS } = demoCatalog(nowSec);
   const admin = `demo-operator::1220${"0".repeat(64)}`;
   await insertRows(q, "to_series", ["ticker", "title", "category", "frequency", "tags", "settlement_sources", "contract_url", "description", "status", "product_metadata"],
     SERIES.map((s) => [s.ticker, s.title, s.category, s.frequency, JSON.stringify(s.tags), JSON.stringify([{ name: "Demo source", url: "https://example.com/demo" }]), null, s.description, "active", JSON.stringify({ demo: true })]));
   await insertRows(q, "to_events", ["ticker", "series_ticker", "title", "sub_title", "image_url", "description", "mutually_exclusive", "strike_date", "strike_period", "settlement_sources", "product_metadata", "archived"],
-    EVENTS.map((e) => [e.ticker, e.series, e.title, e.subTitle, e.imageUrl, e.description, e.mutuallyExclusive, new Date((nowSec + e.expiresInDays * DAY) * 1000).toISOString(), null, JSON.stringify([]), JSON.stringify({ demo: true }), false]));
+    EVENTS.map((e) => [e.ticker, e.series, e.title, e.subTitle, e.imageUrl, e.description, e.mutuallyExclusive, new Date(e.closesAtSec * 1000).toISOString(), null, JSON.stringify([]), JSON.stringify({ demo: true }), false]));
 
   let offsetSeq = 0;
   const marketRows: unknown[][] = [];
@@ -240,7 +354,7 @@ async function seed(q: QueryRunner): Promise<Record<string, number>> {
     const marketId = -(index + 1);
     const ticker = `${spec.event}-${spec.suffix}`;
     const event = EVENTS.find((e) => e.ticker === spec.event)!;
-    const expiresAt = nowSec + event.expiresInDays * DAY;
+    const expiresAt = event.closesAtSec;
     const trades = walk(spec, 1000 + index * 7919, startSec, nowSec);
     const createdOffset = OFFSET_BASE + ++offsetSeq;
     const tradeOffsets = trades.map(() => OFFSET_BASE + ++offsetSeq);
@@ -310,8 +424,10 @@ async function main(): Promise<number> {
     if (!clearOnly) {
       const inserted = await seed(runner);
       console.log(`seeded: ${JSON.stringify(inserted)}`);
-      console.log("demo markets: " + MARKETS.map((m) => `${m.event}-${m.suffix}`).join(", "));
-      console.log("read them at GET /api/v1/events?withNestedMarkets=true&sort=trending and GET /api/v1/events/DEMO-FED-26MAR/candlesticks");
+      const catalog = demoCatalog(Math.floor(Date.now() / 1000));
+      console.log("demo events: " + catalog.events.map((e) => `${e.ticker} (${e.title}, closes ${new Date(e.closesAtSec * 1000).toISOString()})`).join("; "));
+      console.log("demo markets: " + catalog.markets.map((m) => `${m.event}-${m.suffix}`).join(", "));
+      console.log(`read them at GET /api/v1/events?withNestedMarkets=true&sort=trending and GET /api/v1/events/${catalog.events[1].ticker}/candlesticks`);
     }
     await runner.commitTransaction();
     return 0;
@@ -324,9 +440,12 @@ async function main(): Promise<number> {
   }
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err: unknown) => {
-    console.error(err);
-    process.exit(1);
-  });
+// Runs only when executed (`npm run seed:dev`), never on import: the spec imports demoCatalog.
+if (require.main === module) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err: unknown) => {
+      console.error(err);
+      process.exit(1);
+    });
+}
