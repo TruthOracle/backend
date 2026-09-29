@@ -351,15 +351,23 @@ describe("catalog", () => {
     expect(submitted.ExerciseCommand.choiceArgument.expiresAt).toBe(String(Math.floor(Date.parse(expiresAt) / 1000)));
     expect((submitted.ExerciseCommand.choiceArgument.policy as { operatorResolution: boolean }).operatorResolution).toBe(true);
 
-    // The side labels default to the plain side names — the contract refuses an empty one.
+    // The side labels default to the plain side names — the contract refuses an empty one —
+    // and a blank image means the event's image.
+    await ctx.agent.patch("/api/v1/admin/events/FED-26MAR").set(headers).send({ imageUrl: "https://img.example/fed-26mar.png" }).expect(200);
     await ctx.agent
       .post("/api/v1/admin/markets")
       .set(headers)
-      .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT50", question: "Cut of at least 50 bps?", yesSubTitle: "  ", expiresAt, initialProbability: "0.1", initialValueCC: "200" })
+      .send({ eventTicker: "FED-26MAR", ticker: "FED-26MAR-CUT50", question: "Cut of at least 50 bps?", yesSubTitle: "  ", imageUrl: " ", expiresAt, initialProbability: "0.1", initialValueCC: "200" })
       .expect(200);
     expect(ctx.wallet.submits).toHaveLength(2);
     const second = ctx.wallet.submits[1].commands[0] as { ExerciseCommand: { choiceArgument: Record<string, unknown> } };
-    expect(second.ExerciseCommand.choiceArgument).toMatchObject({ ticker: "FED-26MAR-CUT50", eventTicker: "FED-26MAR", yesSubTitle: "Yes", noSubTitle: "No" });
+    expect(second.ExerciseCommand.choiceArgument).toMatchObject({
+      ticker: "FED-26MAR-CUT50",
+      eventTicker: "FED-26MAR",
+      yesSubTitle: "Yes",
+      noSubTitle: "No",
+      imageUrl: "https://img.example/fed-26mar.png",
+    });
     // The identity is required: no ticker, no event, an over-long label — nothing is submitted.
     for (const body of [
       { eventTicker: "FED-26MAR", question: "x" },

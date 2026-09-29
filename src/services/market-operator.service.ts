@@ -120,7 +120,9 @@ export class MarketOperatorService {
 
     const choiceArgument = {
       question: input.question.trim(),
-      imageUrl: input.imageUrl ?? event.imageUrl ?? "",
+      // Blank means "the event's image": the event is the catalog's artwork carrier, a market
+      // only overrides it when the operator sets one explicitly.
+      imageUrl: input.imageUrl?.trim() || event.imageUrl || "",
       description: input.description ?? "",
       resolutionDescription: input.resolutionDescription ?? "",
       category: (input.category ?? series?.category ?? "").trim(),
