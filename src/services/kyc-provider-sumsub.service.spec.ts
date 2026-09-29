@@ -1,6 +1,15 @@
 import { createHmac } from "node:crypto";
 
-import { normaliseSumsubApplicant, parseSumsubEvent, parseSumsubTimestamp, redactSumsubPayload, signSumsubRequest, verifySumsubDigest } from "./kyc-provider-sumsub.service";
+import {
+  acceptedDigestAlgorithms,
+  interpretSumsubProbe,
+  normaliseSumsubApplicant,
+  parseSumsubEvent,
+  parseSumsubTimestamp,
+  redactSumsubPayload,
+  signSumsubRequest,
+  verifySumsubDigest,
+} from "./kyc-provider-sumsub.service";
 
 describe("Sumsub adapter (§9.1) — locally computed vectors", () => {
   it("signs requests as hex(HMAC-SHA256(secret, ts + METHOD + path + body))", () => {
@@ -55,6 +64,10 @@ describe("Sumsub adapter (§9.1) — locally computed vectors", () => {
     expect(parseSumsubEvent({ type: "applicantTagsChanged" }, "k")?.kind).toBe("unknown");
     for (const t of ["applicantReset", "applicantDeleted", "applicantDeactivated"]) expect(parseSumsubEvent({ type: t }, "k")?.kind).toBe("reset");
     expect(parseSumsubEvent({ type: "applicantOnHold" }, "k")?.kind).toBe("onHold");
+    // Waiting states and partial resets keep the attempt in flight; a failed workflow needs an operator.
+    for (const t of ["applicantAwaitingUser", "applicantAwaitingService", "applicantStepsReset"]) expect(parseSumsubEvent({ type: t }, "k")?.kind).toBe("pending");
+    expect(parseSumsubEvent({ type: "applicantWorkflowFailed" }, "k")?.kind).toBe("onHold");
+    for (const t of ["applicantLevelChanged", "applicantActivated", "applicantPersonalInfoChanged", "applicantActionReviewed"]) expect(parseSumsubEvent({ type: t }, "k")?.kind).toBe("unknown");
     expect(parseSumsubEvent({}, "k")).toBeNull();
     expect(parseSumsubEvent("nope", "k")).toBeNull();
   });
@@ -86,5 +99,23 @@ describe("Sumsub adapter (§9.1) — locally computed vectors", () => {
     expect(pending).toMatchObject({ answer: null, rejectType: null, documents: [], person: { firstName: null, lastName: null, dob: null, country: null }, levelName: null });
     const red = normaliseSumsubApplicant({ review: { reviewStatus: "completed", reviewResult: { reviewAnswer: "RED", reviewRejectType: "FINAL", rejectLabels: ["duplicate"] } }, testMode: true });
     expect(red).toMatchObject({ answer: "RED", rejectType: "FINAL", labels: ["DUPLICATE"], sandbox: true });
+  });
+});
+
+describe("Sumsub adapter — operator probe (docs/KYC.md §6)", () => {
+  it("accepts sha256 / sha512 digests by default and sha1 only when allowed", () => {
+    expect(acceptedDigestAlgorithms(false)).toEqual(["HMAC_SHA256_HEX", "HMAC_SHA512_HEX"]);
+    expect(acceptedDigestAlgorithms(true)).toEqual(["HMAC_SHA256_HEX", "HMAC_SHA512_HEX", "HMAC_SHA1_HEX"]);
+  });
+
+  it("reads the probe: 404 = credentials and signature accepted; 401 / 403 / unreachable are named", () => {
+    expect(interpretSumsubProbe(404)).toEqual({ ok: true, message: "Sumsub accepted the app token and the request signature" });
+    expect(interpretSumsubProbe(200).ok).toBe(true);
+    expect(interpretSumsubProbe(401).ok).toBe(false);
+    expect(interpretSumsubProbe(401).message).toContain("SUMSUB_APP_TOKEN / SUMSUB_SECRET_KEY");
+    expect(interpretSumsubProbe(403).ok).toBe(false);
+    expect(interpretSumsubProbe(403).message).toContain("View applicants");
+    expect(interpretSumsubProbe(0, "getaddrinfo ENOTFOUND")).toEqual({ ok: false, message: "Sumsub is unreachable: getaddrinfo ENOTFOUND" });
+    expect(interpretSumsubProbe(500)).toMatchObject({ ok: false, message: "Sumsub answered HTTP 500" });
   });
 });

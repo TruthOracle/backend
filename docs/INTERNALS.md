@@ -15,6 +15,8 @@ internal surface that other packages call.
 | **P3 — payouts** | service `payout`; controller `payouts`; processor `payout-settlement`; `src/dto/payouts.dto.ts`; specs + `test/payouts.e2e-spec.ts` |
 | **P4 — KYC** | services `kyc`, `kyc-provider-mock`, `kyc-provider-sumsub`; controllers `kyc`, `kyc-mock` (not in the barrel), `webhooks`; processor `kyc-webhook`; `src/dto/kyc.dto.ts`; `docs/KYC.md`; specs + `test/kyc.e2e-spec.ts` |
 | **P5 — admin** | service `admin`; controller `admin`; `src/dto/admin.dto.ts`; specs + `test/admin.e2e-spec.ts` |
+| **P6 — ledger index** (docs/INDEXER.md) | `src/indexer/*` (pure: `events`, `splice`, `projection`), `src/util/ledger-values.ts`, `src/util/ledger-offset.interceptor.ts`; services `ledger-stream`, `indexer`, `markets`, `portfolio`; processor `ledger-indexer`; controllers `markets`, `ledger`, `portfolio`, `ledger-wallet`, `admin-ledger`; `src/dto/ledger.dto.ts`; 14 entities + migration `LedgerIndex`; `test/helpers/ledger-fixtures.ts`, `FakeLedgerStream`; specs + `test/ledger.e2e-spec.ts` |
+| **P7 — market catalog, candles, quotes / orders, exchange** (docs/MARKETS.md) | `src/amm/*` (pure: `pm-amm` port of PmAmmMath, `market-state`), `src/indexer/candles.ts`; services `catalog`, `candles`, `quote`, `exchange`, `market-operator`; controllers `catalog`, `orders`, `exchange`, `admin-catalog` (+ `markets` gains candlesticks / quote and id-or-ticker params); `src/dto/catalog.dto.ts`, `src/dto/orders.dto.ts`; entities `SeriesEntity` (to_series), `CatalogEventEntity` (to_events), `MarketCandleEntity` (to_market_candles) + the catalog / open-interest columns on `MarketEntity`; migration `MarketCatalog`; fixtures carry the four identity fields and `at:`; specs + `test/{catalog,candles,orders}.e2e-spec.ts` |
 
 Nobody edits another package's files. Barrels are written once by F and not touched again
 (F lists every class below; a package that needs an extra injectable keeps it private to its
@@ -106,7 +108,7 @@ src/dto/common.dto.ts       PageQueryDto { page?: number }
 `telegramOidcClientId`, `telegramOidcClientSecret`, `telegramOidcIssuer`,
 `adminOperators (Map<partyId, pinnedPublicKey | "">)`,
 `ledgerApiUrl`, `enterpriseWalletUrl`, `treasuryPartyId`, `enterpriseWalletAppName`,
-`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v14 — `UserWallet.depositRefs` is mandatory, no feature flag),
+`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v15 — `UserWallet.depositRefs` and the market identity fields are mandatory, no feature flag),
 `keycloak: { url, realm, clientId, clientSecret }`, `ledgerKeycloak`, `walletKeycloak` (same shape, optional overrides),
 `zkpc: { ledgerApiUrl, keycloakUrl, keycloakRealm, clientId, clientSecret }`,
 `kycProvider ('mock'|'sumsub')`, `kycEnforceWithdrawals` (plain flag), `kycRequiredLevel`, `kycFingerprintPepper`, `kycPepperRotationAck`,
@@ -215,6 +217,75 @@ lockedIdentityId(userId): Promise<string | null>   // used by IdentityService vi
 
 // AdminService (P5) — composes the above; no other package depends on it
 ```
+
+## Ledger index seams (P6)
+
+```ts
+// LedgerStreamService (reads as config.indexerParty; nothing cached)
+ledgerEnd(): Promise<number>; prunedOffset(): Promise<number>
+fetchUpdates({ beginExclusive, endInclusive, limit }): Promise<LedgerTransaction[]>   // throws with PARTICIPANT_PRUNED_DATA_ACCESSED in the message when pruned
+fetchActiveContracts(activeAtOffset): Promise<ActiveContractEntry[]>                   // throws when the page fills INDEXER_ACS_LIMIT
+
+// IndexerService
+runOnce(): Promise<{ applied; seen; caughtUp; bootstrapped; resynced }>   // bootstrap if needed, one page, each tx atomically with the cursor
+applyTransaction(tx): Promise<boolean>                                     // false = replay; publishes the NATS fan-out after commit
+resync(fromOffset, reason) · resyncNow(reason) · status(): Promise<ApiLedgerStatus> · currentOffset() · waitForOffset(offset, timeoutMs)
+
+// LedgerProjection (src/indexer/projection.ts, pure over an EntityManager)
+applyTransaction(manager, tx): Promise<{ applied; summary }>; applyActiveContracts(manager, entries, atOffset, "bootstrap" | "resync")
+
+// MarketsService — find(idOrTicker) · resolve(idOrTicker) (404) · list (+ event / series / tickers filters) · get · toApiMany(rows, withBlob, manager?) · extrasFor(rows) / extrasOf(market)
+//   (seriesTicker through the event, previousPrice / volume24h from the hourly candles) · toApi(m, withBlob, extras?) (+ openInterest, liquidityCC, book) · toSummary · …
+// PortfolioService — partiesOf(user) (primary + active linked wallets), positions/liquidity/trades/activity/walletHistory/indexedWallet/transfers/ledgerPayouts
+```
+
+## Market catalog, candles, quotes / orders, exchange seams (P7 — docs/MARKETS.md)
+
+```ts
+// src/amm/pm-amm.ts (pure, doubles — the PmAmmMath port)
+quoteBuy(state, side, collateralCC, nowSec) · quoteSell(state, side, sharesIn, nowSec) · quoteSwap(state, fromSide, sharesIn, nowSec)
+quoteProvideLiquidity(state, valueIncreaseCC, nowSec) · impliedQuoteBook(state, nowSec, sizeCC) · marketEffectiveL · poolValue · optimalReserves · …
+// src/amm/market-state.ts
+ammStateOf(marketRow): AmmMarketState · decimalToNumber(bigint) · numberToDecimal(number)
+
+// src/indexer/candles.ts (pure)
+candleUpsert(contribution, periodSecs): { sql, params } · periodStartSec(sec, period) · CANDLE_TRADE_CHOICES · OPEN_INTEREST_RECOMPUTE_SQL
+
+// CatalogService
+listSeries(q) · getSeries(ticker) → { series, events } · createSeries(input, actor, reason?) · updateSeries(ticker, patch, actor, reason?)
+listEvents(q { series?, status?, category?, q?, withNestedMarkets, includeArchived, page, limit }) · getEvent(ticker) (markets nested)
+createEvent(input, actor, reason?) · updateEvent(ticker, patch, actor, reason?)
+deriveEventStatus(phases): EventStatus · normalizeTicker(raw)   // exported pure helpers
+
+// CandlesService
+candlesticks(idOrTicker, { startTs?, endTs?, periodMinutes: 1 | 60 | 1440 }): Promise<ApiCandlesticks>   // dense; 400 over 5 000 candles
+
+// QuoteService
+quote(market, { action, side?, amountCC?, shares?, slippageBps? }, nowSec?): ApiQuote           // 409 market_not_tradable / quote_unavailable
+prepare(user, market, { action, side?, amountCC?, shares?, lpTokens?, slippageBps? }): Promise<ApiPreparedOrder>   // reads wallet / position / LP cids from the index; 409 reasons per docs/MARKETS.md §7
+assertTradable(market, action, phase, nowSec)                                                    // mirrors the Daml asserts
+
+// ExchangeService
+status(): Promise<ApiExchangeStatus> · halt(): Promise<ApiExchangeHalt> · setHalt({ active, reason, estimatedResumeAt? }, actor)   // to_settings 'exchange_halt'
+
+// MarketOperatorService
+createMarket(input, actor, reason?): Promise<ApiCreateMarketResult>   // MarketCounter.CreateMarket via EnterpriseWalletService.externalSubmit, commandId create-market-<sha256(ticker)[:40]>; sideLabel(raw, "Yes" | "No") defaults the labels
+
+// src/indexer/projection.ts (identity, docs/MARKETS.md §2)
+marketIdentityOf(manager, marketId, payload) · ensureCatalogEvent(manager, marketId, eventTicker, market) · placeholderSeriesTickerOf(eventTicker)   // exported pure helper
+```
+
+Fixtures: `LedgerFixture.createMarket` / `marketPayload` accept `ticker`, `eventTicker`,
+`yesSubTitle`, `noSubTitle` (defaults `TEST-<marketId>`, `TEST`, `Yes`, `No` — every fixture market carries them), `isDynamic`,
+`liquidityL` and `at:` (the transaction's ledger time — what the candle buckets are drawn from);
+`buy` / `sell` accept `at:` too. `FakeEnterpriseWallet.externalSubmit` records a `CreateMarket`
+exercise without applying it (the market reaches the index through `FakeLedgerStream`).
+
+Fixtures: `test/helpers/ledger-fixtures.ts` builds internally consistent transactions from the Daml
+choices (`createMarket`, `createWallet`, `deposit`, `withdraw`, `markPaid`, `buy`, `sell`,
+`resolveT0`, `redeem`, `spliceTransferIn/Out`, `acsEntry`); `FakeLedgerStream` (`test/helpers/fakes.ts`)
+replaces the participant (`push()`, `pruned`, `acs`, `failNext`, `calls`). `INDEXER_ENABLED=false`
+under test — specs call `IndexerService.runOnce()` themselves.
 
 ## Test helpers (F)
 

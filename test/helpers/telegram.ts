@@ -38,13 +38,38 @@ export function nextTelegramUser(firstName: string): TelegramTestUser {
 
 /**
  * Widget payloads are single-use (`tg:<hash>` is claimed once) and `auth_date` must be fresh, so
- * every call signs anew. Two sign-ins of one user inside the same second would hash identically;
- * the rolling offset keeps `auth_date` distinct while staying well inside TELEGRAM_AUTH_MAX_AGE_SEC.
+ * every call signs anew with an auth_date this user has not been signed with before.
  */
-let authDateOffset = 0;
+/**
+ * auth_dates already signed, per Telegram user id. The server claims every payload hash once
+ * (`tg:<hash>`, the replay guard), so two payloads for the same user must never share an
+ * auth_date. The previous rolling offset (`now - n`) collided whenever two consecutive calls
+ * straddled a wall-clock second: the clock and the offset both advanced by one, the auth_date
+ * repeated, and the second sign-in was refused as a replay (the intermittent 401 in CI).
+ */
+const usedAuthDates = new Map<string, Set<number>>();
+/** Stay well inside TELEGRAM_AUTH_MAX_AGE_SEC (300 s by default). */
+const AUTH_DATE_WINDOW_SEC = 200;
+
+function uniqueAuthDate(userId: string): number {
+  const now = Math.floor(Date.now() / 1000);
+  let used = usedAuthDates.get(userId);
+  if (!used) {
+    used = new Set();
+    usedAuthDates.set(userId, used);
+  }
+  for (const t of used) if (t < now - AUTH_DATE_WINDOW_SEC) used.delete(t);
+  for (let k = 1; k < AUTH_DATE_WINDOW_SEC; k += 1) {
+    const candidate = now - k;
+    if (!used.has(candidate)) {
+      used.add(candidate);
+      return candidate;
+    }
+  }
+  throw new Error(`freshWidgetPayload: more than ${AUTH_DATE_WINDOW_SEC} sign-ins for Telegram user ${userId} within ${AUTH_DATE_WINDOW_SEC} s`);
+}
 export function freshWidgetPayload(user: TelegramTestUser, botToken = TEST_TELEGRAM_BOT_TOKEN): Record<string, string> {
-  authDateOffset = (authDateOffset + 1) % 200;
-  const fields: Record<string, string> = { id: user.id, first_name: user.first_name, auth_date: String(Math.floor(Date.now() / 1000) - authDateOffset) };
+  const fields: Record<string, string> = { id: user.id, first_name: user.first_name, auth_date: String(uniqueAuthDate(user.id)) };
   if (user.last_name !== undefined) fields.last_name = user.last_name;
   if (user.username !== undefined) fields.username = user.username;
   return signTelegramWidget(fields, botToken);

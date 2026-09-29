@@ -7,6 +7,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  Max,
   Min,
   MinLength,
   validateSync,
@@ -23,6 +24,9 @@ export type DbSslMode = (typeof DB_SSL_MODES)[number];
 
 const KYC_PROVIDERS = ["mock", "sumsub"] as const;
 export type KycProviderSetting = (typeof KYC_PROVIDERS)[number];
+
+const INDEXER_UPDATES_ENDPOINTS = ["auto", "updates", "trees"] as const;
+export type IndexerUpdatesEndpoint = (typeof INDEXER_UPDATES_ENDPOINTS)[number];
 
 export interface KeycloakConfig {
   url: string;
@@ -243,6 +247,17 @@ export class Config {
   @Min(1000)
   readonly sessionCleanupMs!: number;
 
+  // ── exchange / orders (docs/MARKETS.md §7–§8) ──────────────────────────────
+  /** `GET /exchange/status.ledger.stale`: the index row was not touched for longer than this. */
+  @IsInt()
+  @Min(10)
+  readonly exchangeStaleAfterSec!: number;
+
+  /** How long a prepared order (`POST /markets/:id/orders/prepare`) is advertised as usable. */
+  @IsInt()
+  @Min(5)
+  readonly orderPrepareTtlSec!: number;
+
   @IsInt()
   @Min(0)
   readonly ledgerCacheMs!: number;
@@ -269,6 +284,54 @@ export class Config {
   @IsBoolean()
   readonly swaggerEnabled!: boolean;
 
+  // ── ledger indexer (docs/INDEXER.md) ────────────────────────────────────────
+  /** `INDEXER_ENABLED=false` keeps the read API up on whatever was indexed but runs no loop. */
+  @IsBoolean()
+  readonly indexerEnabled!: boolean;
+
+  /** How often the loop re-reads the ledger end once it has caught up. */
+  @IsInt()
+  @Min(250)
+  readonly indexerPollMs!: number;
+
+  /** Updates requested per `/v2/updates` call (the participant caps it at its own `http-list-max-elements-limit`). */
+  @IsInt()
+  @Min(1)
+  @Max(1000)
+  readonly indexerBatch!: number;
+
+  /** ACS page size for the bootstrap / resync snapshot; a snapshot that fills it is refused as possibly truncated. */
+  @IsInt()
+  @Min(100)
+  readonly indexerAcsLimit!: number;
+
+  /** First offset to index on a never-pruned participant (0 = ledger begin — the full history). */
+  @IsInt()
+  @Min(0)
+  readonly indexerStartOffset!: number;
+
+  /** Cross-instance lock TTL; the holder renews it at a third of this. */
+  @IsInt()
+  @Min(5_000)
+  readonly indexerLockTtlMs!: number;
+
+  /** Index Canton Coin transfers between the treasury and other parties (Splice `Amulet` events). */
+  @IsBoolean()
+  readonly indexerTrackTransfers!: boolean;
+
+  /** `packageName` the participant reports for Splice Amulet events (`splice-amulet` on every Splice network so far). */
+  @IsString()
+  @IsNotEmpty()
+  readonly splicePackageName!: string;
+
+  /** `auto` tries `/v2/updates` (LEDGER_EFFECTS) and falls back to the deprecated `/v2/updates/trees` on a 404. */
+  @IsIn(INDEXER_UPDATES_ENDPOINTS as readonly string[])
+  readonly indexerUpdatesEndpoint!: IndexerUpdatesEndpoint;
+
+  /** The party the indexer reads as; blank = the treasury (signatory / observer on every TruthOracle template). */
+  @IsString()
+  readonly indexerPartyOverride!: string;
+
   // ── derived helpers ─────────────────────────────────────────────────────────
   get isMainnet(): boolean {
     return this.appNetwork === "mainnet";
@@ -285,6 +348,11 @@ export class Config {
   /** sha256 hex of the pepper — compared with `to_settings.kyc_pepper_hash` at boot (§9.6). */
   get kycPepperHash(): string {
     return createHash("sha256").update(this.kycFingerprintPepper, "utf8").digest("hex");
+  }
+
+  /** The party whose view of the ledger is indexed (`INDEXER_PARTY`, default the treasury). */
+  get indexerParty(): string {
+    return this.indexerPartyOverride || this.treasuryPartyId;
   }
 }
 
@@ -448,11 +516,25 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     },
 
     sessionCleanupMs: parseIntOr(env.SESSION_CLEANUP_MS, 3_600_000),
+    exchangeStaleAfterSec: parseIntOr(env.EXCHANGE_STALE_AFTER_SEC, 300),
+    orderPrepareTtlSec: parseIntOr(env.ORDER_PREPARE_TTL_SEC, 60),
     ledgerCacheMs: parseIntOr(env.LEDGER_CACHE_MS, 15_000),
     depositLockTtlMs: parseIntOr(env.DEPOSIT_LOCK_TTL_MS, 300_000),
     depositConfirmGraceMs: parseIntOr(env.DEPOSIT_CONFIRM_GRACE_MS, 10 * 60_000),
     sentryDsn: str(env.SENTRY_DSN),
     swaggerEnabled: parseAutoBool(env.SWAGGER_ENABLED, !isProd),
+
+    indexerEnabled: parseBool(env.INDEXER_ENABLED, true),
+    indexerPollMs: parseIntOr(env.INDEXER_POLL_MS, 2_000),
+    indexerBatch: parseIntOr(env.INDEXER_BATCH, 200),
+    indexerAcsLimit: parseIntOr(env.INDEXER_ACS_LIMIT, 10_000),
+    indexerStartOffset: parseIntOr(env.INDEXER_START_OFFSET, 0),
+    indexerLockTtlMs: parseIntOr(env.INDEXER_LOCK_TTL_MS, 30_000),
+    indexerTrackTransfers: parseBool(env.INDEXER_TRACK_TRANSFERS, true),
+    splicePackageName: str(env.SPLICE_AMULET_PACKAGE_NAME, "splice-amulet") || "splice-amulet",
+    indexerUpdatesEndpoint: (str(env.INDEXER_UPDATES_ENDPOINT, "auto").toLowerCase() ||
+      "auto") as IndexerUpdatesEndpoint,
+    indexerPartyOverride: str(env.INDEXER_PARTY),
   };
 
   // Object.assign (not class-transformer): plainToInstance would rebuild the Map as an empty one.
@@ -504,6 +586,12 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     if (key && !/^[A-Za-z0-9+/=_-]{40,90}$/.test(key)) {
       issues.push(`ADMIN_OPERATORS pinned key for ${party.slice(0, 24)}… is not hex/base64`);
     }
+  }
+  if (
+    config.indexerPartyOverride &&
+    !/^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}$/.test(config.indexerPartyOverride)
+  ) {
+    issues.push("INDEXER_PARTY is not a Canton party id");
   }
   for (const origin of [...config.frontendOrigins, ...config.corsOrigins]) {
     if (!/^https?:\/\/[A-Za-z0-9*.-]+(:\d+)?$/.test(origin)) {

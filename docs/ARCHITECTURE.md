@@ -25,8 +25,8 @@ authority, state or a secret:
 2. **Wallets** — several Canton wallets (Cantor8 today) link to one account. One is the
    **primary** wallet: it owns the on-ledger `UserWallet` (in-app balance). Deposits from
    *any* linked wallet credit that balance, attributed per wallet.
-3. **KYC** — provider-agnostic verification (vendor not yet chosen; a mock adapter for dev and
-   a Sumsub adapter kept as the reference implementation of the provider interface — see docs/KYC.md),
+3. **KYC** — provider-agnostic verification (Sumsub is the production provider, a mock adapter
+   serves dev and tests — see docs/KYC.md),
    attached to the account and to the sign-in identity that started it, enforced at the
    point real CC leaves the platform (external withdrawal settlement). After an approved
    KYC, the verified natural person is bound to exactly one account, permanently, until an
@@ -724,7 +724,9 @@ Codes: `unauthenticated`, `forbidden`, `csrf_rejected`, `rate_limited`, `identit
 `no_primary_wallet`, `primary_wallet_in_use`, `deposit_in_progress`,
 `deposit_attribution_drift`, `payout_not_found`, `payout_blocked` (`details.status` names the
 blocking payout status), `kyc_required`, `kyc_duplicate_identity`, `kyc_provider_unavailable`,
-`webhook_rejected`, `invalid_credential`, `oidc_failed`, `user_suspended`, `validation_failed`,
+`webhook_rejected`, `invalid_credential`, `oidc_failed`, `user_suspended`, `trading_halted`,
+`market_not_tradable`, `no_in_app_wallet`, `no_position`, `insufficient_balance`, `insufficient_shares`,
+`quote_unavailable`, `catalog_conflict` (markets / orders, docs/MARKETS.md), `validation_failed`,
 `bad_request`, `not_found`, `payload_too_large`, `unsupported_media_type`, `upstream_failed`,
 `not_ready`, `internal_error`, `backend_unconfigured` and `backend_unreachable` (proxy only).
 The authoritative list is `ERROR_CODES` in `src/types.ts`; the frontend mirrors it in
@@ -746,7 +748,7 @@ TELEGRAM_BOT_TOKEN  TELEGRAM_BOT_USERNAME  TELEGRAM_AUTH_MAX_AGE_SEC=300  TELEGR
 TELEGRAM_OIDC_CLIENT_ID  TELEGRAM_OIDC_CLIENT_SECRET  TELEGRAM_OIDC_ISSUER=https://oauth.telegram.org
 ADMIN_OPERATORS (party[=publicKey], comma)
 LEDGER_API_URL  ENTERPRISE_WALLET_URL  TREASURY_PARTY_ID  ENTERPRISE_WALLET_APP_NAME=truthoracle
-TRUTHORACLE_PACKAGE_ID=64653d3a4b63abcff3a0f016cdf08b0c46aa827f0b971b8990a7fdf5ede6446a  TRUTHORACLE_PACKAGE_NAME=truthoracle-v14
+TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload>  TRUTHORACLE_PACKAGE_NAME=truthoracle-v15
 KEYCLOAK_URL KEYCLOAK_REALM KEYCLOAK_CLIENT_ID KEYCLOAK_CLIENT_SECRET  LEDGER_KEYCLOAK_* WALLET_KEYCLOAK_*  ZKPC_*
 KYC_PROVIDER=mock|sumsub  KYC_ENFORCE_WITHDRAWALS=false  KYC_REQUIRED_LEVEL=basic-kyc-level
 KYC_FINGERPRINT_PEPPER (≥32)  KYC_PEPPER_ROTATION_ACK=
@@ -754,7 +756,7 @@ PAYOUT_EXTERNAL_REASONS=withdraw  PAYOUT_INAPP_REASONS=bond,model-prize  PAYOUT_
 SUMSUB_BASE_URL=https://api.sumsub.com SUMSUB_APP_TOKEN SUMSUB_SECRET_KEY SUMSUB_WEBHOOK_SECRET SUMSUB_DUPLICATE_LABELS=DUPLICATE SUMSUB_ALLOW_SHA1=false
 SESSION_CLEANUP_MS=3600000  LEDGER_CACHE_MS=15000  DEPOSIT_LOCK_TTL_MS=300000  DEPOSIT_CONFIRM_GRACE_MS=600000  SENTRY_DSN  SWAGGER_ENABLED=auto
 ```
-The deployed Daml package is **truthoracle-v14 1.0.0** (`UserWallet.depositRefs : [Text]`
+The deployed Daml package is **truthoracle-v15 1.0.0** (`UserWallet.depositRefs : [Text]`
 mandatory); the two values above are the documented defaults in `.env.example`. There is no
 Daml feature flag: a `UserWallet` read without `depositRefs` is a `502 upstream_failed` (wrong
 package deployed), never "no refs". `KYC_ENFORCE_WITHDRAWALS` is a plain flag — money leaves
@@ -891,7 +893,7 @@ Changed files:
 
 - Phase 1 (this change): backend (accounts, sign-in, wallet linking, session-gated deposit
   reconciliation, KYC with mock provider, gated payout settlement, admin API) and frontend
-  integration, deployed **together with the Daml package truthoracle-v14 1.0.0** against a
+  integration, deployed **together with the Daml package truthoracle-v15 1.0.0** against a
   fresh database (one `Init` migration — nothing is migrated from an earlier layout, §18).
   The frontend has no account-less money path: deposits and withdrawal settlement go through
   the backend and require a signed-in account; trading and reads stay wallet-signed.
@@ -924,7 +926,7 @@ frontend are designed greenfield:
   flow the browser forbids.
 - Consequently there is no seed from the ledger at link time, no silent repair of a ledger
   surplus (drift in either direction is refused), no Daml feature flag for `depositRefs`
-  (mandatory on truthoracle-v14), no boot-time precondition in front of
+  (mandatory on truthoracle-v15), no boot-time precondition in front of
   `KYC_ENFORCE_WITHDRAWALS`, no fallback to an older Enterprise Wallet history endpoint, and a
   single `Init` migration creates the final schema.
 - Still in place because it is sound regardless of history: write-ahead deposit credits with
@@ -938,7 +940,7 @@ frontend are designed greenfield:
 |---|---|---|
 | Account-less money paths | kept "unchanged" through Phase 1 | none exist (§18): deposits and withdrawal settlement require an account; `KYC_ENFORCE_WITHDRAWALS` is a plain flag |
 | Deposit attribution | `credited_cc` starts at 0 | `credited_cc` starts at 0 and is the only attribution; linking never reads the ledger; drift in **either** direction is a hard `409 deposit_attribution_drift` (nothing is repaired silently) |
-| Deposit confirmation | `depositedCC` grew by the amount | `UserWallet.depositRefs` contains the row's `txRef` (mandatory on truthoracle-v14) |
+| Deposit confirmation | `depositedCC` grew by the amount | `UserWallet.depositRefs` contains the row's `txRef` (mandatory on truthoracle-v15) |
 | Deposit crash safety | DB bump after submit | write-ahead `to_deposit_credits` + confirm pass; lock TTL 300 s |
 | Attribution scope | active wallets | all wallet rows; party bound to first account forever; relink reactivates |
 | Arithmetic | JS numbers, dust tolerance | fixed point bigint, exact invariant |
@@ -964,3 +966,14 @@ frontend are designed greenfield:
 | Stack | ioredis 6, CJS jest, TS 6.0.x, Node ≥22.12 | ioredis 5.11.1, Jest ESM mode, TS 6.0.3 exact, Node ^22.18 ‖ ≥24.11, explicit rootDir, migrations via dist |
 | CI | "root workflow" | own workflow in this repo |
 | Frontend providers | AuthProvider in main.tsx | duplicate WalletProvider removed; AuthProvider inside Wallet + Router; three wallet/account UI states |
+
+## Time
+
+UTC is the platform's only time zone. The ledger speaks epoch seconds (Daml `Int`), the database
+stores `timestamptz`, the API emits ISO 8601 strings ending in `Z` (and epoch seconds where the
+ledger does), and candle buckets are epoch-aligned, so a daily candle is a UTC day. Every backend
+entrypoint (`main.ts`, `data-source.ts`, `src/scripts/*`) imports `src/util/utc.ts` first, which
+pins `process.env.TZ = "UTC"`: no Date is formatted or computed in the host's zone, and logs carry
+UTC timestamps (`src/util/utc.spec.ts` proves it from three non-UTC host zones). SQL keeps to
+`timestamptz` and epoch arithmetic and never casts to `date` or calls `date_trunc` in the session's
+zone. The frontend renders every instant in UTC and reads every date input as UTC.

@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import "./util/utc";
 import { setDefaultResultOrder } from "node:dns";
 import { join } from "node:path";
 import * as Sentry from "@sentry/node";

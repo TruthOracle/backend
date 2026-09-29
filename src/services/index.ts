@@ -23,3 +23,14 @@ export { KycService } from "./kyc.service";
 export { KycProviderMockService } from "./kyc-provider-mock.service";
 export { KycProviderSumsubService } from "./kyc-provider-sumsub.service";
 export { AdminService } from "./admin.service";
+// ledger indexer + index-backed reads (docs/INDEXER.md)
+export { LedgerStreamService } from "./ledger-stream.service";
+export { IndexerService } from "./indexer.service";
+export { MarketsService } from "./markets.service";
+export { PortfolioService } from "./portfolio.service";
+// market catalog, candles, quotes / orders, exchange status (docs/MARKETS.md)
+export { CatalogService } from "./catalog.service";
+export { CandlesService } from "./candles.service";
+export { ExchangeService } from "./exchange.service";
+export { QuoteService } from "./quote.service";
+export { MarketOperatorService } from "./market-operator.service";
