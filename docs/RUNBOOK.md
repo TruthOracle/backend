@@ -13,6 +13,7 @@ configured.
 | Message | Cause | Fix |
 |---|---|---|
 | `DATABASE_URL / REDIS_URL / NATS_URL is required` | a datastore is unset | set it; all three are required (NATS with JetStream, §4) |
+| `AuthorizationError: Authorization Violation` (NATS) | the NATS server requires auth and `NATS_URL` carries none, or the wrong one | put it in the URL: `nats://<token>@host:4222` for a token (Railway's NATS), `nats://<user>:<pass>@host:4222` for a user; percent-encode reserved characters |
 | `SESSION_SECRET / KYC_FINGERPRINT_PEPPER must be at least 32 characters` | short secret | `openssl rand -hex 32` |
 | `BACKEND_PROXY_SECRET must be at least 32 characters when set` | short proxy secret | same value on both sides (`truthoracle-canton` `BACKEND_PROXY_SECRET`) |
 | `KYC_PROVIDER=mock is refused when APP_ENV=prod or APP_NETWORK=mainnet` | mock KYC in a real environment | set `KYC_PROVIDER` to the chosen vendor adapter (not selected yet — see docs/KYC.md §5; `sumsub` is the reference adapter) |
