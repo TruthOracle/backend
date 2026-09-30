@@ -15,6 +15,7 @@ import { connect, nanos, type NatsConnection } from "@nats-io/transport-node";
 
 import { Config } from "../config";
 import type { NatsSubject } from "../types";
+import { natsConnectOptions } from "../util/nats-url";
 
 /** All domain events live on one JetStream stream per network: `TRUTHORACLE_<APP_NETWORK>`. */
 export const DOMAIN_SUBJECTS = ["truthoracle.>"];
@@ -71,7 +72,8 @@ export class NatsService implements OnModuleInit, BeforeApplicationShutdown, OnA
 
   async onModuleInit(): Promise<void> {
     this.nc = await connect({
-      servers: this.config.natsUrl,
+      // Credentials in NATS_URL become explicit options; the client ignores them in the URL.
+      ...natsConnectOptions(this.config.natsUrl),
       name: "truthoracle-backend",
       maxReconnectAttempts: -1,
       reconnectTimeWait: 2_000,
