@@ -42,6 +42,7 @@ import type { FakeEnterpriseWallet } from "./helpers/fakes";
 import { bodyOf, linkWallet, signInAsAdmin } from "./helpers/session";
 import { nextTelegramUser, signInWithTelegram } from "./helpers/telegram";
 import { makeTestWallet, type TestWallet } from "./helpers/wallet";
+import { FIXTURE_PACKAGE_NAME } from "./helpers/ledger-fixtures";
 
 const operator = makeTestWallet("operator");
 
@@ -610,7 +611,7 @@ describe("payouts (e2e)", () => {
         reason: "bond",
       });
       const cid = bond.contractId;
-      const walletCreateCommandId = walletCreateCommandIdFor(b.wallet.partyId);
+      const walletCreateCommandId = walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, b.wallet.partyId);
       const { settleCommandId } = commandIdsFor(cid);
 
       const body = bodyOf<SettleBody>(await settle(ctx, cid, b.cookie).expect(200));
@@ -986,7 +987,7 @@ describe("payouts (e2e)", () => {
         status: "settled_in_app",
         userId: null,
         payeeWalletId: null,
-        walletCreateCommandId: walletCreateCommandIdFor(s.unknownParty),
+        walletCreateCommandId: walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, s.unknownParty),
         settleCommandId: commandIdsFor(s.prize.contractId).settleCommandId,
       });
       expect(await payoutRow(ctx, s.withdraw.contractId)).toMatchObject({
@@ -1238,7 +1239,7 @@ describe("payouts (e2e)", () => {
       expect(body.payout).toMatchObject({ status: "settled_in_app", onLedger: false });
       expect(ctx.wallet.transfers).toHaveLength(0);
       expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([
-        walletCreateCommandIdFor(b.wallet.partyId),
+        walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, b.wallet.partyId),
         commandIdsFor(bond.contractId).settleCommandId,
       ]);
       expect((await ctx.ledger.fetchUserWallet(b.wallet.partyId))?.balanceCC).toBe(parseCC("1"));

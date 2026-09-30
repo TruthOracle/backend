@@ -6,6 +6,7 @@
 import type { ActiveContractEntry, LedgerTransaction } from "../../src/indexer/events";
 import type { ConsumedMessage, ConsumeHandler } from "../../src/services/nats.service";
 import { totalReceivedFrom } from "../../src/services/enterprise-wallet.service";
+import { walletCreateCommandIdFor } from "../../src/services/ledger-client.service";
 import type {
   ApplicantSummary,
   KycEvent,
@@ -134,6 +135,11 @@ export class FakeLedgerClient {
 
   filterTemplateId(entity: string, module = "Truthoracle"): string {
     return `#truthoracle-test:${module}:${entity}`;
+  }
+
+  /** The real id scheme under the test package name, exactly as the real client derives it. */
+  walletCreateCommandId(owner: string): string {
+    return walletCreateCommandIdFor("truthoracle-test", owner);
   }
 
   nextCid(prefix: string): string {

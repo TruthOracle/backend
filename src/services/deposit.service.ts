@@ -18,7 +18,7 @@ import { ApiError } from "../util/errors";
 import { DUST, formatCC, parseCC } from "../util/money";
 import { AuditService } from "./audit.service";
 import { EnterpriseWalletService } from "./enterprise-wallet.service";
-import { LedgerClientService, userWalletCreateCommand, walletCreateCommandIdFor } from "./ledger-client.service";
+import { LedgerClientService, userWalletCreateCommand } from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { PayoutService } from "./payout.service";
 import { RedisService } from "./redis.service";
@@ -223,7 +223,7 @@ export class DepositService {
       }
 
       // 6. the primary's UserWallet must exist BEFORE the write-ahead: it is created empty
-      //    (0/0/0) under the one deterministic id every path uses (`wallet-create-<hash(owner)>`),
+      //    (0/0/0) under the one deterministic id every path uses (`wallet-create-<hash(package name, owner)>`),
       //    so a Create racing PayoutService's in-app path collides on ledger command-dedup instead
       //    of minting a second wallet. The credit itself is then always an Exercise Deposit, whose
       //    txRef the Daml refuses to credit twice.
@@ -386,7 +386,7 @@ export class DepositService {
    * decides. A wallet that is accepted but not yet visible is a 502 the user retries.
    */
   private async ensureUserWallet(owner: string): Promise<LedgerWallet> {
-    const commandId = walletCreateCommandIdFor(owner);
+    const commandId = this.ledger.walletCreateCommandId(owner);
     try {
       await this.wallet.externalSubmit({
         commandId,

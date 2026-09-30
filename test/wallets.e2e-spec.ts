@@ -10,7 +10,7 @@
  * supertest *agent* stores the last `Set-Cookie` it saw and merges it over an explicit header, so
  * after one user signs in through it every later request would silently carry that user's session.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import request from "supertest";
 
@@ -41,6 +41,7 @@ import { TEST_ORIGIN, useTestApp } from "./helpers/app";
 import { bodyOf, cookieFromResponse, linkWallet } from "./helpers/session";
 import { nextTelegramUser, signInWithTelegram } from "./helpers/telegram";
 import { makeTestWallet, type TestWallet } from "./helpers/wallet";
+import { FIXTURE_PACKAGE_NAME } from "./helpers/ledger-fixtures";
 
 // ─────────────────────────────────────────── fakes ───────────────────────────────────────────────
 
@@ -588,7 +589,7 @@ describe("Wallets + deposits (e2e)", () => {
       const onLedger = ctx.ledger.wallets.get(A.partyId);
       expect(onLedger).toMatchObject({ owner: A.partyId, balanceCC: parseCC("12.5"), depositedCC: parseCC("12.5"), withdrawnCC: 0n });
       expect(ctx.ledger.wallets.has(B.partyId)).toBe(false);
-      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(A.partyId), res.commandId]);
+      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, A.partyId), res.commandId]);
       const [create] = ctx.wallet.submits[0].commands as LedgerCommand[];
       expect(create.CreateCommand?.templateId).toMatch(/:UserWallet$/);
       // depositRefs is mandatory on truthoracle-v16 and always sent (empty on the Create; the
@@ -911,7 +912,7 @@ describe("Wallets + deposits (e2e)", () => {
       const a = await signIn(A);
       // PayoutService created A's wallet moments ago under the shared deterministic id.
       const existing = ctx.ledger.seedUserWallet(A.partyId, {});
-      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(A.partyId), "completed");
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, A.partyId), "completed");
       ctx.wallet.seedInbound(A.partyId, "4");
 
       const res = await reconcileOk(a.cookie);
@@ -919,6 +920,26 @@ describe("Wallets + deposits (e2e)", () => {
       expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([res.commandId]);
       const [deposit] = ctx.wallet.submits[0].commands as LedgerCommand[];
       expect(deposit.ExerciseCommand).toMatchObject({ contractId: existing.contractId, choice: "Deposit" });
+      expect([...ctx.ledger.wallets.values()].filter((w) => w.owner === A.partyId)).toHaveLength(1);
+    });
+
+    it("a wallet-create id already spent under an older package does not block the Create on the current one", async () => {
+      // Regression (DevNet, 2026-09-29): the id used to hash the owner alone, so the Create that a
+      // party's truthoracle-v14 wallet had spent was refused as a duplicate on truthoracle-v16, and
+      // the credit answered 502 on every retry. Command dedup compares ids, never what they create.
+      const A = makeTestWallet("alice");
+      const a = await signIn(A);
+      const ownerOnlyId = `wallet-create-${createHash("sha256").update(A.partyId).digest("hex").slice(0, 40)}`;
+      ctx.wallet.commandStatuses.set(ownerOnlyId, "completed");
+      // ...and the same owner's Create under an older package NAME must not block it either.
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor("truthoracle-v14", A.partyId), "completed");
+      ctx.wallet.seedInbound(A.partyId, "4");
+
+      const res = await reconcileOk(a.cookie);
+      expect(res).toMatchObject({ credited: CC("4"), status: "confirmed", ledger: { owner: A.partyId, depositedCC: CC("4") } });
+      const [create] = ctx.wallet.submits;
+      expect(create.commandId).toBe(walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, A.partyId));
+      expect(create.commandId).not.toBe(ownerOnlyId);
       expect([...ctx.ledger.wallets.values()].filter((w) => w.owner === A.partyId)).toHaveLength(1);
     });
 
@@ -932,7 +953,7 @@ describe("Wallets + deposits (e2e)", () => {
       // (the wallet must be visible before the Exercise), so let it land first.
       const first = await reconcile(a.cookie);
       expectError(first, 502, "upstream_failed"); // the empty wallet is accepted but not yet visible
-      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(A.partyId)]);
+      expect(ctx.wallet.submits.map((x) => x.commandId)).toEqual([walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, A.partyId)]);
       ctx.wallet.applyPending();
       const res = await reconcileOk(a.cookie);
       expect(res).toMatchObject({ credited: CC("10"), status: "submitted", perWallet: [{ partyId: A.partyId, amountCC: CC("10") }] });
@@ -970,7 +991,7 @@ describe("Wallets + deposits (e2e)", () => {
       const a = await signIn(A);
       ctx.wallet.seedInbound(A.partyId, "3");
       ctx.ledger.seedUserWallet(A.partyId, {});
-      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(A.partyId), "completed");
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, A.partyId), "completed");
 
       // The Deposit submit dies before the wallet records anything: the row stays `submitted`.
       ctx.wallet.failNext = new Error("ECONNRESET");
@@ -1018,7 +1039,7 @@ describe("Wallets + deposits (e2e)", () => {
       const a = await signIn(A);
       ctx.wallet.seedInbound(A.partyId, "2");
       ctx.ledger.seedUserWallet(A.partyId, {});
-      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(A.partyId), "completed");
+      ctx.wallet.commandStatuses.set(walletCreateCommandIdFor(FIXTURE_PACKAGE_NAME, A.partyId), "completed");
       ctx.wallet.lagLedger = true;
       const res = await reconcileOk(a.cookie);
       expect(res.status).toBe("submitted");
