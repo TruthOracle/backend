@@ -515,9 +515,11 @@ Preconditions: `users.party_id` set (`409 no_primary_wallet`), user `active`, KY
 5. amount = Σ_w max(owed_w, 0)  (each owed_w rounded to 10 dp BEFORE summing; exact fixed point)
    if amount ≤ DUST → 200 { credited: 0, status: nothing_outstanding }
 6. if no UserWallet(owner = primary) exists: Create UserWallet { admin: treasury, owner: primary,
-   balanceCC = depositedCC = withdrawnCC = 0, depositRefs: [] } under the ONE per-owner id
-   "wallet-create-<sha256(primary)[:40]>" shared with the in-app payout path (a racing Create
-   collides on ledger command-dedup instead of minting a second wallet); re-read the wallet
+   balanceCC = depositedCC = withdrawnCC = 0, depositRefs: [] } under the ONE id per owner and
+   package name, "wallet-create-<sha256(packageName | primary)[:40]>", shared with the in-app
+   payout path (a racing Create collides on ledger command-dedup instead of minting a second
+   wallet; the package name keeps a Create spent under an older package from blocking this one,
+   because dedup compares ids, never what they create); re-read the wallet
 7. commandId = "deposit-" + sha256(primary | ledger.cid | amount | ledger.depositedCC)[:40]
    INSERT to_deposit_credits { command_id, owner_party, tx_ref: "reconcile:<commandId>", amount_cc,
      attribution, deposited_cc_before, wallet_cid_before, status: submitted, submitted_at }
@@ -612,7 +614,7 @@ policy by reason (closed map, no default-external):
   withdraw            → external:  requires user active AND kyc gate (below) AND payee wallet active
                         else status blocked_kyc | blocked_unknown_user | blocked_wallet_revoked
   bond, model-prize   → in-app:    if UserWallet(owner = payee) missing → treasury Create UserWallet{0,0,0}
-                        (commandId "wallet-create-<sha256(payee)[:40]>", separate submission), then
+                        (commandId "wallet-create-<sha256(packageName | payee)[:40]>", separate submission), then
                         SettleToWallet { walletCid: freshly read } (commandId "settle-<cidHash>")
   anything else       → blocked_unknown_reason (admin queue)
 external path: set status settling + transfer_command_id ("payout-<cidHash>") BEFORE calling transfer();
@@ -910,7 +912,7 @@ earlier account-less app. No user funds exist (DevNet only), so contracts, backe
 frontend are designed greenfield:
 
 - The on-ledger `UserWallet` of an account's primary party is created **only by the backend**
-  (treasury-signed, `wallet-create-<hash(owner)>`); nothing predates the backend. A Canton
+  (treasury-signed, `wallet-create-<hash(package name, owner)>`); nothing predates the backend. A Canton
   party never holds an in-app balance without an account — the one exception is an in-app
   payout (`bond` / `model-prize`) settled to a party that traded with its own key, which the
   backend also performs and which never touches `depositedCC`.

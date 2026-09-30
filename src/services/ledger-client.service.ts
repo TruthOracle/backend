@@ -70,6 +70,17 @@ export class LedgerClientService {
     return `#${name}:${module}:${entity}`;
   }
 
+  /**
+   * The UserWallet Create command id for `owner` under the configured package name. Deposits and
+   * in-app payouts both take it from here, so a Create racing another path collides on command
+   * dedup instead of minting a second wallet.
+   */
+  walletCreateCommandId(owner: string): string {
+    const name = this.config.truthoraclePackageName;
+    if (!name) throw new ApiError(502, "upstream_failed", "TRUTHORACLE_PACKAGE_NAME is not set");
+    return walletCreateCommandIdFor(name, owner);
+  }
+
   private async ledger<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}): Promise<T> {
     const base = this.baseUrl;
     if (!base) throw new ApiError(502, "upstream_failed", "Ledger API URL is not configured");
@@ -240,7 +251,7 @@ export class LedgerClientService {
 /**
  * The one shape of a treasury-created UserWallet: empty (0 / 0 / 0, no refs). Both the deposit
  * path and the in-app payout path create wallets through this with the SAME deterministic command
- * id (`walletCreateCommandIdFor(owner)`), so two racing Creates collide on ledger command-dedup
+ * id (`LedgerClientService.walletCreateCommandId(owner)`), so two racing Creates collide on ledger command-dedup
  * instead of minting two wallets — UserWallet has no contract key to stop that on-ledger. The
  * credit itself is always an `Exercise Deposit { amountCC, txRef }` on the wallet that exists,
  * which is what appends `txRef` to `depositRefs` (mandatory `[Text]` on truthoracle-v16).
@@ -262,9 +273,22 @@ export function userWalletCreateCommand(input: { templateId: string; admin: stri
   };
 }
 
-/** `wallet-create-<sha256(owner)[:40]>` — one Create per owner, whoever submits it first. */
-export function walletCreateCommandIdFor(ownerParty: string): string {
-  return `wallet-create-${createHash("sha256").update(ownerParty).digest("hex").slice(0, 40)}`;
+/**
+ * `wallet-create-<sha256("<packageName>|<owner>")[:40]>`: one Create per owner per package NAME,
+ * whoever submits it first.
+ *
+ * The package name is part of the key because command dedup compares ids, never what a command
+ * creates. With an owner-only key, the Create that a party's wallet had spent under an older
+ * package (truthoracle-v14) was refused as a duplicate on the current one (truthoracle-v16), and
+ * every deposit credit for that party answered 502. The name, not the package id, is the scope:
+ * every version under one name is an upgrade-compatible build of the same wallet family (the
+ * contracts CI refuses anything else) and wallets are read by name, so racing Creates from
+ * instances on different versions of one name still collide. A breaking change always gets a new
+ * name, and with it fresh ids.
+ */
+export function walletCreateCommandIdFor(packageName: string, ownerParty: string): string {
+  if (!packageName || !ownerParty) throw new Error("walletCreateCommandIdFor needs both the package name and the owner party");
+  return `wallet-create-${createHash("sha256").update(`${packageName}|${ownerParty}`).digest("hex").slice(0, 40)}`;
 }
 
 /**

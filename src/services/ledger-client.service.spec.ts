@@ -45,13 +45,34 @@ describe("LedgerClientService.fetchUserWallet", () => {
 });
 
 describe("UserWallet Create command (shared by deposits and in-app payouts)", () => {
-  it("is always the empty wallet with depositRefs: [] (mandatory on truthoracle-v16), under one id per owner", () => {
+  it("is always the empty wallet with depositRefs: [] (mandatory on truthoracle-v16)", () => {
     const create = userWalletCreateCommand({ templateId: "pkg:Truthoracle:UserWallet", admin: TREASURY, owner: OWNER }) as { CreateCommand: { templateId: string; createArguments: Record<string, unknown> } };
     expect(create.CreateCommand.templateId).toBe("pkg:Truthoracle:UserWallet");
     expect(create.CreateCommand.createArguments).toEqual({ admin: TREASURY, owner: OWNER, balanceCC: "0.0000000000", depositedCC: "0.0000000000", withdrawnCC: "0.0000000000", depositRefs: [] });
-    expect(walletCreateCommandIdFor(OWNER)).toMatch(/^wallet-create-[0-9a-f]{40}$/);
-    expect(walletCreateCommandIdFor(OWNER)).toBe(walletCreateCommandIdFor(OWNER));
-    expect(walletCreateCommandIdFor("other::1220" + "b".repeat(64))).not.toBe(walletCreateCommandIdFor(OWNER));
+  });
+});
+
+describe("UserWallet Create command id", () => {
+  it("is one fixed id per owner and package name, in a pinned format", () => {
+    expect(walletCreateCommandIdFor("truthoracle-v16", OWNER)).toBe("wallet-create-352c032020ce2161a7f406bf51fee745598ac722");
+    expect(walletCreateCommandIdFor("truthoracle-v16", OWNER)).toBe(walletCreateCommandIdFor("truthoracle-v16", OWNER));
+    expect(walletCreateCommandIdFor("truthoracle-v16", "other::1220" + "b".repeat(64))).not.toBe(walletCreateCommandIdFor("truthoracle-v16", OWNER));
+  });
+
+  it("changes with the package name, so a Create spent under an older package cannot block the current one", () => {
+    expect(walletCreateCommandIdFor("truthoracle-v16", OWNER)).not.toBe(walletCreateCommandIdFor("truthoracle-v14", OWNER));
+  });
+
+  it("refuses to build an id without a package name or an owner", () => {
+    expect(() => walletCreateCommandIdFor("", OWNER)).toThrow();
+    expect(() => walletCreateCommandIdFor("truthoracle-v16", "")).toThrow();
+  });
+
+  it("the service applies the configured package name, and fails closed without one", () => {
+    const { service } = build([]);
+    expect(service.walletCreateCommandId(OWNER)).toBe(walletCreateCommandIdFor("truthoracle-v16", OWNER));
+    const unnamed = new LedgerClientService({ truthoraclePackageName: "" } as unknown as Config, {} as KeycloakTokenService, {} as RedisService, {} as SentryService);
+    expect(() => unnamed.walletCreateCommandId(OWNER)).toThrow(ApiError);
   });
 });
 

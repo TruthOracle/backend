@@ -132,7 +132,7 @@ export function retryCommandId(base: string, attempt: number): string {
   return `${base}-r${attempt}`;
 }
 
-/** One UserWallet per payee — the shared deterministic id (ledger-client.service), re-exported for callers and tests. */
+/** One UserWallet per payee per package name: the shared deterministic id (ledger-client.service), re-exported for callers and tests. */
 export { walletCreateCommandIdFor };
 
 interface SettleContext {
@@ -433,7 +433,7 @@ export class PayoutService {
 
     let ledgerWallet = await this.ledger.fetchUserWallet(payee, { uncached: true });
     if (!ledgerWallet) {
-      const walletCreateCommandId = walletCreateCommandIdFor(payee);
+      const walletCreateCommandId = this.ledger.walletCreateCommandId(payee);
       if (row.walletCreateCommandId) {
         const status = await this.wallet.commandStatus(treasury, row.walletCreateCommandId);
         if (this.readFailed(status)) throw await this.stopUnknown(ctx, row.walletCreateCommandId);
