@@ -20,9 +20,11 @@ import {
 import {
   CANDLE_PERIOD_MINUTES,
   MARKET_EVENT_KINDS,
+  TRANSFER_INSTRUCTION_STATUSES,
   WALLET_ENTRY_KINDS,
   type CandlePeriodMinutes,
   type MarketEventKind,
+  type TransferInstructionStatus,
   type WalletEntryKind,
 } from "../types";
 import { AdminReasonDto } from "./admin.dto";
@@ -181,8 +183,30 @@ export class WalletHistoryQueryDto extends PageQueryDto {
   kind?: WalletEntryKind;
 }
 
-/** `GET /in-app-wallet/transfers?direction=` · `GET /admin/ledger/transfers` */
-export class TransfersQueryDto extends PageQueryDto {
+/** `?instrument=<admin>:<id>` — the instrument an aggregate is computed over (default: the default collateral). */
+export class InstrumentQueryDto {
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/, {
+    message: "instrument must be <admin party>:<token id>",
+  })
+  instrument?: string;
+}
+
+/** `?instrument=` on a paged list (no default: omitted = every instrument). */
+export class InstrumentPageQueryDto extends PageQueryDto {
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(/^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/, {
+    message: "instrument must be <admin party>:<token id>",
+  })
+  instrument?: string;
+}
+
+/** `GET /in-app-wallet/transfers?direction=&instrument=` · `GET /admin/ledger/transfers?direction=&counterparty=&instrument=` */
+export class TransfersQueryDto extends InstrumentPageQueryDto {
   @IsOptional()
   @IsIn(["in", "out"])
   direction?: "in" | "out";
@@ -194,8 +218,30 @@ export class TransfersQueryDto extends PageQueryDto {
   counterparty?: string;
 }
 
-/** `GET /leaderboard?window=&limit=` */
-export class LeaderboardQueryDto {
+/** `GET /admin/ledger/holdings?instrument=&active=` — the treasury's token-standard holdings as indexed. */
+export class HoldingsQueryDto extends InstrumentPageQueryDto {
+  @IsOptional()
+  @toBool()
+  @IsBoolean()
+  active?: boolean;
+}
+
+/** `GET /admin/ledger/transfer-instructions?instrument=&status=&party=` */
+export class TransferInstructionsQueryDto extends InstrumentPageQueryDto {
+  @IsOptional()
+  @IsIn(TRANSFER_INSTRUCTION_STATUSES)
+  status?: TransferInstructionStatus;
+
+  /** Sender or receiver. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @MaxLength(400)
+  party?: string;
+}
+
+/** `GET /leaderboard?window=&limit=&instrument=` */
+export class LeaderboardQueryDto extends InstrumentQueryDto {
   @IsOptional()
   @IsIn(LEADERBOARD_WINDOWS)
   window?: (typeof LEADERBOARD_WINDOWS)[number];

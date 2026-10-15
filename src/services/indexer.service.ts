@@ -14,10 +14,32 @@ import {
 } from "../indexer/events";
 import { LedgerProjection, type ApplySummary } from "../indexer/projection";
 import { NatsSubjects, type ApiLedgerStatus } from "../types";
+import { ApiError } from "../util/errors";
 import { isoOrNull } from "../util/ledger-values";
+import { InstrumentsService } from "./instruments.service";
 import { LedgerStreamService } from "./ledger-stream.service";
 import { NatsService } from "./nats.service";
 import { SentryService } from "./sentry.service";
+
+/** The index against the live ledger end (`requireFresh`, docs/TOKENS.md §4.3). */
+export interface IndexFreshness {
+  offset: number;
+  ledgerEnd: number;
+  /** `ledgerEnd − offset`, never negative. */
+  lag: number;
+  maxLag: number;
+  fresh: boolean;
+}
+
+/**
+ * The freshness rule, pure: the index is fresh when it is at most `maxLag` offsets behind the
+ * ledger end. A lag is measured in offsets, not seconds, because that is what both sides report;
+ * `LEDGER_FRESH_OFFSETS` is the window the frontend's retry loop can absorb.
+ */
+export function freshnessOf(offset: number, ledgerEnd: number, maxLag: number): IndexFreshness {
+  const lag = Math.max(0, ledgerEnd - offset);
+  return { offset, ledgerEnd, lag, maxLag, fresh: lag <= maxLag };
+}
 
 /** What one `runOnce` did. */
 export interface RunResult {
@@ -50,12 +72,12 @@ export class IndexerService {
     private readonly stream: LedgerStreamService,
     private readonly nats: NatsService,
     private readonly sentry: SentryService,
+    private readonly instruments: InstrumentsService,
   ) {
     this.projection = new LedgerProjection({
       packageName: config.truthoraclePackageName,
       splicePackageName: config.splicePackageName,
       treasury: config.treasuryPartyId,
-      trackTransfers: config.indexerTrackTransfers,
     });
   }
 
@@ -106,6 +128,48 @@ export class IndexerService {
       [INDEXER_STATE_KEY],
     );
     return row.length > 0 ? Number(row[0].offset) : 0;
+  }
+
+  /**
+   * The index against the live ledger end. Reads the ledger end from the participant (never the
+   * cached `to_indexer_state.ledger_end`: a stalled loop would report a stale end as fresh).
+   */
+  async freshness(): Promise<IndexFreshness> {
+    const [offset, ledgerEnd] = await Promise.all([this.currentOffset(), this.stream.ledgerEnd()]);
+    return freshnessOf(offset, ledgerEnd, this.config.ledgerFreshOffsets);
+  }
+
+  /**
+   * `503 ledger_stale` unless the index is within `LEDGER_FRESH_OFFSETS` of the ledger end
+   * (docs/TOKENS.md §4.3): a money derivation that reads `to_ledger_transfers` must not run on an
+   * index that may be missing a deposit. An unconfigured or unreachable ledger fails the same way
+   * — nothing can vouch for the index then.
+   */
+  async requireFresh(): Promise<IndexFreshness> {
+    if (!this.stream.isConfigured())
+      throw new ApiError(
+        503,
+        "ledger_stale",
+        "the ledger index has no participant to check against (LEDGER_API_URL / Keycloak)",
+      );
+    let fresh: IndexFreshness;
+    try {
+      fresh = await this.freshness();
+    } catch (err) {
+      throw new ApiError(
+        503,
+        "ledger_stale",
+        `the ledger end could not be read: ${(err as Error).message}`,
+      );
+    }
+    if (!fresh.fresh)
+      throw new ApiError(
+        503,
+        "ledger_stale",
+        `the ledger index is ${fresh.lag} offsets behind the ledger end (allowed ${fresh.maxLag}); retry shortly`,
+        { offset: fresh.offset, ledgerEnd: fresh.ledgerEnd, lag: fresh.lag, maxLag: fresh.maxLag },
+      );
+    return fresh;
   }
 
   /** Resolves once the index has applied `offset` (or after `timeoutMs`, whichever first) — the "wait for my transaction" primitive. */
@@ -220,26 +284,22 @@ export class IndexerService {
     const entries = await this.stream.fetchActiveContracts(at);
     const gap: IndexerGap = { fromOffset, toOffset: at, reason, at: new Date().toISOString() };
     await this.dataSource.transaction(async (manager) => {
-      const { inserted, archived } = await this.projection.applyActiveContracts(
-        manager,
-        entries,
-        at,
-        "resync",
-      );
+      const { inserted, archived, holdings, instructions } =
+        await this.projection.applyActiveContracts(manager, entries, at, "resync");
       const state = await this.state(manager);
-      await manager
-        .getRepository(IndexerStateEntity)
-        .update(
-          { key: INDEXER_STATE_KEY },
-          {
-            offset: at,
-            prunedOffset: pruned,
-            gaps: [...(state.gaps ?? []), gap],
-            lastError: null,
-            lastErrorAt: null,
-          },
-        );
-      this.logger.warn(`resync: ${inserted} contract(s) added, ${archived} marked archived`);
+      await manager.getRepository(IndexerStateEntity).update(
+        { key: INDEXER_STATE_KEY },
+        {
+          offset: at,
+          prunedOffset: pruned,
+          gaps: [...(state.gaps ?? []), gap],
+          lastError: null,
+          lastErrorAt: null,
+        },
+      );
+      this.logger.warn(
+        `resync: ${inserted} contract(s) added (${holdings} holding(s), ${instructions} instruction(s) seen), ${archived} marked archived`,
+      );
     });
     this.sentry.captureMessage("ledger indexer resynced from an ACS snapshot", "warning", {
       fromOffset: String(fromOffset),
@@ -262,18 +322,16 @@ export class IndexerService {
         reason: `operator resync: ${reason}`,
         at: new Date().toISOString(),
       };
-      await manager
-        .getRepository(IndexerStateEntity)
-        .update(
-          { key: INDEXER_STATE_KEY },
-          {
-            offset: end,
-            ledgerEnd: end,
-            gaps: state.offset < end ? [...(fresh.gaps ?? []), gap] : (fresh.gaps ?? []),
-            bootstrappedAt: fresh.bootstrappedAt ?? new Date(),
-            bootstrapOffset: fresh.bootstrapOffset ?? end,
-          },
-        );
+      await manager.getRepository(IndexerStateEntity).update(
+        { key: INDEXER_STATE_KEY },
+        {
+          offset: end,
+          ledgerEnd: end,
+          gaps: state.offset < end ? [...(fresh.gaps ?? []), gap] : (fresh.gaps ?? []),
+          bootstrappedAt: fresh.bootstrappedAt ?? new Date(),
+          bootstrapOffset: fresh.bootstrapOffset ?? end,
+        },
+      );
     });
     return this.status();
   }
@@ -285,8 +343,15 @@ export class IndexerService {
   ): Promise<void> {
     await this.dataSource.transaction(async (manager) => {
       await this.state(manager);
-      const { inserted } = await this.projection.applyActiveContracts(manager, entries, at, mode);
-      this.logger.log(`${mode}: ${inserted} active contract(s) loaded from the snapshot at ${at}`);
+      const { inserted, holdings, instructions } = await this.projection.applyActiveContracts(
+        manager,
+        entries,
+        at,
+        mode,
+      );
+      this.logger.log(
+        `${mode}: ${inserted} ${this.config.truthoraclePackageName} contract(s), ${holdings} treasury holding(s) and ${instructions} transfer instruction(s) loaded from the snapshot at ${at}`,
+      );
     });
   }
 
@@ -310,8 +375,28 @@ export class IndexerService {
         .execute();
       return res;
     });
-    if (outcome.applied) await this.announce(outcome.summary);
+    if (outcome.applied) {
+      await this.registerInstruments(outcome.summary);
+      await this.announce(outcome.summary);
+    }
     return outcome.applied;
+  }
+
+  /**
+   * Every instrument a market or wallet of this transaction named is registered (disabled, symbol =
+   * id) when the platform does not know it yet, so a ledger-first market renders with its token id
+   * until an operator describes it (docs/TOKENS.md §4.1). Best effort: the rows are committed.
+   */
+  private async registerInstruments(s: ApplySummary): Promise<void> {
+    for (const instrument of s.instrumentsSeen) {
+      try {
+        await this.instruments.ensureKnown(instrument);
+      } catch (err) {
+        this.logger.warn(
+          `could not register instrument ${instrument.id}: ${(err as Error).message}`,
+        );
+      }
+    }
   }
 
   private async advanceTo(offset: number, updateId: string | null): Promise<void> {
@@ -372,11 +457,21 @@ export class IndexerService {
         NatsSubjects.transferSeen,
         {
           updateId: s.updateId,
+          nodeId: t.nodeId,
           direction: t.direction,
           counterparty: t.counterparty,
+          instrument: t.instrument,
+          kind: t.kind,
           offset: s.offset,
         },
-        { msgId: `tr:${t.eventId}` },
+        { msgId: `tr:${s.updateId}:${t.nodeId}` },
+      );
+    }
+    for (const i of s.instructionsAccepted) {
+      await this.nats.publishSafe(
+        NatsSubjects.transferInstructionAccepted,
+        { contractId: i.contractId, instrument: i.instrument, offset: s.offset },
+        { msgId: `tia:${i.contractId}` },
       );
     }
   }

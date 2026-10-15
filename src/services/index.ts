@@ -23,6 +23,13 @@ export { KycService } from "./kyc.service";
 export { KycProviderMockService } from "./kyc-provider-mock.service";
 export { KycProviderSumsubService } from "./kyc-provider-sumsub.service";
 export { AdminService } from "./admin.service";
+// instruments, registries, token-app, treasury transfers (docs/TOKENS.md)
+export { InstrumentsService } from "./instruments.service";
+export { TokenRegistryService } from "./token-registry.service";
+export { TokenAppService } from "./token-app.service";
+export { TreasuryTransferService } from "./treasury-transfer.service";
+export { TokenOperationsService } from "./token-operations.service";
+export { RewardsService } from "./rewards.service";
 // ledger indexer + index-backed reads (docs/INDEXER.md)
 export { LedgerStreamService } from "./ledger-stream.service";
 export { IndexerService } from "./indexer.service";

@@ -1,17 +1,16 @@
 # TruthOracle backend — architecture and implementation spec (v2)
 
 This document is the contract for `canton/truthoracle-backend` (a sibling repository of
-`truthoracle-canton`, `truthoracle-contracts` and `enterprise-wallet`, laid out like
+`pm-frontend`, `truthoracle-contracts` and `enterprise-wallet`, laid out like
 `risk-monitor-backend`). It fixes the layout, the domain model, the auth/wallet/KYC rules,
 the API surface and the configuration so that every part can be built and reviewed
 independently. v2 folds in a five-lens design review (security, money/ledger, KYC,
 frontend rollout, toolchain); §19 lists every decision that changed from v1.
 
-Where the existing Vercel functions in `truthoracle-canton/api/` already solved a problem
+Where the existing Vercel functions in `pm-frontend/api/` already solved a problem
 (derived deposit amounts, deterministic command ids, payout settlement, signature
 verification, the shared store), the backend ports that logic. The comments in those files
-record production facts (wallet history paging, status filtering, command-id dedup) — keep
-them.
+record production facts (status-index filtering, command-id dedup) — keep them.
 
 ## 1. Purpose and scope
 
@@ -28,7 +27,7 @@ authority, state or a secret:
 3. **KYC** — provider-agnostic verification (Sumsub is the production provider, a mock adapter
    serves dev and tests — see docs/KYC.md),
    attached to the account and to the sign-in identity that started it, enforced at the
-   point real CC leaves the platform (external withdrawal settlement). After an approved
+   point real tokens leave the platform (external withdrawal settlement). After an approved
    KYC, the verified natural person is bound to exactly one account, permanently, until an
    audited admin transfer.
 4. **Money rails** — deposit reconciliation and payout settlement live here, behind a user
@@ -147,18 +146,18 @@ explicit `type` (`numeric` with `precision: 38, scale: 10`, `citext`, `timestamp
 Browser (Vite/React, app host)                     Native iOS (later)
    │  same-origin  /__backend/api/v1/...               │ Authorization: Bearer <session token> + CORS
    ▼                                                   ▼
-Vercel rewrite → truthoracle-canton/api/proxy/backend.mjs ──►  backend (Nest, :8091, Railway)
+Vercel rewrite → pm-frontend/api/proxy/backend.mjs ──►  backend (Nest, :8091, Railway)
    (dev: the same handler via _devProxy.mjs proxyMiddleware)     │
                                                                  ├── Postgres  (accounts, wallets, sessions, kyc, payouts, credits, audit)
                                                                  ├── Redis     (session cache + per-user index, challenges, nonces, rate limits, locks, oauth state, ledger cache, keycloak tokens)
                                                                  ├── NATS/JS   (domain events, webhook processing queue)
                                                                  ├── Keycloak  (client_credentials → bearer for ledger + wallet)
                                                                  ├── Canton JSON Ledger API (active-contracts reads as the treasury party)
-                                                                 ├── Enterprise Wallet REST (history, transfer, external/submit)
+                                                                 ├── Enterprise Wallet REST (transfer, external/submit, status indexes)
                                                                  └── Google / Telegram / Sumsub
 ```
 
-### 4.1 The `/__backend` proxy contract (`truthoracle-canton/api/proxy/backend.mjs`)
+### 4.1 The `/__backend` proxy contract (`pm-frontend/api/proxy/backend.mjs`)
 
 - Route: `vercel.json` rewrite `{ "source": "/__backend/:path*", "destination": "/api/proxy/backend?path=:path*" }`
   placed **above** the SPA catch-all, and `__backend/` added to the catch-all's negative
@@ -187,8 +186,8 @@ Vercel rewrite → truthoracle-canton/api/proxy/backend.mjs ──►  backend (
 
 ## 5. Domain model (Postgres, tables prefixed `to_`)
 
-Ids `uuid` (`gen_random_uuid()`), timestamps `timestamptz`, money `numeric(38,10)` (CC has
-10 decimals; the service layer uses fixed point — §8.4). All tables have `created_at`;
+Ids `uuid` (`gen_random_uuid()`), timestamps `timestamptz`, money `numeric(38,10)` (every amount is
+stored at 10 dp whatever its instrument's `decimals`; the service layer uses fixed point — §8.4). All tables have `created_at`;
 mutable ones `updated_at`.
 
 ### `to_settings` (single row, written by the first migration)
@@ -235,8 +234,14 @@ identity (§6.8).
 | label | text null | |
 | is_primary | bool | partial unique `(user_id) where is_primary and status='active'` |
 | status | text | `active` \| `revoked` |
-| credited_cc | numeric | in-app credits attributed to this wallet by the backend — the **only** attribution there is: nothing on the ledger predates the backend (§18), so a new row starts at 0 and no ledger read happens at link time |
 | verified_at, revoked_at | timestamptz | |
+
+The attribution a wallet carries lives per instrument in `to_wallet_credits` (docs/TOKENS.md
+§4.3): `(wallet_id fk, instrument_admin, instrument_id) pk, credited numeric(38,10)` — the
+**only** attribution there is: nothing on the ledger predates the backend (§18), so a new wallet
+has no rows and no ledger read happens at link time. `to_instruments (admin, id) pk` holds the
+CIP-56 instruments the platform knows (symbol, name, decimals, kind, enabled, default collateral,
+registry and transfer wiring); boot upserts the two env-configured ones.
 
 ### `to_sessions`
 | column | type | notes |
@@ -280,15 +285,16 @@ last_attempt_at null (the sweep's re-arm cooldown counts from here), error null`
 
 ### `to_payouts` — durable arbiter for settlement (§9.4)
 `id, pending_payout_cid text unique, user_id null, payee_party, payee_wallet_id null,
-amount_cc, reason, status (queued | settling | settled_external | settled_in_app |
+instrument_admin, instrument_id, amount (in that instrument), reason, details jsonb (dust kept
+in-app by quantisation, transfer mode), status (queued | settling | settled_external | settled_in_app |
 blocked_kyc | blocked_unknown_user | blocked_unknown_reason | blocked_wallet_revoked |
 failed | archived), transfer_command_id null, wallet_create_command_id null,
 settle_command_id null, mark_paid_command_id null, attempts int, last_error, first_seen_at,
 settled_at, created_at, updated_at`.
 
 ### `to_deposit_credits` — write-ahead record of every treasury-signed credit (§8.3)
-`id, user_id, owner_party, command_id unique, tx_ref, amount_cc, attribution jsonb
-([{walletId, partyId, amountCC}]), deposited_cc_before, wallet_cid_before null,
+`id, user_id, owner_party, instrument_admin, instrument_id, command_id unique, tx_ref, amount, attribution jsonb
+([{walletId, partyId, amount}]), deposited_before, wallet_cid_before null,
 status (submitted | confirmed | failed), error, created_at, submitted_at (when the row was
 last (re-)armed — the confirm-pass grace period counts from here), confirmed_at`.
 
@@ -415,7 +421,7 @@ two things a proof can do are link the wallet to an already signed-in account
 2. Wallet `signMessage(message, partyId)` (Cantor8 signs raw UTF-8 — confirmed 2026-09-01).
    The browser must open that popup inside the click's own user activation: a browser grants
    one popup per click, so the frontend prefetches the challenge and never awaits anything
-   between the click and the SDK call (`truthoracle-canton/frontend/wallets/cantor8/popupGesture.ts`).
+   between the click and the SDK call (`pm-frontend/frontend/wallets/cantor8/popupGesture.ts`).
 3. `POST /wallets/link` or `POST /auth/admin`, body `{ challengeId, partyId, publicKey,
    signature, kind }` (`kind` allowlist:
    `cantor8`; informational). The challenge claim is consumed **before** verification (a bad
@@ -425,7 +431,7 @@ two things a proof can do are link the wallet to an already signed-in account
      `fingerprint = hex(0x12 0x20 ‖ sha256(uint32be(12) ‖ rawKey))` — exactly
      `TopologyWriteService.createFingerprintFromKey` in `@canton-network/wallet-sdk`
      (HashPurpose 12 = PublicKeyFingerprint, multihash sha2-256). Verified against the real
-     operator party in `truthoracle-canton/.env`. Nothing is pinned or trusted from the
+     operator party in `pm-frontend/.env`. Nothing is pinned or trusted from the
      client. Limitation (documented, error `wallet_key_mismatch` = "this wallet's signing key
      is not its namespace key"): parties whose signing key was rotated or that were allocated
      under a participant namespace cannot be linked until a topology-based check exists;
@@ -449,7 +455,7 @@ publicKey, signature, kind }` → a `kind = admin` session (§6.8), only for par
 caller cannot enumerate operators from the challenge route. The sign-in creates (or reuses)
 the operator's `canton_wallet` identity and records the verified key in `profile.publicKey`
 for `AdminGuard`'s per-request pin check; it creates **no** `to_wallets` row, because an
-operator party is not a funding wallet. The `/admin` UI in `truthoracle-canton` keeps its own
+operator party is not a funding wallet. The `/admin` UI in `pm-frontend` keeps its own
 `to_admin` flow until it is ported; the two do not interact (the proxy never forwards
 `to_admin`).
 
@@ -465,15 +471,15 @@ operator party is not a funding wallet. The `/admin` UI in `truthoracle-canton` 
   a standing KYC approval can never lock a wallet.
 - A party with **any** `to_wallets` row (active or revoked) under another user →
   `409 wallet_already_linked`. Re-linking a party that already has a row under this user
-  reactivates that row (`status → active`, `credited_cc` untouched); it never inserts.
-- **Linking never touches the ledger.** A new row starts at `credited_cc = 0`: nothing
+  reactivates that row (`status → active`, its `to_wallet_credits` untouched); it never inserts.
+- **Linking never touches the ledger.** A new row starts with no credits: nothing
   on-ledger predates the backend (§18), so there is nothing to seed and a first-time wallet
   sign-in or link succeeds while the ledger or its Keycloak is down. The two audit rows of a
   first link are `wallet.linked` and (for the first wallet) `wallet.primary_changed`.
-- A non-primary party that owns its own on-ledger `UserWallet` (an in-app payout settled
-  to it while it traded with its own key) keeps it: its balance is shown as
-  `ownLedgerWallet` in `GET /in-app-wallet` / `GET /wallets` and remains withdrawable only
-  with that wallet's key; the backend never folds it into the primary.
+- A non-primary party that owns its own on-ledger `UserWallet`s (an in-app payout settled
+  to it while it traded with its own key) keeps them: their balances are shown as
+  `ownLedgerWallets` (one per instrument) in `GET /in-app-wallet` / `GET /wallets` and remain
+  withdrawable only with that wallet's key; the backend never folds them into the primary.
 - Linking creates/reactivates the `canton_wallet` identity; the KYC lock and last-identity
   rules apply through `IdentityService.unlink` on unlink.
 
@@ -486,62 +492,90 @@ deposit exists — stated in `GET /me.capabilities.primaryPartyId` and in the UI
 deposit. The primary wallet cannot be unlinked while `users.party_id` points at it.
 
 ### 8.3 Deposit reconciliation — `POST /in-app-wallet/deposits/reconcile` (session)
-Preconditions: `users.party_id` set (`409 no_primary_wallet`), user `active`, KYC not
-`blocked_duplicate` (`409 kyc_duplicate_identity`), `lock:deposit:<userId>` acquired (TTL
-**300 s**, above the worst-case history walk; `409 deposit_in_progress`).
+One instrument per call (`{ instrument?: { admin, id } }`, default the default collateral;
+`404 instrument_unknown` / `409 instrument_disabled`): a party holds one `UserWallet` per
+instrument and one `to_wallet_credits` row per (wallet, instrument), so every step below runs
+against that instrument's wallet and credits only (docs/TOKENS.md §4.3). Preconditions:
+`users.party_id` set (`409 no_primary_wallet`), user `active`, KYC not `blocked_duplicate`
+(`409 kyc_duplicate_identity`), `lock:deposit:<userId>` acquired (TTL **300 s**, above the
+worst-case pass; `409 deposit_in_progress`).
 
 ```
 1. confirm pass: for each to_deposit_credits row of this user with status = submitted:
-     read UserWallet(owner = primary) ; confirmed iff depositRefs contains tx_ref
+     read UserWallet(owner = primary) ; confirmed iff creditRefs contains tx_ref
        (THE rule — the Daml `Deposit` appends txRef and refuses a repeat, so the ref on the
-       contract is the on-ledger proof this exact credit landed, whatever depositedCC did meanwhile)
-     → on confirm: apply attribution bumps (credited_cc += amountCC per wallet) + status confirmed
+       contract is the on-ledger proof this exact credit landed, whatever deposited did meanwhile)
+     → on confirm: apply attribution bumps (to_wallet_credits.credited += amount per wallet, in the row's instrument) + status confirmed
      → if the wallet exists WITHOUT tx_ref (pre-state), the row is older than DEPOSIT_CONFIRM_GRACE_MS
        AND the wallet's command index reports the command as failed or unknown (fail closed on
        read errors): status failed (re-armed under the same id by the next reconcile)
      → otherwise leave submitted (still in flight); reconcile stops here with 409 deposit_in_progress
-2. history = transferHistory(treasury)  (UNCACHED on this route; paged, v0.1.35 /api/v1/history)
+2. freshness gate (docs/TOKENS.md §4.3): to_indexer_state.offset ≥ ledgerEnd − LEDGER_FRESH_OFFSETS,
+     the ledger end read LIVE from the participant → else 503 ledger_stale { offset, ledgerEnd, lag, maxLag }
+     (an index that may be missing the deposit must not derive; the frontend retries)
 3. for every wallet row w of the user (active AND revoked):
-     received_w = totalReceivedFrom(history, treasury, w.party)          # settled Amulet inbound only
-     owed_w     = round10(received_w) − credited_cc_w
+     received_w = SUM(amount) of to_ledger_transfers WHERE direction = 'in' AND instrument = (admin, id)
+                  AND counterparty = w.party                              # the ledger index, token-standard or Canton Coin rows alike;
+                                                                          # only committed transactions exist there — no pending / failed state
+                + Σ confirmed to_deposit_credits rows with tx_ref 'mint:…' attributed to w   # an operator's mint-and-credit (docs/TOKENS.md §4.7):
+                                                                          # a Deposit nothing was sent for, counted as received so it never reads as an over-credit
+     owed_w     = received_w − credited_w                                 # credited_w = to_wallet_credits(w, instrument)
      if owed_w < −DUST → over_credit drift: audit + Sentry + NATS, 409 deposit_attribution_drift
 4. ledger = UserWallet(owner = primary)
-   expected = Σ_w credited_cc_w
-   delta    = ledger.depositedCC − expected
+   expected = Σ_w credited_w
+   delta    = ledger.deposited − expected
      |delta| > DUST → 409 deposit_attribution_drift (ledger_below_expected | ledger_above_expected),
                       audit + Sentry + NATS; nothing is credited and nothing is repaired silently:
                       every credit the primary's UserWallet ever received went through this backend
                       (§18), so a surplus is as much an operator matter as a shortfall.
 5. amount = Σ_w max(owed_w, 0)  (each owed_w rounded to 10 dp BEFORE summing; exact fixed point)
    if amount ≤ DUST → 200 { credited: 0, status: nothing_outstanding }
-6. if no UserWallet(owner = primary) exists: Create UserWallet { admin: treasury, owner: primary,
-   balanceCC = depositedCC = withdrawnCC = 0, depositRefs: [] } under the ONE id per owner and
-   package name, "wallet-create-<sha256(packageName | primary)[:40]>", shared with the in-app
-   payout path (a racing Create collides on ledger command-dedup instead of minting a second
-   wallet; the package name keeps a Create spent under an older package from blocking this one,
-   because dedup compares ids, never what they create); re-read the wallet
-7. commandId = "deposit-" + sha256(primary | ledger.cid | amount | ledger.depositedCC)[:40]
-   INSERT to_deposit_credits { command_id, owner_party, tx_ref: "reconcile:<commandId>", amount_cc,
-     attribution, deposited_cc_before, wallet_cid_before, status: submitted, submitted_at }
+6. if no UserWallet(owner = primary, instrument) exists: Create UserWallet { admin: treasury, owner: primary,
+   instrument, balance = deposited = withdrawn = 0, creditRefs: [], auditObservers: AUDIT_OBSERVER_PARTIES }
+   under the ONE id per owner, instrument and package name,
+   "wallet-create-<sha256(packageName | primary | admin | id)[:40]>", shared with the in-app payout
+   path and the rewards processor (a racing Create collides on ledger command-dedup instead of
+   minting a second wallet; the package name keeps a Create spent under an older package from
+   blocking this one, because dedup compares ids, never what they create); re-read the wallet
+7. commandId = "deposit-" + sha256(primary | ledger.cid | amount | ledger.deposited)[:40]
+   INSERT to_deposit_credits { command_id, owner_party, tx_ref: "reconcile:<commandId>", amount,
+     attribution, deposited_before, wallet_cid_before, status: submitted, submitted_at }
      ON CONFLICT (command_id) DO NOTHING → no row inserted: 409 deposit_in_progress
      (a row the confirm pass marked `failed` is re-armed under the same id instead)
-8. submit as treasury: Exercise Deposit { amountCC, txRef: "reconcile:<commandId>" } on ledger.cid
-   — the credit is ALWAYS an Exercise; the txRef lands in depositRefs through it
+8. submit as treasury: Exercise Deposit { amount, txRef: "reconcile:<commandId>" } on ledger.cid
+   — the credit is ALWAYS an Exercise; the txRef lands in creditRefs through it
 9. run the confirm pass again immediately (best effort); respond with per-wallet attribution
    and the row's real status (confirmed | submitted)
 ```
-Invariant by construction: `ledger.depositedCC == Σ credited_cc` with zero tolerance after
-confirmation (all arithmetic in fixed point). Amounts never come from the client;
+Invariant by construction: `ledger.deposited == Σ credited` per instrument with zero tolerance
+after confirmation (all arithmetic in fixed point). Amounts never come from the client;
 deterministic command ids make concurrent duplicates collide; the write-ahead row makes a
 crash between submit and confirm repairable instead of double-crediting; drift in either
-direction is refused and reported, never repaired silently. `GET /in-app-wallet` may serve a
-15 s cached history view and reports `attribution: { creditedTotalCC, ledgerDepositedCC,
-delta }`; the reconcile route never uses the cache.
+direction is refused and reported, never repaired silently. `GET /in-app-wallet` may serve the
+15 s cached ledger view and the index as it stands (no freshness gate: it informs, the reconcile
+decides) and reports one `balances` row per instrument (`{ instrument, ledger, attribution:
+{ creditedTotal, ledgerDeposited, delta } }`); the reconcile route never uses the cache. The
+received side is the ledger index alone, never an Enterprise Wallet read (docs/TOKENS.md §2 decision 5).
+
+**Mint-and-credit** (`DepositService.creditMint`, behind `POST /admin/tokens/mint { creditUserId }`,
+docs/TOKENS.md §4.7) is the same machinery with the operator's token-app mint as the source of
+funds instead of an inbound transfer: the account's wallet in the instrument is created (step 6)
+BEFORE the mint, then — under the same `lock:deposit:<userId>` and after the same confirm pass —
+a write-ahead row `mint-credit-<sha256(mint command id)[:40]>` with `tx_ref = "mint:<mint command
+id>"`, attributed to the primary wallet row, is submitted as `Exercise Deposit` and confirmed by
+the same rule. The ids derive from the mint, so re-running the credit for one mint lands on the
+existing row (`confirmed`), `409 deposit_in_progress` while in flight, or re-arms a `failed` one;
+a transport failure leaves the row `submitted` for the DepositConfirmProcessor, never a second
+Deposit. `UserWallet.ensureUserWallet` is public for the same reason: the rewards grant and the
+mint credit create a party's wallet under the one deterministic id the reconcile uses.
 
 ### 8.4 Money arithmetic
-`util/money.ts`: CC amounts are `bigint` in 1e-10 units end to end (parse wallet/ledger
-strings with a decimal parser, never `Number`); `DUST = 10n` (1e-9 CC); formatting emits
-exactly 10 decimals for Daml.
+`util/money.ts`: amounts of any instrument are `bigint` in 1e-10 units end to end (parse
+wallet/ledger strings with `parseAmount`, never `Number`); `DUST = 10n` (1e-9 units);
+`formatAmount` emits exactly 10 decimals for Daml and the wire. An instrument's `decimals` only
+matter at the edges: `quantizeDown(amount, decimals)` truncates what leaves the platform to the
+token's smallest unit (the dust stays in-app, recorded on the payout row) and
+`formatAmountWithDecimals` renders it for the registry / token-app (docs/TOKENS.md §2).
 
 ### 8.5 Withdrawals
 User-signed (`UserWallet.Withdraw` → `PendingPayout reason=withdraw`), unchanged on-ledger.
@@ -617,10 +651,15 @@ policy by reason (closed map, no default-external):
                         (commandId "wallet-create-<sha256(packageName | payee)[:40]>", separate submission), then
                         SettleToWallet { walletCid: freshly read } (commandId "settle-<cidHash>")
   anything else       → blocked_unknown_reason (admin queue)
-external path: set status settling + transfer_command_id ("payout-<cidHash>") BEFORE calling transfer();
-  if the row already records a submitted transfer: NEVER call transfer() again — check
-  transferAlreadySubmitted (fail CLOSED on read errors: stop, keep settling) then MarkPaid
-  ("markpaid-<cidHash>"); attempts capped at PAYOUT_MAX_ATTEMPTS (5) → failed (admin queue)
+external path: set status settling + transfer_command_id ("payout-<cidHash>") + details { dust, sent, transferMode }
+  BEFORE calling TreasuryTransferService.transfer() — amount quantised down to the instrument's decimals
+  (docs/TOKENS.md §4.3); mode `wallet` = the Enterprise Wallet's /api/v1/transfer with the instrument's
+  wallet id, mode `registry` = TransferFactory_Transfer built from the token's registry over the treasury's
+  indexed holdings (409 insufficient_treasury_holdings when they do not cover it), per to_instruments.transfer_mode
+  else TREASURY_TRANSFER_MODE (docs/TOKENS.md §4.4);
+  if the row already records a submitted transfer: NEVER call transfer() again — ask the status index of the
+  RECORDED mode (transfer index for wallet, command index for registry; fail CLOSED on read errors: stop,
+  keep settling) then MarkPaid ("markpaid-<cidHash>"); attempts capped at PAYOUT_MAX_ATTEMPTS (5) → failed (admin queue)
 archived contract: if a submit was recorded → settled_external / settled_in_app; else archived (user cancel)
 kyc gate: users.status = active AND to_kyc_persons binding for the user AND an approved, unexpired
   verification with level_name = KYC_REQUIRED_LEVEL; applies only when KYC_ENFORCE_WITHDRAWALS=true
@@ -634,7 +673,7 @@ kyc gate: users.status = active AND to_kyc_persons binding for the user AND an a
 - `payout-settlement.processor` scans PendingPayouts every `PAYOUT_SCAN_MS` (30 s) and
   consumes `truthoracle.kyc.status_changed` (→ `approved` re-queues that user's `blocked_kyc`
   rows). Product change (deliberate): `bond` and `model-prize` payouts now settle **into the
-  in-app wallet** instead of external CC; `liquidity` is never produced by the Daml and is not
+  in-app wallet** instead of an external transfer; `liquidity` is never produced by the Daml and is not
   in the policy.
 - `GET /me.capabilities`: `canWithdraw`, `kycRequiredForWithdrawal`, `primaryPartyId`,
   `canDeposit`.
@@ -671,15 +710,51 @@ purged after 30 days (`kyc-cleanup` in `session-cleanup.processor`).
   `truthoracle.identity.linked|unlinked|reattached`,
   `truthoracle.wallet.linked|unlinked|primary_changed`, `truthoracle.deposit.credited|drift`,
   `truthoracle.payout.settled|blocked|failed`, `truthoracle.kyc.session_started|status_changed|duplicate_detected`,
-  `truthoracle.kyc.webhook.<provider>` (payload `{ eventId }` only).
+  `truthoracle.kyc.webhook.<provider>` (payload `{ eventId }` only), the ledger-index subjects
+  (docs/INDEXER.md §7, incl. `truthoracle.transfer.seen|instruction_accepted` with the instrument),
+  `truthoracle.instrument.changed`, `truthoracle.reward.granted|blocked_float`,
+  `truthoracle.token.minted|burned` (docs/TOKENS.md §4.6–§4.7; ids, parties and amounts only).
 - **KeycloakTokenService**: port of `_keycloakToken.mjs`; Redis cache keyed by
-  `issuerUrl|realm|clientId`, 60 s margin.
+  `issuerUrl|realm|clientId`, 60 s margin; targets `ledger`, `wallet`, `registry`
+  (`REGISTRY_KEYCLOAK_*`) and `tokenApp` (`TOKEN_APP_KEYCLOAK_*`), each field falling back to
+  `KEYCLOAK_*` (docs/TOKENS.md §4.4).
 - **LedgerClientService**: port of `ledgerClient.mjs` (package-name filters, `fetchUserWallet`,
   `fetchPendingPayouts`, `fetchPendingPayout`); on mainnet the ledger client reads `ZKPC_*`
   only (`LEDGER_API_URL`/`KEYCLOAK_*` are ignored for it, exactly as `upstream.mjs`).
-- **EnterpriseWalletService**: port of `walletClient.mjs` (`transferHistory` paging,
-  `totalReceivedFrom` in fixed point, `transferAlreadySubmitted` with an explicit
-  `{ known: boolean }` result so callers can fail closed, `externalSubmit`, `transfer`).
+- **EnterpriseWalletService**: port of `walletClient.mjs` reduced to the treasury's
+  submissions: `externalSubmit` (with disclosed contracts), the instrument-aware `transfer`, and
+  the two status indexes `transferStatus` / `commandStatus` with an explicit `{ known: boolean }`
+  so callers can fail closed. Deposits are never read from the wallet: they come from the index.
+- **TokenRegistryService** (docs/TOKENS.md §4.4): an instrument's CIP-56 registry
+  (`registry_url` / `registry_auth`) — `info`, `instrument`, `transferFactory(choiceArguments)`,
+  `acceptContext` / `rejectContext` / `withdrawContext`; auth `ledger` (the participant's bearer,
+  Canton Coin's scan proxy), `keycloak` (`REGISTRY_KEYCLOAK_*`) or `none`.
+- **TokenAppService** (docs/TOKENS.md §4.4): Cantor8's mint / burn service — `mint`, `burn`,
+  `mintBatch`, `burnBatch`, `status`, `holdings`, `mints`, `burns`; amounts leave as decimal
+  strings in the instrument's decimals; unconfigured → `503 token_app_unconfigured`.
+- **TreasuryTransferService** (docs/TOKENS.md §2 decision 6, §4.4): the one way an instrument
+  leaves the treasury — mode `wallet` (the Enterprise Wallet's transfer) or `registry`
+  (`TransferFactory_Transfer` from the registry's factory and context over the treasury's indexed
+  holdings, largest first, through `externalSubmit`), `status(mode, commandId)`, and the
+  instrument `setup` action (AutoAccept / MintDelegation on the token's factory).
+- **TransferInstructionAcceptorProcessor** (every `ACCEPTOR_SCAN_MS`): completes the pending
+  two-step offers addressed to the treasury in known, enabled instruments with the registry's
+  accept context; unknown or disabled instruments stay pending and are logged once.
+- **RewardsService** / **RewardsProcessor** (every `REWARDS_SCAN_MS` while `REWARDS_ENABLED`,
+  `lock:rewards`; docs/TOKENS.md §4.6): one pass = read the index past `to_settings.rewards_cursor`
+  (`to_wallet_entries` / `to_market_events`) and queue what the enabled `to_reward_rules` earn for
+  the account that owns the acting party, submit the queued grants under the float rule (the
+  treasury's indexed holdings of the rewards instrument ≥ Σ indexed in-app balances + grants in
+  flight + this one; else `blocked_float`, Sentry, `truthoracle.reward.blocked_float`, and with
+  `REWARDS_AUTO_MINT` one token-app mint of `max(shortfall, REWARDS_MINT_MIN)` per grant), confirm
+  the submitted ones against `UserWallet.creditRefs` (`reward:<grantId>`; a refused grant is
+  re-queued under a fresh attempt id up to five times, then `failed`). The rules are seeded at
+  boot (`seedRules`, enabled on `APP_ENV=dev`); `GET /me/rewards` and `/admin/rewards/*` read and
+  edit the same tables.
+- **TokenOperationsService** (docs/TOKENS.md §4.7): the operator's mint / burn through
+  `TokenAppService` with `token.mint` / `token.burn` audit rows and `truthoracle.token.minted|burned`,
+  the mint-and-credit (`DepositService.creditMint`, §8.3) and `GET /admin/tokens/status` (token-app's
+  snapshot next to `TreasuryTransferService.indexedBalances` per instrument).
 - **SentryService**: wrapper (`Sentry.init` happens in `main.ts`).
 - **AuditService**, **RateLimitService** (`key`, window, max; `subject` and `ip` dimensions).
 
@@ -696,7 +771,7 @@ purged after 30 days (`kyc-cleanup` in `session-cleanup.processor`).
 | POST | `/auth/admin/challenge` | public (refused with a session) | `{ partyId }` — operators only (§7.4) |
 | POST | `/auth/admin` | public | `{ challengeId, partyId, publicKey, signature, kind }` → `kind = admin` session |
 | POST | `/auth/logout` | session (admin too) | revoke current session, clear cookie |
-| GET | `/me` | session (admin too) | user, identities, wallets (+ ownLedgerWallet), kyc summary, capabilities |
+| GET | `/me` | session (admin too) | user, identities, wallets (+ credits per instrument, ownLedgerWallets), kyc summary, capabilities |
 | PATCH | `/me` | session | `{ displayName?, avatarUrl? }` |
 | DELETE | `/me/identities/:id` | session | unlink (rules §6) |
 | POST | `/me/identities/:id/reattach` | session | link-mode re-attachment by the original user (§6.4) |
@@ -704,8 +779,18 @@ purged after 30 days (`kyc-cleanup` in `session-cleanup.processor`).
 | GET | `/me/audit?page=` | session | own trail |
 | GET | `/wallets` · POST `/wallets/link-challenge` · POST `/wallets/link` | session | link answers `{ wallet }` (§8.1) |
 | DELETE | `/wallets/:id` · POST `/wallets/:id/primary` | session | |
-| GET | `/in-app-wallet` | session | primary UserWallet, attribution per wallet, ownLedgerWallet per wallet, payouts |
-| POST | `/in-app-wallet/deposits/reconcile` | session | §8.3 |
+| GET | `/in-app-wallet` | session | one balance row per instrument (UserWallet + attribution), wallets with credits and ownLedgerWallets, payouts |
+| POST | `/in-app-wallet/deposits/reconcile` | session | §8.3 — `{ instrument? }`, default the default collateral; `503 ledger_stale` while the index lags |
+| GET | `/in-app-wallet/transfers?direction=&instrument=` | session | the index's token transfers between the treasury and the account's wallets, with instrument and amount (docs/INDEXER.md §6) |
+| GET | `/exchange/instruments` | public | the enabled instruments (docs/TOKENS.md §4.1) |
+| GET · POST | `/admin/instruments` · PATCH `/admin/instruments/:admin/:id` | admin | the instruments registry (docs/TOKENS.md §4.1) |
+| POST | `/admin/instruments/:admin/:id/setup` | admin | `{ autoAccept?, mintDelegation?, reason? }` — the token's factory choices for the treasury through its registry (docs/TOKENS.md §4.4), audited `token.setup` |
+| GET | `/admin/ledger/holdings?instrument=&active=` · `/admin/ledger/transfer-instructions?status=&party=&instrument=` · `/admin/ledger/transfers?instrument=` | admin | the treasury's indexed holdings, the two-step offers it is party to, every transfer with its instrument (docs/INDEXER.md §6) |
+| GET | `/series?instrument=` · `/series/:ticker?instrument=` · `/events?instrument=` | public | the catalog per instrument — counts and sums over the markets in one collateral, default the default collateral (docs/TOKENS.md §4.5, docs/MARKETS.md §3) |
+| GET | `/me/rewards` | session | the account's rewards wallet, totals and grants (docs/TOKENS.md §4.6); 404 without a rewards instrument |
+| GET · PUT | `/admin/rewards/rules` · `/admin/rewards/rules/:id` | admin | the reward rules (`{ params?, enabled?, reason }`), audited `reward.rule_updated` |
+| POST · GET | `/admin/rewards/grant` · `/admin/rewards/grants?status=&userId=` · `/admin/rewards/float` | admin | a manual grant (`{ userId \| party, amount, reason }`, audited `reward.grant_requested`), the grants queue, the float rule's figures |
+| POST · GET | `/admin/tokens/mint` · `/admin/tokens/burn` · `/admin/tokens/status` | admin | token-app mint (`{ instrument, amount, to?, creditUserId?, reason }` — mint-and-credit through §8.3) / burn, audited `token.mint` / `token.burn`; token-app status plus the index's float per instrument (docs/TOKENS.md §4.7) |
 | GET | `/in-app-wallet/payouts` · POST `/in-app-wallet/payouts/:cid/settle` | session | §9.4 (`retryAfterKyc` on blocked rows) |
 | GET | `/kyc` · POST `/kyc/sessions` | session | |
 | POST | `/kyc/mock/submit` | session; mock provider only (route absent otherwise) | |
@@ -728,7 +813,9 @@ Codes: `unauthenticated`, `forbidden`, `csrf_rejected`, `rate_limited`, `identit
 blocking payout status), `kyc_required`, `kyc_duplicate_identity`, `kyc_provider_unavailable`,
 `webhook_rejected`, `invalid_credential`, `oidc_failed`, `user_suspended`, `trading_halted`,
 `market_not_tradable`, `no_in_app_wallet`, `no_position`, `insufficient_balance`, `insufficient_shares`,
-`quote_unavailable`, `catalog_conflict` (markets / orders, docs/MARKETS.md), `validation_failed`,
+`quote_unavailable`, `catalog_conflict` (markets / orders, docs/MARKETS.md), `ledger_stale`,
+`insufficient_treasury_holdings`, `token_app_unconfigured`, `instrument_unknown`, `instrument_disabled`,
+`instrument_exists` (instruments / tokens, docs/TOKENS.md), `validation_failed`,
 `bad_request`, `not_found`, `payload_too_large`, `unsupported_media_type`, `upstream_failed`,
 `not_ready`, `internal_error`, `backend_unconfigured` and `backend_unreachable` (proxy only).
 The authoritative list is `ERROR_CODES` in `src/types.ts`; the frontend mirrors it in
@@ -750,19 +837,25 @@ TELEGRAM_BOT_TOKEN  TELEGRAM_BOT_USERNAME  TELEGRAM_AUTH_MAX_AGE_SEC=300  TELEGR
 TELEGRAM_OIDC_CLIENT_ID  TELEGRAM_OIDC_CLIENT_SECRET  TELEGRAM_OIDC_ISSUER=https://oauth.telegram.org
 ADMIN_OPERATORS (party[=publicKey], comma)
 LEDGER_API_URL  ENTERPRISE_WALLET_URL  TREASURY_PARTY_ID  ENTERPRISE_WALLET_APP_NAME=truthoracle
-TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload>  TRUTHORACLE_PACKAGE_NAME=truthoracle-v15
+TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload>  TRUTHORACLE_PACKAGE_NAME=truthoracle-v17
 KEYCLOAK_URL KEYCLOAK_REALM KEYCLOAK_CLIENT_ID KEYCLOAK_CLIENT_SECRET  LEDGER_KEYCLOAK_* WALLET_KEYCLOAK_*  ZKPC_*
 KYC_PROVIDER=mock|sumsub  KYC_ENFORCE_WITHDRAWALS=false  KYC_REQUIRED_LEVEL=basic-kyc-level
 KYC_FINGERPRINT_PEPPER (≥32)  KYC_PEPPER_ROTATION_ACK=
 PAYOUT_EXTERNAL_REASONS=withdraw  PAYOUT_INAPP_REASONS=bond,model-prize  PAYOUT_MAX_ATTEMPTS=5  PAYOUT_SCAN_MS=30000  PAYOUT_RESEND_GRACE_MS=600000
 SUMSUB_BASE_URL=https://api.sumsub.com SUMSUB_APP_TOKEN SUMSUB_SECRET_KEY SUMSUB_WEBHOOK_SECRET SUMSUB_DUPLICATE_LABELS=DUPLICATE SUMSUB_ALLOW_SHA1=false
 SESSION_CLEANUP_MS=3600000  LEDGER_CACHE_MS=15000  DEPOSIT_LOCK_TTL_MS=300000  DEPOSIT_CONFIRM_GRACE_MS=600000  SENTRY_DSN  SWAGGER_ENABLED=auto
+COLLATERAL_INSTRUMENT_ADMIN / _ID / _SYMBOL / _NAME / _DECIMALS  COLLATERAL_REGISTRY_URL  COLLATERAL_REGISTRY_AUTH=keycloak  COLLATERAL_WALLET_INSTRUMENT_ID
+REWARDS_INSTRUMENT_* (same shape; TRO)  AUDIT_OBSERVER_PARTIES  TREASURY_TRANSFER_MODE=wallet  TREASURY_TRANSFER_TTL_SEC=600  LEDGER_FRESH_OFFSETS=50  ACCEPTOR_SCAN_MS=10000
+REGISTRY_KEYCLOAK_*  TOKEN_APP_URL  TOKEN_APP_APP_NAME=truthoracle  TOKEN_APP_KEYCLOAK_*  REWARDS_ENABLED=true  REWARDS_SCAN_MS=30000  REWARDS_AUTO_MINT=false  REWARDS_MINT_MIN=1000
 ```
-The deployed Daml package is **truthoracle-v15 1.0.0** (`UserWallet.depositRefs : [Text]`
-mandatory); the two values above are the documented defaults in `.env.example`. There is no
-Daml feature flag: a `UserWallet` read without `depositRefs` is a `502 upstream_failed` (wrong
-package deployed), never "no refs". `KYC_ENFORCE_WITHDRAWALS` is a plain flag — money leaves
-only through this backend (§18), so nothing has to be attested before it is switched on.
+The deployed Daml package is **truthoracle-v17 1.0.0** (`UserWallet.instrument : InstrumentId`
+and `UserWallet.creditRefs : [Text]` mandatory, `PredictionMarket.collateral`); the two values
+above are the documented defaults in `.env.example`. There is no Daml feature flag: a
+`UserWallet` read without `creditRefs` or `instrument` is a `502 upstream_failed` (wrong package
+deployed), never "no refs" or "some default token". The instrument, treasury-transfer,
+token-app and rewards variables are specified in docs/TOKENS.md §4.7. `KYC_ENFORCE_WITHDRAWALS`
+is a plain flag — money leaves only through this backend (§18), so nothing has to be attested
+before it is switched on.
 
 Boot refuses: missing DATABASE_URL/REDIS_URL/NATS_URL; short SESSION_SECRET /
 BACKEND_PROXY_SECRET / KYC_FINGERPRINT_PEPPER; `KYC_PROVIDER=mock` when `APP_ENV=prod` **or**
@@ -770,7 +863,11 @@ BACKEND_PROXY_SECRET / KYC_FINGERPRINT_PEPPER; `KYC_PROVIDER=mock` when `APP_ENV
 with an app token but no webhook secret; mainnet without `ZKPC_*`; unverified Postgres TLS in
 prod / on mainnet without `DB_SSL_INSECURE_ACK`; `to_settings.app_network` ≠ `APP_NETWORK`;
 pepper hash mismatch without ack; `COOKIE_DOMAIN` set while `BACKEND_PROXY_SECRET` is
-configured (proxied cookies must be host-only).
+configured (proxied cookies must be host-only); `COLLATERAL_INSTRUMENT_ID` without
+`COLLATERAL_INSTRUMENT_ADMIN` (or the admin without the id), an instrument admin or
+`AUDIT_OBSERVER_PARTIES` entry that is not a party id, `*_INSTRUMENT_DECIMALS` outside 0..10,
+`*_REGISTRY_AUTH` outside `none | ledger | keycloak`, `TREASURY_TRANSFER_MODE` outside
+`wallet | registry`.
 
 ## 13. Security controls (checklist)
 
@@ -803,7 +900,7 @@ checks pg/redis/nats, structured audit trail.
   consistency + replay, Google verifier (mocked), session issue/verify/revoke/index, identity
   link/unlink/reattach rules incl. `identity_unlinked`, wallet primary rules, deposit
   attribution (fixed point; no seed — link never reads the ledger; unlink/relink; drift in
-  both directions refused; depositRefs-based confirm pass; crash between submit and commit),
+  both directions refused; creditRefs-based confirm pass; crash between submit and commit),
   payout matrix (reason × kyc × enforce × has-wallet × known-user
   × recorded-submit × status-read-error), KYC state machine + persons binding + duplicate +
   transfer, Sumsub signing/digest, rate limiter/lock against real Redis.
@@ -857,7 +954,7 @@ New files:
 - `components/auth/AccountMenu.tsx` — header avatar/name, link to `/account`, sign-out **button**.
 - `components/Account/AccountPage.tsx` (route `/account`, gated AdminGate-style: sign-in prompt,
   no redirect) — profile; sign-in methods (link/unlink/reattach); wallets (link via signature,
-  primary badge + permanence note, unlink, attribution, ownLedgerWallet); identity
+  primary badge + permanence note, unlink, attribution per instrument, ownLedgerWallets); identity
   verification (`KycPanel`: status, start → Sumsub WebSDK container or mock form); sessions.
 - `components/kyc/KycPanel.tsx` — loads
   `https://static.sumsub.com/idensic/static/sns-websdk-builder.js` on demand.
@@ -895,7 +992,7 @@ Changed files:
 
 - Phase 1 (this change): backend (accounts, sign-in, wallet linking, session-gated deposit
   reconciliation, KYC with mock provider, gated payout settlement, admin API) and frontend
-  integration, deployed **together with the Daml package truthoracle-v15 1.0.0** against a
+  integration, deployed **together with the Daml package truthoracle-v17 1.0.0** against a
   fresh database (one `Init` migration — nothing is migrated from an earlier layout, §18).
   The frontend has no account-less money path: deposits and withdrawal settlement go through
   the backend and require a signed-in account; trading and reads stay wallet-signed.
@@ -915,7 +1012,7 @@ frontend are designed greenfield:
   (treasury-signed, `wallet-create-<hash(package name, owner)>`); nothing predates the backend. A Canton
   party never holds an in-app balance without an account — the one exception is an in-app
   payout (`bond` / `model-prize`) settled to a party that traded with its own key, which the
-  backend also performs and which never touches `depositedCC`.
+  backend also performs and which never touches `deposited`.
 - Deposits and withdrawals **require a signed-in account**, and so, in practice, does trading.
   Every trade is still signed by the user's own wallet (reads and Daml choices are never
   server-signed), but every market choice debits or credits a `UserWallet`, and a `UserWallet`
@@ -927,10 +1024,11 @@ frontend are designed greenfield:
   by KYC, removes the "connected but not signed in" state, and removes the two-popups-per-click
   flow the browser forbids.
 - Consequently there is no seed from the ledger at link time, no silent repair of a ledger
-  surplus (drift in either direction is refused), no Daml feature flag for `depositRefs`
-  (mandatory on truthoracle-v15), no boot-time precondition in front of
-  `KYC_ENFORCE_WITHDRAWALS`, no fallback to an older Enterprise Wallet history endpoint, and a
-  single `Init` migration creates the final schema.
+  surplus (drift in either direction is refused), no Daml feature flag for `creditRefs`
+  (mandatory on truthoracle-v17), no boot-time precondition in front of
+  `KYC_ENFORCE_WITHDRAWALS`, no wallet-side source of deposits (they come from the ledger index
+  alone, docs/TOKENS.md §2 decision 5), and the checked-in migrations create the schema from
+  scratch (no row is carried over from an earlier deploy).
 - Still in place because it is sound regardless of history: write-ahead deposit credits with
   the confirm pass, deterministic command ids, the payout write-ahead arbiter, the KYC gate
   (vendor undecided, mock default), fixed-point money, the `/__backend` relay contract and
@@ -941,8 +1039,8 @@ frontend are designed greenfield:
 | Area | v1 | v2 |
 |---|---|---|
 | Account-less money paths | kept "unchanged" through Phase 1 | none exist (§18): deposits and withdrawal settlement require an account; `KYC_ENFORCE_WITHDRAWALS` is a plain flag |
-| Deposit attribution | `credited_cc` starts at 0 | `credited_cc` starts at 0 and is the only attribution; linking never reads the ledger; drift in **either** direction is a hard `409 deposit_attribution_drift` (nothing is repaired silently) |
-| Deposit confirmation | `depositedCC` grew by the amount | `UserWallet.depositRefs` contains the row's `txRef` (mandatory on truthoracle-v15) |
+| Deposit attribution | `credited_cc` starts at 0 | `to_wallet_credits` starts empty (one row per wallet and instrument) and is the only attribution; linking never reads the ledger; drift in **either** direction is a hard `409 deposit_attribution_drift` (nothing is repaired silently) |
+| Deposit confirmation | `deposited` grew by the amount | `UserWallet.creditRefs` contains the row's `txRef` (mandatory on truthoracle-v17) |
 | Deposit crash safety | DB bump after submit | write-ahead `to_deposit_credits` + confirm pass; lock TTL 300 s |
 | Attribution scope | active wallets | all wallet rows; party bound to first account forever; relink reactivates |
 | Arithmetic | JS numbers, dust tolerance | fixed point bigint, exact invariant |

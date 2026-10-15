@@ -10,12 +10,12 @@ import {
 } from "typeorm";
 
 import type { WalletKind, WalletStatus } from "../types";
-import { moneyTransformer } from "../util/money";
 import { UserEntity } from "./user.entity";
 
 /**
  * A linked Canton wallet (ARCHITECTURE §5 `to_wallets`). A party is bound to its first account
- * forever (active or revoked); relinking reactivates the row and never inserts.
+ * forever (active or revoked); relinking reactivates the row and never inserts. What the backend
+ * credited the wallet with lives per instrument in `to_wallet_credits` (docs/TOKENS.md §4.3).
  */
 @Entity({ name: "to_wallets" })
 @Index("uq_to_wallets_primary_per_user", ["userId"], {
@@ -56,10 +56,6 @@ export class WalletEntity {
 
   @Column({ type: "text", default: "active" })
   status!: WalletStatus;
-
-  /** In-app credits attributed to this wallet by the backend (the only attribution there is — §8.3). */
-  @Column({ name: "credited_cc", type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
-  creditedCC!: bigint;
 
   @Column({ name: "verified_at", type: "timestamptz" })
   verifiedAt!: Date;

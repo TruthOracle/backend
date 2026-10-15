@@ -4,6 +4,7 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { DataSource, In, Repository } from "typeorm";
 
 import { Config } from "../config";
+import type { InstrumentEntity } from "../entities/instrument.entity";
 import { PayoutEntity } from "../entities/payout.entity";
 import type { WalletEntity } from "../entities/wallet.entity";
 import {
@@ -12,28 +13,43 @@ import {
   NatsSubjects,
   type PayoutStatus,
   type PendingPayoutRecord,
+  TREASURY_TRANSFER_MODES,
+  type TreasuryTransferMode,
+  type TreasuryTransferRequest,
 } from "../types";
 import { ApiError } from "../util/errors";
-import { formatCC } from "../util/money";
+import { formatAmount, quantizeDown } from "../util/money";
 import { AuditService, type AuditInput } from "./audit.service";
 import { EnterpriseWalletService, type TransferStatusResult } from "./enterprise-wallet.service";
+import { InstrumentsService } from "./instruments.service";
 import { KycService } from "./kyc.service";
-import { LedgerClientService, userWalletCreateCommand, walletCreateCommandIdFor } from "./ledger-client.service";
+import {
+  LedgerClientService,
+  userWalletCreateCommand,
+  walletCreateCommandIdFor,
+} from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { RedisService } from "./redis.service";
 import { SentryService } from "./sentry.service";
+import { TreasuryTransferService } from "./treasury-transfer.service";
 import { UserService } from "./user.service";
 import { WalletLinkService } from "./wallet-link.service";
 
 /**
  * Settlement of on-ledger PendingPayouts under the KYC gate (docs/ARCHITECTURE.md §9.4). Port of
- * truthoracle-canton/api/wallet/settle-payout.mjs, extended with the `to_payouts` write-ahead
- * arbiter, the closed reason policy and the in-app path.
+ * the Vercel function `api/wallet/settle-payout.mjs` pm-frontend shipped before settlement moved
+ * here (since removed there), extended with the `to_payouts` write-ahead arbiter, the closed
+ * reason policy and the in-app path.
  *
- * The contract IS the authorisation: the payee and the amount are read from the on-ledger
- * PendingPayout, which only the market choices can create. A caller supplies a contract id and
- * nothing else, so the worst a hostile caller can do is settle a payout that the ledger already
- * says is owed — to the party the ledger says owns it.
+ * The contract IS the authorisation: the payee, the instrument and the amount are read from the
+ * on-ledger PendingPayout, which only the market and wallet choices can create. A caller supplies
+ * a contract id and nothing else, so the worst a hostile caller can do is settle a payout that
+ * the ledger already says is owed — to the party the ledger says owns it, in the token it names.
+ * External settlement sends `amount` quantised down to the instrument's decimals (the dust stays
+ * in-app and is recorded in `to_payouts.details.dust`, docs/TOKENS.md §4.3) through
+ * `TreasuryTransferService` — the Enterprise Wallet's transfer or a registry-built
+ * `TransferFactory_Transfer`, per the instrument's `transfer_mode`; the mode used is recorded on
+ * the row (`details.transferMode`) so a later attempt asks the right status index.
  *
  * Concurrency is the remaining way to abuse that: on the external path the transfer happens
  * BEFORE the consuming MarkPaid (money must move before the record archives), so two attempts
@@ -80,7 +96,11 @@ export const PAYOUT_LOCK_TTL_MS = 120_000;
 /** The scan lock only stops instances doing the same work twice; per-cid locks guard the money. */
 export const PAYOUT_SCAN_LOCK_TTL_MS = 5 * 60_000;
 
-const TERMINAL: ReadonlySet<PayoutStatus> = new Set(["settled_external", "settled_in_app", "archived"]);
+const TERMINAL: ReadonlySet<PayoutStatus> = new Set([
+  "settled_external",
+  "settled_in_app",
+  "archived",
+]);
 /** Statuses the scan retries on its own; blocked rows wait for a user, a KYC approval or an operator. */
 const RETRIABLE: ReadonlySet<PayoutStatus> = new Set(["queued", "settling"]);
 /** `force` may override these and nothing else (ARCHITECTURE §9.4). */
@@ -196,6 +216,8 @@ export class PayoutService {
     private readonly kyc: KycService,
     private readonly walletLink: WalletLinkService,
     private readonly users: UserService,
+    private readonly instruments: InstrumentsService,
+    private readonly treasuryTransfers: TreasuryTransferService,
     private readonly sentry: SentryService,
   ) {}
 
@@ -207,14 +229,21 @@ export class PayoutService {
    */
   async settle(cid: string, actor: PayoutActor): Promise<SettleResult> {
     if (actor.force) {
-      if (actor.type !== "admin") throw new ApiError(403, "forbidden", "only an operator can force a settlement");
-      if (!actor.reason?.trim()) throw new ApiError(400, "validation_failed", "a reason is required to force a settlement");
+      if (actor.type !== "admin")
+        throw new ApiError(403, "forbidden", "only an operator can force a settlement");
+      if (!actor.reason?.trim())
+        throw new ApiError(400, "validation_failed", "a reason is required to force a settlement");
     }
     const lock = await this.redis.acquireLock(`lock:payout:${cid}`, PAYOUT_LOCK_TTL_MS);
     if (!lock.acquired) {
-      throw new ApiError(409, "payout_blocked", "a settlement for this payout is already in progress", {
-        reason: "settlement_in_progress",
-      });
+      throw new ApiError(
+        409,
+        "payout_blocked",
+        "a settlement for this payout is already in progress",
+        {
+          reason: "settlement_in_progress",
+        },
+      );
     }
     try {
       return await this.settleLocked(cid, actor);
@@ -262,19 +291,44 @@ export class PayoutService {
     // re-evaluated past this point — a wallet revoked after the transfer must still be MarkPaid.
     if (row.transferCommandId) return this.executeExternal(ctx);
     if (row.settleCommandId || row.walletCreateCommandId) return this.executeInApp(ctx);
-    if (!live.user || live.amountCC <= 0n) {
-      return this.block(ctx, "failed", live.user ? "payout amount is not positive" : "payout has no payee");
+    if (!live.user || live.amount <= 0n) {
+      return this.block(
+        ctx,
+        "failed",
+        live.user ? "payout amount is not positive" : "payout has no payee",
+      );
     }
+    // An instrument the platform does not know or has disabled cannot leave (or be credited): the
+    // row waits for an operator, who registers / enables the token and retries.
+    const instrument = await this.instruments.get(live.instrument.admin, live.instrument.id);
+    if (!instrument)
+      return this.block(
+        ctx,
+        "blocked_unknown_reason",
+        `instrument ${live.instrument.id} (${live.instrument.admin.slice(0, 24)}…) is not registered`,
+      );
+    if (!instrument.enabled)
+      return this.block(
+        ctx,
+        "blocked_unknown_reason",
+        `instrument ${instrument.symbol} is disabled`,
+      );
 
     const policy = this.policyFor(live.reason);
-    if (policy === "unknown") return this.block(ctx, "blocked_unknown_reason", `reason "${live.reason}" is not in the payout policy`);
+    if (policy === "unknown")
+      return this.block(
+        ctx,
+        "blocked_unknown_reason",
+        `reason "${live.reason}" is not in the payout policy`,
+      );
     if (policy === "in_app") return this.executeInApp(ctx);
 
-    // External CC leaves the platform: user active AND payee wallet active AND the KYC gate —
+    // Tokens leave the platform: user active AND payee wallet active AND the KYC gate —
     // always evaluated on the PAYEE's account, never the caller's.
     const verdict = await this.externalVerdict(wallet);
     if (verdict) {
-      if (!(actor.force && FORCEABLE.has(verdict.status))) return this.block(ctx, verdict.status, verdict.detail);
+      if (!(actor.force && FORCEABLE.has(verdict.status)))
+        return this.block(ctx, verdict.status, verdict.detail);
       await this.audit.record({
         ...this.actorFields(actor),
         action: "payout.admin_override",
@@ -305,10 +359,12 @@ export class PayoutService {
   }
 
   private async externalVerdict(wallet: WalletEntity | null): Promise<Verdict | null> {
-    if (!wallet) return { status: "blocked_unknown_user", detail: "payee party is not linked to any account" };
+    if (!wallet)
+      return { status: "blocked_unknown_user", detail: "payee party is not linked to any account" };
     const user = await this.users.findById(wallet.userId);
     if (!user) return { status: "blocked_unknown_user", detail: "payee account not found" };
-    if (wallet.status !== "active") return { status: "blocked_wallet_revoked", detail: "payee wallet is revoked" };
+    if (wallet.status !== "active")
+      return { status: "blocked_wallet_revoked", detail: "payee wallet is revoked" };
     if (user.status !== "active") return { status: "blocked_kyc", detail: "user_suspended" };
     // The gate owns KYC_ENFORCE_WITHDRAWALS too (INTERNALS), but it is only consulted when the
     // flag is on: with enforcement off the answer is `allowed` by contract, and not calling it
@@ -322,18 +378,51 @@ export class PayoutService {
   // ───────────────────────────────────────────── external path ───────────────────────────────
 
   private async executeExternal(ctx: LiveContext): Promise<SettleResult> {
-    const { cid, row, actor } = ctx;
+    const { cid, row, actor, live } = ctx;
     const { transferCommandId, markPaidCommandId } = commandIdsFor(cid);
-    const treasury = this.config.treasuryPartyId;
+    const instrument = await this.instruments.get(live.instrument.admin, live.instrument.id);
+    if (!instrument)
+      return this.block(
+        ctx,
+        "blocked_unknown_reason",
+        `instrument ${live.instrument.id} is not registered`,
+      );
+    const sendable = quantizeDown(live.amount, instrument.decimals);
+    if (sendable <= 0n) {
+      return this.block(
+        ctx,
+        "failed",
+        `payout of ${formatAmount(live.amount)} ${instrument.symbol} is below the instrument's smallest unit (${instrument.decimals} decimals)`,
+      );
+    }
 
     if (!row.transferCommandId) {
       // Write-ahead (compare-and-set): once this commits, transfer() is called at most once for
       // this payout, ever — and an instance that lost the race never calls the wallet.
-      if (!(await this.claimCommand(row, "transferCommandId", transferCommandId, { previous: null, countAttempt: true }))) {
+      if (
+        !(await this.claimCommand(row, "transferCommandId", transferCommandId, {
+          previous: null,
+          countAttempt: true,
+        }))
+      ) {
         throw await this.lostRace(ctx, transferCommandId);
       }
+      // What quantisation kept in-app and how the money leaves are facts of this settlement,
+      // recorded before the money moves: a later attempt must ask the status index of the mode
+      // that was used, not of the mode the instrument is configured with by then.
+      const transferMode = this.instruments.transferModeOf(instrument);
+      await this.transition(row, {
+        details: {
+          ...(row.details ?? {}),
+          dust: formatAmount(live.amount - sendable),
+          sent: formatAmount(sendable),
+          transferMode,
+        },
+      });
       try {
-        await this.wallet.transfer(this.transferArgs(ctx, transferCommandId));
+        await this.treasuryTransfers.transfer(
+          this.transferRequest(ctx, transferCommandId, sendable),
+        );
       } catch (err) {
         // Unknown whether the wallet accepted it: the row keeps the id, the next attempt asks.
         throw await this.attemptFailed(ctx, err, "transfer");
@@ -342,7 +431,10 @@ export class PayoutService {
       // Skip the transfer when a previous attempt already submitted it (crashed before
       // MarkPaid, or a concurrent request from another instance won). The payout is still
       // active, so finishing the job means archiving it — not paying again.
-      const status = await this.wallet.transferStatus(treasury, row.transferCommandId);
+      const status = await this.treasuryTransfers.status(
+        this.recordedTransferMode(row, instrument),
+        row.transferCommandId,
+      );
       if (!status.known) throw await this.stopUnknown(ctx, row.transferCommandId);
       if (!status.submitted) {
         if (this.mayResendTransfer(ctx)) {
@@ -354,12 +446,26 @@ export class PayoutService {
             action: "payout.admin_override",
             subjectType: "payout",
             subjectId: cid,
-            metadata: { detail: "resend_transfer", transferCommandId: row.transferCommandId, walletStatus: status.status, reason: actor.reason, userId: row.userId },
+            metadata: {
+              detail: "resend_transfer",
+              transferCommandId: row.transferCommandId,
+              walletStatus: status.status,
+              reason: actor.reason,
+              userId: row.userId,
+            },
           });
-          this.logger.warn(`payout ${cid}: operator re-sends transfer ${row.transferCommandId} (wallet reported "${status.status ?? "unknown"}")`);
-          await this.transition(row, { status: "settling", attempts: row.attempts + 1, lastError: null });
+          this.logger.warn(
+            `payout ${cid}: operator re-sends transfer ${row.transferCommandId} (wallet reported "${status.status ?? "unknown"}")`,
+          );
+          await this.transition(row, {
+            status: "settling",
+            attempts: row.attempts + 1,
+            lastError: null,
+          });
           try {
-            await this.wallet.transfer(this.transferArgs(ctx, row.transferCommandId));
+            await this.treasuryTransfers.transfer(
+              this.transferRequest(ctx, row.transferCommandId, sendable),
+            );
           } catch (err) {
             throw await this.attemptFailed(ctx, err, "transfer");
           }
@@ -368,28 +474,45 @@ export class PayoutService {
           // itself: a "not found" from a lagging index is exactly the case that double-pays. A
           // user's or operator's retry counts toward the cap (→ operator queue); the scan's own
           // polls do not, or every stuck row would be `failed` within minutes.
-          await this.transition(row, { status: "settling", ...(actor.type === "system" ? {} : { attempts: row.attempts + 1 }) });
+          await this.transition(row, {
+            status: "settling",
+            ...(actor.type === "system" ? {} : { attempts: row.attempts + 1 }),
+          });
           throw await this.attemptFailed(
             ctx,
-            new Error(`transfer ${row.transferCommandId} is recorded but the wallet reports "${status.status ?? "unknown"}"; refusing to transfer again`),
+            new Error(
+              `transfer ${row.transferCommandId} is recorded but the wallet reports "${status.status ?? "unknown"}"; refusing to transfer again`,
+            ),
             "transfer-status",
           );
         }
       } else {
-        this.logger.warn(`payout ${cid}: transfer ${row.transferCommandId} already submitted — resuming at MarkPaid`);
-        await this.transition(row, { status: "settling", attempts: row.attempts + 1, lastError: null });
+        this.logger.warn(
+          `payout ${cid}: transfer ${row.transferCommandId} already submitted — resuming at MarkPaid`,
+        );
+        await this.transition(row, {
+          status: "settling",
+          attempts: row.attempts + 1,
+          lastError: null,
+        });
       }
     }
 
-    // The CC has moved. If MarkPaid fails the user still has their money; the row just lingers
+    // The tokens have moved. If MarkPaid fails the user still has their money; the row just lingers
     // until the next settle attempt resumes here and archives it. A MarkPaid that was already
     // attempted (contract still live, so it did not land) is retried under a fresh id.
-    const markPaidId = row.markPaidCommandId ? retryCommandId(markPaidCommandId, row.attempts) : markPaidCommandId;
+    const markPaidId = row.markPaidCommandId
+      ? retryCommandId(markPaidCommandId, row.attempts)
+      : markPaidCommandId;
     await this.transition(row, { markPaidCommandId: markPaidId });
     try {
       await this.wallet.externalSubmit({
         commandId: markPaidId,
-        commands: [this.exercisePayout(cid, "MarkPaid", { txHash: row.transferCommandId ?? transferCommandId })],
+        commands: [
+          this.exercisePayout(cid, "MarkPaid", {
+            txHash: row.transferCommandId ?? transferCommandId,
+          }),
+        ],
       });
     } catch (err) {
       throw await this.attemptFailed(ctx, err, "markpaid");
@@ -398,15 +521,37 @@ export class PayoutService {
     return this.settled(ctx, "settled_external", "external");
   }
 
-  private transferArgs(ctx: LiveContext, commandId: string): Parameters<EnterpriseWalletService["transfer"]>[0] {
+  /** The treasury transfer of a payout: the payout's instrument, the payee, the amount quantised to the instrument's decimals. */
+  private transferRequest(
+    ctx: LiveContext,
+    commandId: string,
+    amount: bigint,
+  ): TreasuryTransferRequest {
     const { cid, live } = ctx;
     return {
+      instrument: live.instrument,
       to: live.user,
-      amountCC: live.amountCC,
+      amount,
       reason: live.reason || "payout",
       commandId,
-      metadata: { kind: "truthoracle_admin_payout", pending_payout_cid: cid, reason: live.reason || "payout" },
+      metadata: { kind: "truthoracle_admin_payout", pending_payout_cid: cid },
     };
+  }
+
+  /** The mode the recorded transfer was sent with (`details.transferMode`), else the instrument's current one. */
+  private recordedTransferMode(
+    row: PayoutEntity,
+    instrument: InstrumentEntity | null,
+  ): TreasuryTransferMode {
+    const recorded = row.details?.transferMode;
+    if (
+      typeof recorded === "string" &&
+      (TREASURY_TRANSFER_MODES as readonly string[]).includes(recorded)
+    )
+      return recorded as TreasuryTransferMode;
+    return instrument
+      ? this.instruments.transferModeOf(instrument)
+      : this.config.treasuryTransferMode;
   }
 
   /** Admin + force + reason (validated in settle()) and a row older than PAYOUT_RESEND_GRACE_MS. */
@@ -431,30 +576,57 @@ export class PayoutService {
       return true;
     };
 
-    let ledgerWallet = await this.ledger.fetchUserWallet(payee, { uncached: true });
+    // The payee's wallet in the payout's instrument: a bond refund lands in the market's
+    // collateral wallet, never in some other balance the party holds.
+    let ledgerWallet = await this.ledger.fetchUserWallet(payee, live.instrument, {
+      uncached: true,
+    });
     if (!ledgerWallet) {
-      const walletCreateCommandId = this.ledger.walletCreateCommandId(payee);
+      const walletCreateCommandId = this.ledger.walletCreateCommandId(payee, live.instrument);
       if (row.walletCreateCommandId) {
         const status = await this.wallet.commandStatus(treasury, row.walletCreateCommandId);
         if (this.readFailed(status)) throw await this.stopUnknown(ctx, row.walletCreateCommandId);
         // Accepted but not yet visible on the ledger: creating again would race it.
-        if (status.known && status.submitted) throw await this.inFlight(ctx, row.walletCreateCommandId);
+        if (status.known && status.submitted)
+          throw await this.inFlight(ctx, row.walletCreateCommandId);
         // Failed or unknown to the wallet: re-submit the SAME id — the per-owner id makes a Create
         // that did land (unindexed) collide on dedup instead of minting a second wallet.
-        await this.transition(row, { status: "settling", attempts: countOnce() ? row.attempts + 1 : row.attempts, lastError: null });
-      } else if (!(await this.claimCommand(row, "walletCreateCommandId", walletCreateCommandId, { previous: null, countAttempt: countOnce() }))) {
+        await this.transition(row, {
+          status: "settling",
+          attempts: countOnce() ? row.attempts + 1 : row.attempts,
+          lastError: null,
+        });
+      } else if (
+        !(await this.claimCommand(row, "walletCreateCommandId", walletCreateCommandId, {
+          previous: null,
+          countAttempt: countOnce(),
+        }))
+      ) {
         throw await this.lostRace(ctx, walletCreateCommandId);
       }
       try {
         await this.wallet.externalSubmit({
           commandId: walletCreateCommandId,
-          commands: [userWalletCreateCommand({ templateId: this.ledger.templateId("UserWallet"), admin: treasury, owner: payee })],
+          commands: [
+            userWalletCreateCommand({
+              templateId: this.ledger.templateId("UserWallet"),
+              admin: treasury,
+              owner: payee,
+              instrument: live.instrument,
+              auditObservers: this.config.auditObserverParties,
+            }),
+          ],
         });
       } catch (err) {
         throw await this.attemptFailed(ctx, err, "wallet-create");
       }
-      ledgerWallet = await this.ledger.fetchUserWallet(payee, { uncached: true });
-      if (!ledgerWallet) throw await this.attemptFailed(ctx, new Error("UserWallet is not visible after create"), "wallet-create");
+      ledgerWallet = await this.ledger.fetchUserWallet(payee, live.instrument, { uncached: true });
+      if (!ledgerWallet)
+        throw await this.attemptFailed(
+          ctx,
+          new Error("UserWallet is not visible after create"),
+          "wallet-create",
+        );
     }
 
     let settleId = settleCommandId;
@@ -468,13 +640,20 @@ export class PayoutService {
       settleId = retryCommandId(settleCommandId, row.attempts + 1);
     }
     // `walletCid` is always the cid read moments ago: every Deposit / Credit replaces it.
-    if (!(await this.claimCommand(row, "settleCommandId", settleId, { previous: row.settleCommandId, countAttempt: countOnce() }))) {
+    if (
+      !(await this.claimCommand(row, "settleCommandId", settleId, {
+        previous: row.settleCommandId,
+        countAttempt: countOnce(),
+      }))
+    ) {
       throw await this.lostRace(ctx, settleId);
     }
     try {
       await this.wallet.externalSubmit({
         commandId: settleId,
-        commands: [this.exercisePayout(cid, "SettleToWallet", { walletCid: ledgerWallet.contractId })],
+        commands: [
+          this.exercisePayout(cid, "SettleToWallet", { walletCid: ledgerWallet.contractId }),
+        ],
       });
     } catch (err) {
       throw await this.attemptFailed(ctx, err, "settle-to-wallet");
@@ -483,8 +662,19 @@ export class PayoutService {
     return this.settled(ctx, "settled_in_app", "in_app");
   }
 
-  private exercisePayout(cid: string, choice: "MarkPaid" | "SettleToWallet", choiceArgument: Record<string, unknown>): unknown {
-    return { ExerciseCommand: { templateId: this.ledger.templateId("PendingPayout"), contractId: cid, choice, choiceArgument } };
+  private exercisePayout(
+    cid: string,
+    choice: "MarkPaid" | "SettleToWallet",
+    choiceArgument: Record<string, unknown>,
+  ): unknown {
+    return {
+      ExerciseCommand: {
+        templateId: this.ledger.templateId("PendingPayout"),
+        contractId: cid,
+        choice,
+        choiceArgument,
+      },
+    };
   }
 
   /** The wallet accepted a consuming command; only the ledger says whether it executed. */
@@ -512,17 +702,28 @@ export class PayoutService {
 
     if (row.markPaidCommandId) return this.settled(ctx, "settled_external", "external");
     if (row.transferCommandId) {
-      const status = await this.wallet.transferStatus(this.config.treasuryPartyId, row.transferCommandId);
+      const instrument = await this.instruments.get(row.instrumentAdmin, row.instrumentId);
+      const status = await this.treasuryTransfers.status(
+        this.recordedTransferMode(row, instrument),
+        row.transferCommandId,
+      );
       if (!status.known) throw await this.stopUnknown(ctx, row.transferCommandId);
       if (status.submitted) return this.settled(ctx, "settled_external", "external");
       // Recorded but never submitted: the user cancelled between the write-ahead and the call.
     } else if (row.settleCommandId) {
-      const status = await this.wallet.commandStatus(this.config.treasuryPartyId, row.settleCommandId);
+      const status = await this.wallet.commandStatus(
+        this.config.treasuryPartyId,
+        row.settleCommandId,
+      );
       if (this.readFailed(status)) throw await this.stopUnknown(ctx, row.settleCommandId);
       if (status.known && status.submitted) return this.settled(ctx, "settled_in_app", "in_app");
       const detail = `PendingPayout is gone but the wallet reports SettleToWallet ${row.settleCommandId} as ${status.status ?? "unknown"}; operator review required`;
       if (row.status !== "failed") {
-        this.sentry.captureMessage("in-app payout archived without a confirmed settlement", "error", { processor: "payout", cid });
+        this.sentry.captureMessage(
+          "in-app payout archived without a confirmed settlement",
+          "error",
+          { processor: "payout", cid },
+        );
         this.logger.error(`payout ${cid}: ${detail}`);
       }
       return this.block(ctx, "failed", detail);
@@ -534,14 +735,21 @@ export class PayoutService {
 
   // ───────────────────────────────────────────── row transitions ─────────────────────────────
 
-  private async firstSight(live: PendingPayoutRecord, wallet: WalletEntity | null, actor: PayoutActor): Promise<PayoutEntity> {
+  private async firstSight(
+    live: PendingPayoutRecord,
+    wallet: WalletEntity | null,
+    actor: PayoutActor,
+  ): Promise<PayoutEntity> {
     const fields = {
       pendingPayoutCid: live.contractId,
       userId: wallet?.userId ?? null,
       payeeParty: live.user,
       payeeWalletId: wallet?.id ?? null,
-      amountCC: live.amountCC,
+      instrumentAdmin: live.instrument.admin,
+      instrumentId: live.instrument.id,
+      amount: live.amount,
       reason: live.reason,
+      details: {},
       status: "queued" as PayoutStatus,
       transferCommandId: null,
       walletCreateCommandId: null,
@@ -562,7 +770,14 @@ export class PayoutService {
             action: "payout.seen",
             subjectType: "payout",
             subjectId: live.contractId,
-            metadata: { reason: live.reason, amountCC: formatCC(live.amountCC), payeeParty: live.user, userId: saved.userId, walletId: saved.payeeWalletId },
+            metadata: {
+              reason: live.reason,
+              instrument: live.instrument,
+              amount: formatAmount(live.amount),
+              payeeParty: live.user,
+              userId: saved.userId,
+              walletId: saved.payeeWalletId,
+            },
           },
           manager,
         );
@@ -586,7 +801,11 @@ export class PayoutService {
     await this.payouts.save(row);
   }
 
-  private async transition(row: PayoutEntity, patch: Partial<PayoutEntity>, audit?: AuditInput): Promise<PayoutEntity> {
+  private async transition(
+    row: PayoutEntity,
+    patch: Partial<PayoutEntity>,
+    audit?: AuditInput,
+  ): Promise<PayoutEntity> {
     Object.assign(row, patch);
     if (!audit) return this.payouts.save(row);
     return this.dataSource.transaction(async (manager) => {
@@ -631,8 +850,15 @@ export class PayoutService {
   private async lostRace(ctx: SettleContext, commandId: string): Promise<ApiError> {
     const fresh = await this.payouts.findOne({ where: { id: ctx.row.id } });
     if (fresh) Object.assign(ctx.row, fresh);
-    this.logger.warn(`payout ${ctx.cid}: ${commandId} was claimed by another settlement; standing down`);
-    return new ApiError(409, "payout_blocked", "a settlement for this payout is already in progress", { status: ctx.row.status, reason: "in_flight" });
+    this.logger.warn(
+      `payout ${ctx.cid}: ${commandId} was claimed by another settlement; standing down`,
+    );
+    return new ApiError(
+      409,
+      "payout_blocked",
+      "a settlement for this payout is already in progress",
+      { status: ctx.row.status, reason: "in_flight" },
+    );
   }
 
   /** Persist a blocked (or failed) verdict and throw the matching 409. Audited/published on change only. */
@@ -649,7 +875,13 @@ export class PayoutService {
             action,
             subjectType: "payout",
             subjectId: cid,
-            metadata: { status, detail, reason: row.reason, userId: row.userId, attempts: row.attempts },
+            metadata: {
+              status,
+              detail,
+              reason: row.reason,
+              userId: row.userId,
+              attempts: row.attempts,
+            },
           }
         : undefined,
     );
@@ -685,33 +917,64 @@ export class PayoutService {
         : undefined,
     );
     if (becameFailed) {
-      await this.nats.publishSafe(NatsSubjects.payoutFailed, { cid, userId: row.userId, payeeParty: row.payeeParty, status, attempts: row.attempts }, { msgId: `payout.failed:${cid}` });
+      await this.nats.publishSafe(
+        NatsSubjects.payoutFailed,
+        { cid, userId: row.userId, payeeParty: row.payeeParty, status, attempts: row.attempts },
+        { msgId: `payout.failed:${cid}` },
+      );
       this.logger.error(`payout ${cid}: giving up after ${row.attempts} attempt(s) — ${detail}`);
-      this.sentry.captureMessage(`payout settlement failed after ${row.attempts} attempts`, "error", { processor: "payout", phase });
+      this.sentry.captureMessage(
+        `payout settlement failed after ${row.attempts} attempts`,
+        "error",
+        { processor: "payout", phase },
+      );
     } else {
       this.logger.warn(`payout ${cid}: attempt ${row.attempts} failed at ${phase}: ${detail}`);
     }
     if (err instanceof ApiError) return err;
-    return new ApiError(502, "upstream_failed", `payout settlement failed at ${phase}`, { status, attempts: row.attempts });
+    return new ApiError(502, "upstream_failed", `payout settlement failed at ${phase}`, {
+      status,
+      attempts: row.attempts,
+    });
   }
 
   /** Fail CLOSED: the wallet could not say what happened to a recorded id. No attempt is charged. */
   private async stopUnknown(ctx: SettleContext, commandId: string): Promise<ApiError> {
-    await this.transition(ctx.row, { status: "settling", lastError: `status of ${commandId} could not be read; settlement paused` });
-    this.logger.warn(`payout ${ctx.cid}: wallet could not report ${commandId}; failing closed`);
-    return new ApiError(502, "upstream_failed", "the wallet could not confirm a previous submission; settlement is paused and will be retried", {
+    await this.transition(ctx.row, {
       status: "settling",
+      lastError: `status of ${commandId} could not be read; settlement paused`,
     });
+    this.logger.warn(`payout ${ctx.cid}: wallet could not report ${commandId}; failing closed`);
+    return new ApiError(
+      502,
+      "upstream_failed",
+      "the wallet could not confirm a previous submission; settlement is paused and will be retried",
+      {
+        status: "settling",
+      },
+    );
   }
 
   /** A recorded submission is accepted but not yet on the ledger: wait for the next scan. */
   private async inFlight(ctx: SettleContext, commandId: string): Promise<ApiError> {
-    await this.transition(ctx.row, { status: "settling", lastError: `${commandId} accepted by the wallet, waiting for the ledger` });
-    return new ApiError(409, "payout_blocked", "a previous submission for this payout is still in flight", { status: "settling", reason: "in_flight" });
+    await this.transition(ctx.row, {
+      status: "settling",
+      lastError: `${commandId} accepted by the wallet, waiting for the ledger`,
+    });
+    return new ApiError(
+      409,
+      "payout_blocked",
+      "a previous submission for this payout is still in flight",
+      { status: "settling", reason: "in_flight" },
+    );
   }
 
   /** Terminal transition as a compare-and-set: whoever moves the row out of a non-terminal status audits and publishes once. */
-  private async settled(ctx: SettleContext, status: "settled_external" | "settled_in_app", mode: "external" | "in_app"): Promise<SettleResult> {
+  private async settled(
+    ctx: SettleContext,
+    status: "settled_external" | "settled_in_app",
+    mode: "external" | "in_app",
+  ): Promise<SettleResult> {
     const { row, cid, actor } = ctx;
     const won = await this.dataSource.transaction(async (manager) => {
       const res = await manager
@@ -730,7 +993,9 @@ export class PayoutService {
           subjectId: cid,
           metadata: {
             mode,
-            amountCC: formatCC(row.amountCC),
+            instrument: { admin: row.instrumentAdmin, id: row.instrumentId },
+            amount: formatAmount(row.amount),
+            dust: typeof row.details?.dust === "string" ? row.details.dust : undefined,
             reason: row.reason,
             userId: row.userId,
             transferCommandId: row.transferCommandId,
@@ -749,17 +1014,32 @@ export class PayoutService {
     if (!won) return { payout: row, mode: "already_settled", onLedger: false };
     await this.nats.publishSafe(
       NatsSubjects.payoutSettled,
-      { cid, userId: row.userId, payeeParty: row.payeeParty, mode, amountCC: formatCC(row.amountCC), reason: row.reason },
+      {
+        cid,
+        userId: row.userId,
+        payeeParty: row.payeeParty,
+        mode,
+        instrument: { admin: row.instrumentAdmin, id: row.instrumentId },
+        amount: formatAmount(row.amount),
+        reason: row.reason,
+      },
       { msgId: `payout.settled:${cid}` },
     );
     this.logger.log(
-      `payout ${cid}: settled ${formatCC(row.amountCC)} CC to ${row.payeeParty} (${row.reason}) ${mode}${actor.type === "system" ? "" : ` by ${actor.type}`}`,
+      `payout ${cid}: settled ${formatAmount(row.amount)} ${row.instrumentId} to ${row.payeeParty} (${row.reason}) ${mode}${actor.type === "system" ? "" : ` by ${actor.type}`}`,
     );
     return { payout: row, mode, onLedger: false };
   }
 
-  private actorFields(actor: PayoutActor): Pick<AuditInput, "actorType" | "actorUserId" | "actorSessionId" | "ip"> {
-    return { actorType: actor.type, actorUserId: actor.userId ?? null, actorSessionId: actor.sessionId ?? null, ip: actor.ip ?? null };
+  private actorFields(
+    actor: PayoutActor,
+  ): Pick<AuditInput, "actorType" | "actorUserId" | "actorSessionId" | "ip"> {
+    return {
+      actorType: actor.type,
+      actorUserId: actor.userId ?? null,
+      actorSessionId: actor.sessionId ?? null,
+      ip: actor.ip ?? null,
+    };
   }
 
   // ───────────────────────────────────────────── processor entry points ──────────────────────
@@ -774,7 +1054,10 @@ export class PayoutService {
     const live = await this.ledger.fetchPendingPayouts({ uncached: true });
     const liveCids = live.map((p) => p.contractId);
     const rows = await this.payouts.find({
-      where: liveCids.length > 0 ? [{ status: In(NON_TERMINAL) }, { pendingPayoutCid: In(liveCids) }] : { status: In(NON_TERMINAL) },
+      where:
+        liveCids.length > 0
+          ? [{ status: In(NON_TERMINAL) }, { pendingPayoutCid: In(liveCids) }]
+          : { status: In(NON_TERMINAL) },
     });
     const byCid = new Map(rows.map((r) => [r.pendingPayoutCid, r]));
     const liveSet = new Set(liveCids);
@@ -786,12 +1069,19 @@ export class PayoutService {
       // A live PendingPayout whose row says "settled" must never exist silently: the user sees
       // "Settled", nothing was credited, and CancelPayout could still refund it (double pay).
       if (row && TERMINAL.has(row.status) && row.status !== "archived") {
-        this.logger.error(`scan: ${p.contractId} is ${row.status} in to_payouts but still active on the ledger`);
-        this.sentry.captureMessage("settled payout still active on the ledger", "error", { processor: "payout-settlement", cid: p.contractId, status: row.status });
+        this.logger.error(
+          `scan: ${p.contractId} is ${row.status} in to_payouts but still active on the ledger`,
+        );
+        this.sentry.captureMessage("settled payout still active on the ledger", "error", {
+          processor: "payout-settlement",
+          cid: p.contractId,
+          status: row.status,
+        });
       }
     }
     for (const r of rows) {
-      if (!liveSet.has(r.pendingPayoutCid) && !TERMINAL.has(r.status)) todo.push(r.pendingPayoutCid);
+      if (!liveSet.has(r.pendingPayoutCid) && !TERMINAL.has(r.status))
+        todo.push(r.pendingPayoutCid);
     }
 
     let settled = 0;
@@ -813,7 +1103,10 @@ export class PayoutService {
         }
       }
     }
-    if (todo.length > 0) this.logger.log(`scan: ${todo.length} payout(s) examined, ${settled} settled, ${held} held, ${errored} errored`);
+    if (todo.length > 0)
+      this.logger.log(
+        `scan: ${todo.length} payout(s) examined, ${settled} settled, ${held} held, ${errored} errored`,
+      );
   }
 
   /** `truthoracle.kyc.status_changed` → approved: the user's `blocked_kyc` rows go back to the queue. */
@@ -832,7 +1125,8 @@ export class PayoutService {
         },
       );
     }
-    if (rows.length > 0) this.logger.log(`requeued ${rows.length} blocked_kyc payout(s) for user ${userId}`);
+    if (rows.length > 0)
+      this.logger.log(`requeued ${rows.length} blocked_kyc payout(s) for user ${userId}`);
     return rows.length;
   }
 
@@ -860,7 +1154,9 @@ export class PayoutService {
     const walletByParty = new Map(wallets.map((w) => [w.partyId, w]));
     const parties = [...walletByParty.keys()];
     const [rows, live] = await Promise.all([
-      this.payouts.find({ where: parties.length > 0 ? [{ userId }, { payeeParty: In(parties) }] : { userId } }),
+      this.payouts.find({
+        where: parties.length > 0 ? [{ userId }, { payeeParty: In(parties) }] : { userId },
+      }),
       this.ledger.fetchPendingPayouts(),
     ]);
     const byCid = new Map(rows.map((r) => [r.pendingPayoutCid, r]));
@@ -883,7 +1179,8 @@ export class PayoutService {
       pendingPayoutCid: payout.pendingPayoutCid,
       payeeParty: payout.payeeParty,
       walletId: payout.payeeWalletId,
-      amountCC: formatCC(payout.amountCC),
+      instrument: this.instruments.refFor(payout.instrumentAdmin, payout.instrumentId),
+      amount: formatAmount(payout.amount),
       reason: payout.reason,
       status: payout.status,
       retryAfterKyc: payout.status === "blocked_kyc",
@@ -900,7 +1197,8 @@ export class PayoutService {
       pendingPayoutCid: p.contractId,
       payeeParty: p.user,
       walletId: wallet?.id ?? null,
-      amountCC: formatCC(p.amountCC),
+      instrument: this.instruments.refOf(p.instrument),
+      amount: formatAmount(p.amount),
       reason: p.reason,
       status: "queued",
       retryAfterKyc: false,

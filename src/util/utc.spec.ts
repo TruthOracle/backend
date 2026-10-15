@@ -13,19 +13,26 @@ function probe(hostZone: string): Record<string, unknown> {
     "process.stdout.write(JSON.stringify({ offset: d.getTimezoneOffset(), hours: d.getHours(), utcHours: d.getUTCHours(),",
     "  date: d.getDate(), utcDate: d.getUTCDate(), zone: Intl.DateTimeFormat().resolvedOptions().timeZone }));",
   ].join("\n");
-  const out = execFileSync(process.execPath, ["-r", "ts-node/register/transpile-only", "-e", script], {
-    env: { ...process.env, TZ: hostZone },
-    encoding: "utf8",
-  });
+  const out = execFileSync(
+    process.execPath,
+    ["-r", "ts-node/register/transpile-only", "-e", script],
+    {
+      env: { ...process.env, TZ: hostZone },
+      encoding: "utf8",
+    },
+  );
   return JSON.parse(out) as Record<string, unknown>;
 }
 
 describe("process time zone", () => {
-  it.each(["Asia/Kolkata", "America/Los_Angeles", "Europe/Berlin"])("is pinned to UTC when the host runs in %s", (zone) => {
-    const r = probe(zone);
-    expect(r.offset).toBe(0);
-    expect(r.hours).toBe(r.utcHours);
-    expect(r.date).toBe(r.utcDate);
-    expect(r.zone).toBe("UTC");
-  });
+  it.each(["Asia/Kolkata", "America/Los_Angeles", "Europe/Berlin"])(
+    "is pinned to UTC when the host runs in %s",
+    (zone) => {
+      const r = probe(zone);
+      expect(r.offset).toBe(0);
+      expect(r.hours).toBe(r.utcHours);
+      expect(r.date).toBe(r.utcDate);
+      expect(r.zone).toBe("UTC");
+    },
+  );
 });

@@ -54,7 +54,9 @@ export class SessionCleanupProcessor implements OnModuleInit, OnModuleDestroy {
       const sessions = await this.sessions.purgeStale(SESSION_RETENTION_MS);
       const purged = await this.kyc.purgeWebhookPayloads();
       if (sessions || purged) {
-        this.logger.log(`cleanup: ${sessions} stale session(s) deleted, ${purged} webhook payload(s) purged`);
+        this.logger.log(
+          `cleanup: ${sessions} stale session(s) deleted, ${purged} webhook payload(s) purged`,
+        );
       }
     } catch (err) {
       this.logger.error(`cleanup failed: ${(err as Error).message}`);

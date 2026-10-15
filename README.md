@@ -2,7 +2,7 @@
 
 Accounts, sessions, wallet linking, KYC, money rails and the **ledger index** (markets, trades,
 positions, wallet statements, payouts, transfers — docs/INDEXER.md) for TruthOracle on Canton. NestJS 12 /
-TypeScript 6 / TypeORM 1 / Postgres / Redis / NATS JetStream. A sibling of `truthoracle-canton`
+TypeScript 6 / TypeORM 1 / Postgres / Redis / NATS JetStream. A sibling of `pm-frontend`
 (frontend + Vercel functions), `truthoracle-contracts` (Daml) and `enterprise-wallet`; laid out
 like `risk-monitor-backend`.
 
@@ -45,21 +45,21 @@ src/
 ├── auth/                  # SessionGuard, AdminGuard, CsrfGuard, decorators, proxy-contract request helpers
 ├── controllers/           # one per resource; index.ts exports controller classes only
 ├── services/              # index.ts exports service classes only
-├── processors/            # scheduled / NATS-driven loops (incl. the ledger indexer loop)
-├── indexer/               # ledger event normalisation, tree building, the projection, candles, Splice transfer extraction (pure)
+├── processors/            # scheduled / NATS-driven loops (incl. the ledger indexer, the TransferInstruction acceptor and the rewards pass)
+├── indexer/               # ledger event normalisation, tree building, the projection, candles, token-standard + Splice transfer extraction (pure)
 ├── amm/                   # the pm-AMM math port (quotes) — mirrors truthoracle-contracts PmAmmMath.daml
-├── entities/              # 11 account `to_*` tables (ARCHITECTURE §5) + 14 ledger-index tables (INDEXER.md §3) + catalog / candles (MARKETS.md)
-├── migrations/            # checked-in migrations (Init, LedgerIndex, MarketCatalog); synchronize is hard-coded false
+├── entities/              # 11 account `to_*` tables (ARCHITECTURE §5) + 16 ledger-index tables (INDEXER.md §3) + catalog / candles (MARKETS.md) + instruments / rewards (TOKENS.md)
+├── migrations/            # checked-in migrations (Init, LedgerIndex, MarketCatalog, …, Instruments); synchronize is hard-coded false
 ├── dto/                   # class-validator request DTOs
 └── util/                  # money (bigint fixed point), canton-crypto, telegram, cookies, errors, …
 test/
-├── helpers/               # createTestApp / useTestApp, fakes (NATS, ledger, wallet, KYC), makeTestWallet, sessions
+├── helpers/               # createTestApp / useTestApp, fakes (NATS, ledger, wallet, participant stream, registry, token-app, KYC), makeTestWallet, sessions, ledger fixtures
 └── *.e2e-spec.ts          # against real Postgres + Redis
-docs/                      # ARCHITECTURE.md, API.md, INTERNALS.md, RUNBOOK.md
+docs/                      # ARCHITECTURE.md, API.md, INTERNALS.md, RUNBOOK.md, INDEXER.md, MARKETS.md, TOKENS.md, KYC.md
 ```
 
 Conventions: `Object.values(barrel)` auto-registers every exported class, so barrels export
-classes only (tokens and interfaces live in `types.ts`). Money is `bigint` in 1e-10 CC units end
+classes only (tokens and interfaces live in `types.ts`). Money is `bigint` in 1e-10 token units end
 to end (`util/money.ts`), `numeric(38,10)` in Postgres, 10-decimal strings on the wire. Every error
 is an `ApiError(status, code, message, details?)` rendered as `{ error, message, details? }` by
 one global filter — including body-parser failures (`400 validation_failed`) and unknown routes
@@ -81,15 +81,19 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm run migration:run` · `migration:revert` | apply / roll back |
 | `npm run seed:dev [-- --clear]` | write (or remove) a demo catalog with 30 days of candles and a trade feed into the local index for UI work — `APP_ENV=dev` only, never on the ledger (docs/RUNBOOK.md §13) |
 
-Four migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
+Five migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
 an earlier layout is dropped and recreated, never upgraded), `LedgerIndex` (the fourteen
 ledger-index tables, additive), `MarketCatalog` (series / events / candles tables plus the
 identity and open-interest columns on `to_markets`, additive; the identity columns are NOT NULL —
-a v16 index never writes a market without them, and a from-scratch deployment starts with an
-empty index) and `MarketMetadata` (`to_market_metadata`, the backend-owned image / description
+the index never writes a market without them, and a from-scratch deployment starts with an
+empty index), `MarketMetadata` (`to_market_metadata`, the backend-owned image / description
 per market; drops the presentation columns v16 contracts no longer carry, carrying any values
-over first). Regenerating against a migrated database proposes only the
-cosmetic `'{}'` vs `'{}'::jsonb` default rewrites, which are not drift.
+over first) and `Instruments` (docs/TOKENS.md: `to_instruments`, `to_wallet_credits`,
+`to_ledger_holdings`, `to_ledger_transfer_instructions`, `to_reward_rules`, `to_reward_grants`,
+instrument / collateral columns on every amount-carrying table and the `_cc` suffix dropped from
+every column; a real `down()`; data-free — the reward rules are seeded at boot by
+`RewardsService.seedRules`, not by the migration). Regenerating against a migrated database
+proposes only the cosmetic `'{}'` vs `'{}'::jsonb` default rewrites, which are not drift.
 
 Jest runs in CommonJS with `test/esm-to-cjs.transformer.cjs` converting the ESM-only packages
 (`@nestjs/*`, `jose`) — it passes on Node 22 and 24+.
@@ -101,22 +105,30 @@ its default and the boot refusal it participates in. Highlights: `APP_NETWORK` s
 key prefix, the NATS stream (`TRUTHORACLE_<NETWORK>`) and, on mainnet, the `ZKPC_*` ledger
 credentials; `BACKEND_PROXY_SECRET` is what lets the Vercel proxy's `x-real-ip` /
 `x-forwarded-host` be trusted; `KYC_PROVIDER=mock` is refused in prod and on mainnet;
-`KYC_ENFORCE_WITHDRAWALS` is a plain flag. The Daml package is **truthoracle-v16 1.0.0**
+`KYC_ENFORCE_WITHDRAWALS` is a plain flag. The Daml package is **truthoracle-v17 1.0.0**
 (`TRUTHORACLE_PACKAGE_ID=<package id printed by npm run dars:upload in truthoracle-contracts>`,
-`TRUTHORACLE_PACKAGE_NAME=truthoracle-v16`), a fresh lineage deployed from scratch;
-`UserWallet.depositRefs` is mandatory there and is what the deposit confirm pass keys on, and
-every `PredictionMarket` carries its identity (ticker, event, side labels) and nothing
-presentational — image, description and category are the backend's (docs/MARKETS.md §1).
+`TRUTHORACLE_PACKAGE_NAME=truthoracle-v17`), a fresh lineage deployed from scratch;
+`UserWallet.instrument` and `UserWallet.creditRefs` are mandatory there (one wallet per party and
+token; the refs are what the deposit and grant confirm passes key on), every `PredictionMarket`
+carries its `collateral` and its identity (ticker, event, side labels) and nothing presentational
+— image, description and category are the backend's (docs/MARKETS.md §1). The collateral and
+rewards instruments come from `COLLATERAL_INSTRUMENT_*` / `REWARDS_INSTRUMENT_*` (docs/TOKENS.md §4.7;
+Canton Coin is the DevNet stand-in until cBYN is deployed).
 
 ## Ledger index
 
 `LedgerIndexerProcessor` streams the treasury party's transactions from the Canton JSON Ledger
-API v2 (`/v2/updates`, LEDGER_EFFECTS shape — created **and exercised** events) into Postgres,
-one ledger transaction per database transaction, cursor included; on a pruned participant it
-starts from an ACS snapshot at the prune point. `GET /markets`, `/markets/:id/{trades,activity,
-price-history,forecasts,attestations}`, `/me/{positions,liquidity,trades,activity}`,
+API v2 (`/v2/updates`, LEDGER_EFFECTS shape — created **and exercised** events, plus the token
+standard's `Holding` / `TransferInstruction` interface views) into Postgres, one ledger
+transaction per database transaction, cursor included; on a pruned participant it starts from an
+ACS snapshot at the prune point. Every CIP-56 token the treasury holds, is offered or moves lands
+in `to_ledger_holdings`, `to_ledger_transfer_instructions` and `to_ledger_transfers`, which is
+where deposits are read from (the index is the only deposit source; `503 ledger_stale`
+guards a lagging index). `GET /markets`, `/markets/:id/{trades,activity,price-history,forecasts,
+attestations}`, `/me/{positions,liquidity,trades,activity}`,
 `/in-app-wallet/{ledger,history,transfers}`, `/stats`, `/leaderboard`, `/ledger/{status,wait}`
-and `/admin/ledger/*` read it. Design, tables, derivations and operations: `docs/INDEXER.md`.
+and `/admin/ledger/*` (incl. `holdings`, `transfer-instructions`) read it. Design, tables,
+derivations and operations: `docs/INDEXER.md`; the tokens: `docs/TOKENS.md`.
 
 ## CI
 
@@ -137,9 +149,9 @@ e2e spec (`test/{session,app,auth,wallets,payouts,kyc,admin}.e2e-spec.ts`).
 account-less app. The primary wallet's on-ledger `UserWallet` is created only by this backend;
 deposits and withdrawals require a signed-in account; linking never reads the ledger (a first-time
 link succeeds while the ledger is down); deposit confirmation keys on
-`UserWallet.depositRefs`; attribution drift in either direction is a hard
+`UserWallet.creditRefs`; attribution drift in either direction is a hard
 `409 deposit_attribution_drift`; one `Init` migration creates the final schema; package
-truthoracle-v16.
+truthoracle-v17.
 
 **Accounts and wallets (decided 2026-09-11, ARCHITECTURE §6.1 / §7.3 / §8.1):** Google and Telegram
 are the only user sign-in methods. A Cantor8 wallet is linked to an already signed-in account and
@@ -150,6 +162,29 @@ admin API with their wallet on `POST /auth/admin`. Admin sessions are refused on
 covers replay, bootstrap from an ACS snapshot, resync with a recorded gap, the derivations and every
 new route. Not yet exercised against a live participant (RUNBOOK §12).
 
+**Tokens — ledger plumbing (2026-10-15, docs/TOKENS.md §4.2–§4.4):** the index reads the token
+standard's interface views (holdings, two-step offers, `TransferFactory_Transfer` /
+`TransferInstruction_Accept` transfers in any instrument, Canton Coin counted once), the deposit
+reconcile credits from `to_ledger_transfers` behind the `503 ledger_stale` gate, payouts settle
+through `TreasuryTransferService` (Enterprise Wallet or a registry-built `TransferFactory_Transfer`
+over the indexed holdings), `TokenRegistryService` / `TokenAppService` talk to Cantor8's CIP-56
+registries and token-app, the acceptor processor completes offers addressed to the treasury, and
+`POST /admin/instruments/:admin/:id/setup` runs a token's AutoAccept / MintDelegation.
+`test/token-standard.e2e-spec.ts`, `test/instruments.e2e-spec.ts`.
+
+**Tokens — rewards, token operations, per-instrument catalog (2026-10-15, docs/TOKENS.md
+§4.5–§4.7):** the catalog is listed and summed per instrument (`?instrument=` on `GET /events`,
+`GET /series`, `GET /series/:ticker`; an event's collateral is fixed by its first market or its
+accepted submission, a second instrument on it is `409 catalog_conflict`); `RewardsService` /
+`RewardsProcessor` derive TRO grants from the index (trade rebate, winning-redeem bonus, first
+deposit bonus, manual), credit them with `UserWallet.Grant` under the float rule (blocked grants
+wait, DevNet may auto-mint the shortfall through token-app) and confirm them on `creditRefs`;
+`GET /me/rewards` and `/admin/rewards/{rules,grant,grants,float}`; `TokenOperationsService` behind
+`POST /admin/tokens/mint|burn` and `GET /admin/tokens/status`, with the mint-and-credit on-ramp
+running through the deposit write-ahead machinery. `test/{rewards,admin-tokens}.e2e-spec.ts`,
+`src/services/rewards.service.spec.ts`. Still untested against a live token-app and participant
+(docs/RUNBOOK.md §16).
+
 **Sumsub is the KYC provider (2026-09-29, docs/KYC.md §5–§6):** the adapter matches Sumsub's
 current API (SDK tokens with `applicantIdentifiers`, signed requests, SHA-256/512 webhook
 digests over the raw body, every documented `applicant*` webhook type, applicant re-reads);
@@ -159,7 +194,7 @@ the first Sumsub sandbox session is still to be watched.
 
 **Markets like an exchange (2026-09-29, docs/MARKETS.md):** Kalshi-style series → event → market
 catalog (events group N binary pm-AMM markets; a market's `ticker` / `eventTicker` / side labels are
-the contract's own — mandatory on truthoracle-v16 — and the projection creates placeholder catalog
+the contract's own — mandatory on truthoracle-v17 — and the projection creates placeholder catalog
 rows for an event the ledger names first), candlesticks folded by the projection in the ledger transaction's own DB transaction
 (1 min / 1 h / 1 d, dense reads), open interest, 24 h figures and an AMM-implied book on every
 market, `GET /markets/:market/quote` (the PmAmmMath port) and `POST /markets/:market/orders/prepare`
@@ -170,7 +205,7 @@ market, `GET /markets/:market/quote` (the PmAmmMath port) and `POST /markets/:ma
 Verified on 2026-09-10: `npm run typecheck`, `npm run lint`, `npm run build` exit 0;
 `npm test` 21 suites / 150 tests; `npm run test:e2e` 7 suites / 161 tests against real
 Postgres + Redis. A live boot against Postgres + Redis + a JetStream `nats-server`, driven
-**through the `truthoracle-canton` vite relay** (`/__backend/api/v1`), passes the sequence in
+**through the `pm-frontend` vite relay** (`/__backend/api/v1`), passes the sequence in
 `docs/RUNBOOK.md` §8 — health, social sign-in with the relayed `to_session` cookie, mock KYC
 approval, linking wallets, deposit reconcile answering `502 upstream_failed` against an
 unreachable treasury, sessions, logout, CSRF/404 envelopes — and the boot refusals in §1 exit 1

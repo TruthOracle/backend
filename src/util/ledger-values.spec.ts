@@ -1,4 +1,4 @@
-import { formatCC } from "./money";
+import { formatAmount } from "./money";
 import {
   asDecimal,
   asEnum,
@@ -18,8 +18,8 @@ import {
 
 describe("ledger value decoding", () => {
   it("decimals are fixed point, never Number", () => {
-    expect(formatCC(asDecimal("12.5"))).toBe("12.5000000000");
-    expect(formatCC(asDecimal("0.1234567891234"))).toBe("0.1234567891");
+    expect(formatAmount(asDecimal("12.5"))).toBe("12.5000000000");
+    expect(formatAmount(asDecimal("0.1234567891234"))).toBe("0.1234567891");
     expect(asDecimal(undefined)).toBe(0n);
     expect(asDecimal("nope")).toBe(0n);
     expect(asOptionalDecimal(null)).toBeNull();
@@ -65,9 +65,9 @@ describe("ledger value decoding", () => {
   });
 
   it("fixed-point arithmetic", () => {
-    expect(formatCC(mulDecimal(ONE_DECIMAL * 3n, ONE_DECIMAL / 2n))).toBe("1.5000000000");
-    expect(formatCC(divDecimal(ONE_DECIMAL, ONE_DECIMAL * 3n))).toBe("0.3333333333");
-    expect(formatCC(divDecimal(ONE_DECIMAL * 2n, ONE_DECIMAL * 3n))).toBe("0.6666666667");
+    expect(formatAmount(mulDecimal(ONE_DECIMAL * 3n, ONE_DECIMAL / 2n))).toBe("1.5000000000");
+    expect(formatAmount(divDecimal(ONE_DECIMAL, ONE_DECIMAL * 3n))).toBe("0.3333333333");
+    expect(formatAmount(divDecimal(ONE_DECIMAL * 2n, ONE_DECIMAL * 3n))).toBe("0.6666666667");
     expect(divDecimal(1n, 0n)).toBe(0n);
   });
 

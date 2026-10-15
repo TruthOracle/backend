@@ -23,6 +23,8 @@ import {
   type ApiPosition,
   type ApiPricePoint,
   type ApiStats,
+  type InstrumentId,
+  type InstrumentRef,
   type MarketEventKind,
   type MarketPhase,
   type MarketStatus,
@@ -31,8 +33,9 @@ import {
 } from "../types";
 import { ApiError } from "../util/errors";
 import { divDecimal, mulDecimal, ONE_DECIMAL } from "../util/ledger-values";
-import { formatCC, parseCC } from "../util/money";
+import { formatAmount, parseAmount } from "../util/money";
 import { maskParty } from "../util/party";
+import { InstrumentsService } from "./instruments.service";
 
 export type MarketStatusFilter = MarketStatus | "active" | "settled";
 export type MarketSort = "newest" | "oldest" | "volume" | "expiry" | "activity";
@@ -80,8 +83,8 @@ const NO_EXTRAS: MarketExtras = {
   previousPrice: null,
   volume24h: 0n,
 };
-/** Collateral of the reference buy behind `ApiMarket.book` (one CC — a retail-sized order). */
-const BOOK_REFERENCE_CC = 1;
+/** Collateral of the reference buy behind `ApiMarket.book` (one unit of the market's collateral — a retail-sized order). */
+const BOOK_REFERENCE_AMOUNT = 1;
 
 export interface ActivityQuery {
   kind?: MarketEventKind;
@@ -132,11 +135,35 @@ const PNL_DEBIT_REASONS = ["buy", "split", "liquidity-provide"];
 /**
  * Market reads over the ledger index (docs/API.md "Markets"; docs/INDEXER.md §7). Every answer
  * comes from Postgres — nothing here touches the ledger, so a participant outage degrades to
- * "stale by the indexer's lag", never to an error.
+ * "stale by the indexer's lag", never to an error. Every amount is served next to the market's
+ * collateral (`collateral` on a market, `instrument` on trades, positions and aggregates —
+ * docs/TOKENS.md §4.5), resolved through the instruments snapshot.
  */
 @Injectable()
 export class MarketsService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly instruments: InstrumentsService,
+  ) {}
+
+  /** The wire ref of a market's collateral. */
+  collateralOf(m: Pick<MarketEntity, "collateralAdmin" | "collateralId">): InstrumentRef {
+    return this.instruments.refFor(m.collateralAdmin, m.collateralId);
+  }
+
+  /** The wire ref of any `(admin, id)` pair an index row carries. */
+  instrumentRef(admin: string, id: string): InstrumentRef {
+    return this.instruments.refFor(admin, id);
+  }
+
+  /**
+   * The instrument an aggregate (`GET /stats`, `GET /leaderboard`) is computed over: the query's
+   * `?instrument=<admin>:<id>`, else the default collateral; `503 not_ready` without either.
+   */
+  async aggregateInstrument(requested?: InstrumentId): Promise<InstrumentRef> {
+    if (requested) return this.instruments.refOf(requested);
+    return this.instruments.toRef(await this.instruments.requireDefaultCollateral());
+  }
 
   // ───────────────────────────────────────────── markets ─────────────────────────────────────────────
 
@@ -182,7 +209,7 @@ export class MarketsService {
         qb.orderBy("m.market_id", "ASC");
         break;
       case "volume":
-        qb.orderBy("m.total_volume_cc", "DESC").addOrderBy("m.market_id", "DESC");
+        qb.orderBy("m.total_volume", "DESC").addOrderBy("m.market_id", "DESC");
         break;
       case "expiry":
         qb.orderBy("m.expires_at_sec", "ASC").addOrderBy("m.market_id", "DESC");
@@ -272,8 +299,14 @@ export class MarketsService {
     if (rows.length === 0) return out;
     const ids = rows.map((m) => String(m.marketId));
     const eventTickers = [...new Set(rows.map((m) => m.eventTicker))];
-    const catalogByEvent = new Map<string, { seriesTicker: string; category: string; imageUrl: string }>();
-    const metadataByTicker = new Map<string, { imageUrl: string; description: string; updatedAt: Date }>();
+    const catalogByEvent = new Map<
+      string,
+      { seriesTicker: string; category: string; imageUrl: string }
+    >();
+    const metadataByTicker = new Map<
+      string,
+      { imageUrl: string; description: string; updatedAt: Date }
+    >();
     if (eventTickers.length > 0) {
       const events = await manager.query<
         { ticker: string; series_ticker: string; image_url: string; category: string | null }[]
@@ -303,29 +336,31 @@ export class MarketsService {
         });
     }
     const since = new Date(Date.now() - 86_400_000).toISOString();
-    const [volumes, previous, firsts] = await Promise.all([
-      manager.query<{ market_id: string; v: string }[]>(
-        `SELECT market_id, COALESCE(SUM(volume_cc), 0)::text AS v FROM to_market_candles
+    // One query at a time, never a Promise.all over `manager`: an admin write passes its
+    // transaction's manager, and a transaction owns a single pg client, which refuses overlapping
+    // queries (a deprecation warning today, an error from pg 9). Three small indexed set queries
+    // are not worth a second code path that is only safe outside a transaction.
+    const volumes = await manager.query<{ market_id: string; v: string }[]>(
+      `SELECT market_id, COALESCE(SUM(volume), 0)::text AS v FROM to_market_candles
           WHERE period_secs = 3600 AND market_id = ANY($1::bigint[]) AND period_start >= $2
           GROUP BY market_id`,
-        [ids, since],
-      ),
-      manager.query<{ market_id: string; close: string }[]>(
-        `SELECT DISTINCT ON (market_id) market_id, close::text FROM to_market_candles
+      [ids, since],
+    );
+    const previous = await manager.query<{ market_id: string; close: string }[]>(
+      `SELECT DISTINCT ON (market_id) market_id, close::text FROM to_market_candles
           WHERE period_secs = 3600 AND market_id = ANY($1::bigint[]) AND period_start < $2
           ORDER BY market_id, period_start DESC`,
-        [ids, since],
-      ),
-      manager.query<{ market_id: string; open: string }[]>(
-        `SELECT DISTINCT ON (market_id) market_id, open::text FROM to_market_candles
+      [ids, since],
+    );
+    const firsts = await manager.query<{ market_id: string; open: string }[]>(
+      `SELECT DISTINCT ON (market_id) market_id, open::text FROM to_market_candles
           WHERE period_secs = 3600 AND market_id = ANY($1::bigint[])
           ORDER BY market_id, period_start ASC`,
-        [ids],
-      ),
-    ]);
-    const volumeById = new Map(volumes.map((r) => [Number(r.market_id), parseCC(r.v)]));
-    const prevById = new Map(previous.map((r) => [Number(r.market_id), parseCC(r.close)]));
-    const firstById = new Map(firsts.map((r) => [Number(r.market_id), parseCC(r.open)]));
+      [ids],
+    );
+    const volumeById = new Map(volumes.map((r) => [Number(r.market_id), parseAmount(r.v)]));
+    const prevById = new Map(previous.map((r) => [Number(r.market_id), parseAmount(r.close)]));
+    const firstById = new Map(firsts.map((r) => [Number(r.market_id), parseAmount(r.open)]));
     for (const m of rows) {
       const catalog = catalogByEvent.get(m.eventTicker);
       out.set(m.marketId, {
@@ -355,7 +390,8 @@ export class MarketsService {
     const out = new Map<number, ApiMarketSummary>();
     if (rows.length === 0) return out;
     const extras = await this.extrasFor(rows);
-    for (const m of rows) out.set(m.marketId, this.toSummary(m, extras.get(m.marketId) ?? NO_EXTRAS));
+    for (const m of rows)
+      out.set(m.marketId, this.toSummary(m, extras.get(m.marketId) ?? NO_EXTRAS));
     return out;
   }
 
@@ -367,7 +403,13 @@ export class MarketsService {
       qb.andWhere("e.market_id = :marketId", { marketId: query.marketId });
     if (query.marketIds) {
       if (query.marketIds.length === 0)
-        return { items: [], page: query.page, limit: query.limit, total: 0, ...(query.cursor !== undefined ? { nextCursor: null } : {}) };
+        return {
+          items: [],
+          page: query.page,
+          limit: query.limit,
+          total: 0,
+          ...(query.cursor !== undefined ? { nextCursor: null } : {}),
+        };
       qb.andWhere("e.market_id IN (:...marketIds)", { marketIds: query.marketIds });
     }
     if (query.kind) qb.andWhere("e.kind = :kind", { kind: query.kind });
@@ -412,16 +454,25 @@ export class MarketsService {
     };
   }
 
-  /** Shape activity rows with their markets' tickers looked up in one query. */
+  /** Shape activity rows with their markets' tickers and collateral looked up in one query. */
   async toApiEvents(rows: MarketEventEntity[]): Promise<ApiMarketEvent[]> {
     if (rows.length === 0) return [];
     const ids = [...new Set(rows.map((e) => e.marketId))];
-    const tickers = await this.dataSource.query<{ market_id: string; ticker: string }[]>(
-      `SELECT market_id::text, ticker FROM to_markets WHERE market_id = ANY($1::bigint[])`,
+    const markets = await this.dataSource.query<
+      { market_id: string; ticker: string; collateral_admin: string; collateral_id: string }[]
+    >(
+      `SELECT market_id::text, ticker, collateral_admin, collateral_id FROM to_markets WHERE market_id = ANY($1::bigint[])`,
       [ids.map(String)],
     );
-    const tickerOf = new Map(tickers.map((r) => [Number(r.market_id), r.ticker]));
-    return rows.map((e) => this.toApiEvent(e, tickerOf.get(e.marketId) ?? ""));
+    const byId = new Map(markets.map((r) => [Number(r.market_id), r]));
+    return rows.map((e) => {
+      const m = byId.get(e.marketId);
+      return this.toApiEvent(
+        e,
+        m?.ticker ?? "",
+        m ? this.instrumentRef(m.collateral_admin, m.collateral_id) : null,
+      );
+    });
   }
 
   trades(query: Omit<ActivityQuery, "kinds">): Promise<ApiPage<ApiMarketEvent>> {
@@ -454,27 +505,27 @@ export class MarketsService {
     const limitParam = `$${params.length}`;
     const sql =
       width === 0
-        ? `SELECT effective_at, price, total_volume_cc, "offset" FROM (
-             SELECT effective_at, price, total_volume_cc, "offset" FROM to_market_snapshots
+        ? `SELECT effective_at, price, total_volume, "offset" FROM (
+             SELECT effective_at, price, total_volume, "offset" FROM to_market_snapshots
              WHERE ${where.join(" AND ")} ORDER BY "offset" DESC, node_id DESC LIMIT ${limitParam}
            ) latest ORDER BY "offset" ASC`
-        : `SELECT effective_at, price, total_volume_cc, "offset" FROM (
-             SELECT DISTINCT ON (bucket) to_timestamp(bucket) AS effective_at, price, total_volume_cc, "offset"
+        : `SELECT effective_at, price, total_volume, "offset" FROM (
+             SELECT DISTINCT ON (bucket) to_timestamp(bucket) AS effective_at, price, total_volume, "offset"
              FROM (
-               SELECT floor(extract(epoch FROM effective_at) / ${width}) * ${width} AS bucket, price, total_volume_cc, "offset", node_id
+               SELECT floor(extract(epoch FROM effective_at) / ${width}) * ${width} AS bucket, price, total_volume, "offset", node_id
                FROM to_market_snapshots WHERE ${where.join(" AND ")}
              ) b ORDER BY bucket DESC, "offset" DESC, node_id DESC LIMIT ${limitParam}
            ) latest ORDER BY "offset" ASC`;
     const rows = await this.dataSource.query<
-      { effective_at: Date | string; price: string; total_volume_cc: string; offset: string }[]
+      { effective_at: Date | string; price: string; total_volume: string; offset: string }[]
     >(sql, params);
     return {
       marketId,
       resolution: opts.resolution,
       points: rows.map((r) => ({
         t: new Date(r.effective_at).toISOString(),
-        price: formatCC(parseCC(r.price)),
-        volumeCC: formatCC(parseCC(r.total_volume_cc)),
+        price: formatAmount(parseAmount(r.price)),
+        volume: formatAmount(parseAmount(r.total_volume)),
         offset: Number(r.offset),
       })),
     };
@@ -495,9 +546,9 @@ export class MarketsService {
       author: f.author,
       marketId: f.marketId,
       modelId: f.modelId,
-      probabilityYes: formatCC(f.probabilityYes),
+      probabilityYes: formatAmount(f.probabilityYes),
       committedAt: secToIso(f.committedAtSec),
-      marketPriceAtCommit: formatCC(f.marketPriceAtCommit),
+      marketPriceAtCommit: formatAmount(f.marketPriceAtCommit),
       active: f.active,
       createdOffset: f.createdOffset,
     }));
@@ -565,26 +616,36 @@ export class MarketsService {
 
   // ───────────────────────────────────────────── aggregates ─────────────────────────────────────────────
 
-  async stats(indexedOffset: number): Promise<ApiStats> {
+  /** Platform aggregates over the markets of ONE instrument (sums across tokens would be meaningless). */
+  async stats(indexedOffset: number, requested?: InstrumentId): Promise<ApiStats> {
+    const instrument = await this.aggregateInstrument(requested);
     const since = new Date(Date.now() - 86_400_000).toISOString();
     const kinds = [...TRADE_KINDS];
+    const collateral = [instrument.admin, instrument.id];
     const [byStatus, volume, trades, traders] = await Promise.all([
       this.dataSource.query<{ status: string; n: string }[]>(
-        `SELECT status, COUNT(*)::text AS n FROM to_markets WHERE archived = false GROUP BY status`,
+        `SELECT status, COUNT(*)::text AS n FROM to_markets
+          WHERE archived = false AND collateral_admin = $1 AND collateral_id = $2 GROUP BY status`,
+        collateral,
       ),
       this.dataSource.query<{ total: string | null }[]>(
-        `SELECT COALESCE(SUM(total_volume_cc), 0)::text AS total FROM to_markets WHERE archived = false`,
+        `SELECT COALESCE(SUM(total_volume), 0)::text AS total FROM to_markets
+          WHERE archived = false AND collateral_admin = $1 AND collateral_id = $2`,
+        collateral,
       ),
       this.dataSource.query<{ n: string; n24: string; v24: string | null }[]>(
         `SELECT COUNT(*)::text AS n,
-                COUNT(*) FILTER (WHERE effective_at >= $2)::text AS n24,
-                COALESCE(SUM(amount_cc) FILTER (WHERE effective_at >= $2), 0)::text AS v24
-         FROM to_market_events WHERE kind = ANY($1::text[])`,
-        [kinds, since],
+                COUNT(*) FILTER (WHERE e.effective_at >= $2)::text AS n24,
+                COALESCE(SUM(e.amount) FILTER (WHERE e.effective_at >= $2), 0)::text AS v24
+         FROM to_market_events e JOIN to_markets m ON m.market_id = e.market_id
+         WHERE e.kind = ANY($1::text[]) AND m.collateral_admin = $3 AND m.collateral_id = $4`,
+        [kinds, since, ...collateral],
       ),
       this.dataSource.query<{ n: string }[]>(
-        `SELECT COUNT(DISTINCT actor)::text AS n FROM to_market_events WHERE kind = ANY($1::text[])`,
-        [kinds],
+        `SELECT COUNT(DISTINCT e.actor)::text AS n
+           FROM to_market_events e JOIN to_markets m ON m.market_id = e.market_id
+          WHERE e.kind = ANY($1::text[]) AND m.collateral_admin = $2 AND m.collateral_id = $3`,
+        [kinds, ...collateral],
       ),
     ]);
     const count = (status: string): number =>
@@ -594,6 +655,7 @@ export class MarketsService {
     const resolved = count("Resolved");
     const voided = count("Voided");
     return {
+      instrument,
       markets: {
         total: trading + proposed + resolved + voided,
         trading,
@@ -601,8 +663,8 @@ export class MarketsService {
         resolved,
         voided,
       },
-      totalVolumeCC: formatCC(parseCC(volume[0]?.total ?? "0")),
-      volume24hCC: formatCC(parseCC(trades[0]?.v24 ?? "0")),
+      totalVolume: formatAmount(parseAmount(volume[0]?.total ?? "0")),
+      volume24h: formatAmount(parseAmount(trades[0]?.v24 ?? "0")),
       trades: Number(trades[0]?.n ?? 0),
       trades24h: Number(trades[0]?.n24 ?? 0),
       traders: Number(traders[0]?.n ?? 0),
@@ -610,45 +672,59 @@ export class MarketsService {
     };
   }
 
-  /** Traders ranked by CC traded in the window; realised PnL from their wallet cash flows over the same window. */
+  /** Traders ranked by collateral traded in the window, in ONE instrument; realised PnL from their wallet cash flows in it over the same window. */
   async leaderboard(
     window: LeaderboardWindow,
     limit: number,
-  ): Promise<{ window: LeaderboardWindow; entries: ApiLeaderboardEntry[] }> {
+    requested?: InstrumentId,
+  ): Promise<{
+    window: LeaderboardWindow;
+    instrument: InstrumentRef;
+    entries: ApiLeaderboardEntry[];
+  }> {
+    const instrument = await this.aggregateInstrument(requested);
     const ms = WINDOW_MS[window];
     const since = ms === null ? null : new Date(Date.now() - ms).toISOString();
     const kinds = [...TRADE_KINDS];
     const volumeRows = await this.dataSource.query<
       { actor: string; volume: string; trades: string; markets: string }[]
     >(
-      `SELECT actor, COALESCE(SUM(amount_cc), 0)::text AS volume, COUNT(*)::text AS trades, COUNT(DISTINCT market_id)::text AS markets
-       FROM to_market_events WHERE kind = ANY($1::text[]) ${since ? "AND effective_at >= $3" : ""}
-       GROUP BY actor ORDER BY SUM(amount_cc) DESC NULLS LAST, COUNT(*) DESC LIMIT $2`,
-      since ? [kinds, limit, since] : [kinds, limit],
+      `SELECT e.actor, COALESCE(SUM(e.amount), 0)::text AS volume, COUNT(*)::text AS trades, COUNT(DISTINCT e.market_id)::text AS markets
+       FROM to_market_events e JOIN to_markets m ON m.market_id = e.market_id
+       WHERE e.kind = ANY($1::text[]) AND m.collateral_admin = $3 AND m.collateral_id = $4 ${since ? "AND e.effective_at >= $5" : ""}
+       GROUP BY e.actor ORDER BY SUM(e.amount) DESC NULLS LAST, COUNT(*) DESC LIMIT $2`,
+      since
+        ? [kinds, limit, instrument.admin, instrument.id, since]
+        : [kinds, limit, instrument.admin, instrument.id],
     );
-    if (volumeRows.length === 0) return { window, entries: [] };
+    if (volumeRows.length === 0) return { window, instrument, entries: [] };
     const owners = volumeRows.map((r) => r.actor);
     const pnlRows = await this.dataSource.query<
       { owner: string; credits: string; debits: string }[]
     >(
       `SELECT owner,
-              COALESCE(SUM(amount_cc) FILTER (WHERE kind = 'credit' AND reason = ANY($2::text[])), 0)::text AS credits,
-              COALESCE(SUM(amount_cc) FILTER (WHERE kind = 'debit' AND reason = ANY($3::text[])), 0)::text AS debits
-       FROM to_wallet_entries WHERE owner = ANY($1::text[]) ${since ? "AND effective_at >= $4" : ""}
+              COALESCE(SUM(amount) FILTER (WHERE kind = 'credit' AND reason = ANY($2::text[])), 0)::text AS credits,
+              COALESCE(SUM(amount) FILTER (WHERE kind = 'debit' AND reason = ANY($3::text[])), 0)::text AS debits
+       FROM to_wallet_entries
+       WHERE owner = ANY($1::text[]) AND instrument_admin = $4 AND instrument_id = $5 ${since ? "AND effective_at >= $6" : ""}
        GROUP BY owner`,
       since
-        ? [owners, PNL_CREDIT_REASONS, PNL_DEBIT_REASONS, since]
-        : [owners, PNL_CREDIT_REASONS, PNL_DEBIT_REASONS],
+        ? [owners, PNL_CREDIT_REASONS, PNL_DEBIT_REASONS, instrument.admin, instrument.id, since]
+        : [owners, PNL_CREDIT_REASONS, PNL_DEBIT_REASONS, instrument.admin, instrument.id],
     );
-    const pnl = new Map(pnlRows.map((r) => [r.owner, parseCC(r.credits) - parseCC(r.debits)]));
+    const pnl = new Map(
+      pnlRows.map((r) => [r.owner, parseAmount(r.credits) - parseAmount(r.debits)]),
+    );
     return {
       window,
+      instrument,
       entries: volumeRows.map((r) => ({
         party: r.actor,
-        volumeCC: formatCC(parseCC(r.volume)),
+        instrument,
+        volume: formatAmount(parseAmount(r.volume)),
         trades: Number(r.trades),
         markets: Number(r.markets),
-        realizedPnlCC: formatCC(pnl.get(r.actor) ?? 0n),
+        realizedPnl: formatAmount(pnl.get(r.actor) ?? 0n),
       })),
     };
   }
@@ -672,14 +748,14 @@ export class MarketsService {
     const phase = this.phaseOf(m, nowSec);
     const amm = ammStateOf(m);
     const effectiveL = marketEffectiveL(amm, nowSec);
-    const liquidityCC = effectiveL > 0 ? poolValue(amm.currentPrice, effectiveL) : 0;
-    const book = phase === "trading" ? impliedQuoteBook(amm, nowSec, BOOK_REFERENCE_CC) : null;
+    const liquidity = effectiveL > 0 ? poolValue(amm.currentPrice, effectiveL) : 0;
+    const book = phase === "trading" ? impliedQuoteBook(amm, nowSec, BOOK_REFERENCE_AMOUNT) : null;
     const proposal = m.proposal
       ? {
           proposer: m.proposal.proposer,
           proposedOutcome: m.proposal.proposedOutcome,
           proposedAt: secToIso(m.proposal.proposedAtSec),
-          bondCC: m.proposal.bondCC,
+          bond: m.proposal.bond,
           challenger: m.proposal.challenger,
           challengerOutcome: m.proposal.challengerOutcome,
           challengeEndsAt: secToIso(m.proposal.proposedAtSec + (m.policy?.challengeSecs ?? 0)),
@@ -695,6 +771,7 @@ export class MarketsService {
       contractId: m.contractId,
       templateId: m.templateId,
       admin: m.admin,
+      collateral: this.collateralOf(m),
       question: m.question,
       imageUrl: imageUrlOf(extras),
       description: extras.metadata?.description ?? "",
@@ -713,16 +790,16 @@ export class MarketsService {
       gracePeriodSecs: m.gracePeriodSecs,
       isDynamic: m.isDynamic,
       liquidityPeriodSecs: m.liquidityPeriodSecs,
-      reserveYes: formatCC(m.reserveYes),
-      reserveNo: formatCC(m.reserveNo),
-      liquidityL: formatCC(m.liquidityL),
-      lpTokenSupply: formatCC(m.lpTokenSupply),
-      currentPrice: formatCC(m.currentPrice),
+      reserveYes: formatAmount(m.reserveYes),
+      reserveNo: formatAmount(m.reserveNo),
+      liquidityL: formatAmount(m.liquidityL),
+      lpTokenSupply: formatAmount(m.lpTokenSupply),
+      currentPrice: formatAmount(m.currentPrice),
       feeBps: m.feeBps,
       prizeFeeShareBps: m.prizeFeeShareBps,
-      accumulatedFeesCC: formatCC(m.accumulatedFeesCC),
-      prizePoolCC: formatCC(m.prizePoolCC),
-      totalVolumeCC: formatCC(m.totalVolumeCC),
+      accumulatedFees: formatAmount(m.accumulatedFees),
+      prizePool: formatAmount(m.prizePool),
+      totalVolume: formatAmount(m.totalVolume),
       status: m.status,
       outcome: m.outcome,
       resolvedAt: m.resolvedAtSec === null ? null : secToIso(m.resolvedAtSec),
@@ -734,30 +811,30 @@ export class MarketsService {
         reporters: m.policy?.reporters ?? [],
         quorum: m.policy?.quorum ?? 0,
         challengeSecs: m.policy?.challengeSecs ?? 0,
-        bondCC: m.policy?.bondCC ?? formatCC(0n),
+        bond: m.policy?.bond ?? formatAmount(0n),
       },
       auditObservers: m.auditObservers ?? [],
       phase,
       archived: m.archived,
       tradeCount: m.tradeCount,
       lastTradeAt: m.lastTradeAt ? m.lastTradeAt.toISOString() : null,
-      previousPrice: extras.previousPrice === null ? null : formatCC(extras.previousPrice),
+      previousPrice: extras.previousPrice === null ? null : formatAmount(extras.previousPrice),
       priceChange24h:
-        extras.previousPrice === null ? null : formatCC(m.currentPrice - extras.previousPrice),
-      volume24hCC: formatCC(extras.volume24h),
+        extras.previousPrice === null ? null : formatAmount(m.currentPrice - extras.previousPrice),
+      volume24h: formatAmount(extras.volume24h),
       openInterest: {
-        yes: formatCC(m.openInterestYes),
-        no: formatCC(m.openInterestNo),
-        total: formatCC(m.openInterestYes + m.openInterestNo),
+        yes: formatAmount(m.openInterestYes),
+        no: formatAmount(m.openInterestNo),
+        total: formatAmount(m.openInterestYes + m.openInterestNo),
       },
-      liquidityCC: formatCC(numberToDecimal(liquidityCC)),
+      liquidity: formatAmount(numberToDecimal(liquidity)),
       book: book
         ? {
-            yesBid: formatCC(numberToDecimal(book.yesBid)),
-            yesAsk: formatCC(numberToDecimal(book.yesAsk)),
-            noBid: formatCC(numberToDecimal(book.noBid)),
-            noAsk: formatCC(numberToDecimal(book.noAsk)),
-            referenceCC: formatCC(numberToDecimal(BOOK_REFERENCE_CC)),
+            yesBid: formatAmount(numberToDecimal(book.yesBid)),
+            yesAsk: formatAmount(numberToDecimal(book.yesAsk)),
+            noBid: formatAmount(numberToDecimal(book.noBid)),
+            noAsk: formatAmount(numberToDecimal(book.noAsk)),
+            reference: formatAmount(numberToDecimal(BOOK_REFERENCE_AMOUNT)),
           }
         : null,
       updatedOffset: m.updatedOffset,
@@ -776,12 +853,13 @@ export class MarketsService {
       yesSubTitle: m.yesSubTitle,
       noSubTitle: m.noSubTitle,
       contractId: m.contractId,
+      collateral: this.collateralOf(m),
       question: m.question,
       imageUrl: imageUrlOf(extras),
       category: extras.category,
       status: m.status,
       outcome: m.outcome,
-      currentPrice: formatCC(m.currentPrice),
+      currentPrice: formatAmount(m.currentPrice),
       expiresAt: secToIso(m.expiresAtSec),
       resolvedAt: m.resolvedAtSec === null ? null : secToIso(m.resolvedAtSec),
       phase: this.phaseOf(m),
@@ -789,9 +867,20 @@ export class MarketsService {
     };
   }
 
-  toApiEvent(e: MarketEventEntity, ticker = ""): ApiMarketEvent {
-    const dec = (v: bigint | null): string | null => (v === null ? null : formatCC(v));
-    const action = (TRADE_ACTIONS as readonly string[]).includes(e.kind) ? (e.kind as TradeAction) : null;
+  /**
+   * One activity row; `collateral` is the market's (batch-loaded by `toApiEvents`). A row whose
+   * market the index no longer holds falls back to an empty ref (blank admin and id at the 10-dp
+   * scale) so the shape stays total — such a row cannot exist in a consistent index.
+   */
+  toApiEvent(
+    e: MarketEventEntity,
+    ticker = "",
+    collateral: InstrumentRef | null = null,
+  ): ApiMarketEvent {
+    const dec = (v: bigint | null): string | null => (v === null ? null : formatAmount(v));
+    const action = (TRADE_ACTIONS as readonly string[]).includes(e.kind)
+      ? (e.kind as TradeAction)
+      : null;
     return {
       id: String(e.id),
       eventId: e.eventId,
@@ -799,11 +888,12 @@ export class MarketsService {
       kind: e.kind,
       actor: e.actor,
       side: e.side,
-      amountCC: dec(e.amountCC),
-      netCC: dec(e.netCC),
+      instrument: collateral ?? this.instruments.refOf({ admin: "", id: "" }),
+      amount: dec(e.amount),
+      net: dec(e.net),
       shares: dec(e.shares),
       sharesOut: dec(e.sharesOut),
-      feeCC: dec(e.feeCC),
+      fee: dec(e.fee),
       priceBefore: dec(e.priceBefore),
       priceAfter: dec(e.priceAfter),
       lpTokens: dec(e.lpTokens),
@@ -817,8 +907,8 @@ export class MarketsService {
       ticker,
       action,
       yesPrice: dec(e.priceAfter),
-      noPrice: e.priceAfter === null ? null : formatCC(ONE_DECIMAL - e.priceAfter),
-      notionalCC: dec(e.amountCC),
+      noPrice: e.priceAfter === null ? null : formatAmount(ONE_DECIMAL - e.priceAfter),
+      notional: dec(e.amount),
       takerParty: maskParty(e.actor),
       createdAt: e.effectiveAt.toISOString(),
     };
@@ -826,24 +916,24 @@ export class MarketsService {
 
   /** Mark-to-market / redeemable value of a position against the market it belongs to (fixed point). */
   positionValue(
-    p: Pick<PositionEntity, "yesShares" | "noShares" | "costBasisCC">,
+    p: Pick<PositionEntity, "yesShares" | "noShares" | "costBasis">,
     market: Pick<MarketEntity, "status" | "outcome" | "currentPrice"> | null,
-  ): { valueCC: bigint | null; redeemableCC: bigint | null } {
-    if (!market) return { valueCC: null, redeemableCC: null };
+  ): { value: bigint | null; redeemable: bigint | null } {
+    if (!market) return { value: null, redeemable: null };
     if (market.status === "Resolved") {
       const winning =
         market.outcome === "Yes" ? p.yesShares : market.outcome === "No" ? p.noShares : 0n;
-      return { valueCC: winning, redeemableCC: winning };
+      return { value: winning, redeemable: winning };
     }
     if (market.status === "Voided") {
       const held = p.yesShares > p.noShares ? p.yesShares : p.noShares;
-      const refund = p.costBasisCC < held ? p.costBasisCC : held;
-      return { valueCC: refund, redeemableCC: refund };
+      const refund = p.costBasis < held ? p.costBasis : held;
+      return { value: refund, redeemable: refund };
     }
     const value =
       mulDecimal(p.yesShares, market.currentPrice) +
       mulDecimal(p.noShares, ONE_DECIMAL - market.currentPrice);
-    return { valueCC: value, redeemableCC: null };
+    return { value: value, redeemable: null };
   }
 
   toApiPosition(
@@ -851,21 +941,22 @@ export class MarketsService {
     market: MarketEntity | null,
     summary: ApiMarketSummary | null,
   ): ApiPosition {
-    const { valueCC, redeemableCC } = this.positionValue(p, market);
+    const { value, redeemable } = this.positionValue(p, market);
     return {
       contractId: p.contractId,
       holder: p.holder,
       marketId: p.marketId,
-      yesShares: formatCC(p.yesShares),
-      noShares: formatCC(p.noShares),
-      costBasisCC: formatCC(p.costBasisCC),
+      instrument: summary?.collateral ?? (market ? this.collateralOf(market) : null),
+      yesShares: formatAmount(p.yesShares),
+      noShares: formatAmount(p.noShares),
+      costBasis: formatAmount(p.costBasis),
       active: p.active,
       createdAt: (p.createdAtLedger ?? p.createdAt).toISOString(),
       createdOffset: p.createdOffset,
       archivedAt: p.archivedAtLedger ? p.archivedAtLedger.toISOString() : null,
       market: summary,
-      valueCC: valueCC === null ? null : formatCC(valueCC),
-      redeemableCC: redeemableCC === null ? null : formatCC(redeemableCC),
+      value: value === null ? null : formatAmount(value),
+      redeemable: redeemable === null ? null : formatAmount(redeemable),
     };
   }
 
@@ -878,8 +969,9 @@ export class MarketsService {
       contractId: l.contractId,
       provider: l.provider,
       marketId: l.marketId,
-      lpTokens: formatCC(l.lpTokens),
-      depositedCC: formatCC(l.depositedCC),
+      instrument: summary?.collateral ?? (market ? this.collateralOf(market) : null),
+      lpTokens: formatAmount(l.lpTokens),
+      deposited: formatAmount(l.deposited),
       active: l.active,
       createdAt: (l.createdAtLedger ?? l.createdAt).toISOString(),
       createdOffset: l.createdOffset,
@@ -887,7 +979,7 @@ export class MarketsService {
       market: summary,
       poolShare:
         market && market.lpTokenSupply > 0n
-          ? formatCC(divDecimal(l.lpTokens, market.lpTokenSupply))
+          ? formatAmount(divDecimal(l.lpTokens, market.lpTokenSupply))
           : null,
     };
   }

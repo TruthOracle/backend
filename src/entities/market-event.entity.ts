@@ -7,8 +7,9 @@ import { bigintNumberTransformer, decimalTransformer } from "../util/ledger-valu
  * Market activity derived from every `PredictionMarket` / `MarketCounter` choice
  * (docs/INDEXER.md §5 `to_market_events`): trades (buy, sell, swap, split, merge), liquidity,
  * resolution steps, redemptions and forecasts, each with the numbers the ledger actually
- * produced (share deltas from the Position versions, CC from the UserWallet Debit / Credit,
- * fees from the market's fee-pot deltas) — never a re-computation.
+ * produced (share deltas from the Position versions, collateral from the UserWallet Debit /
+ * Credit, fees from the market's fee-pot deltas) — never a re-computation. Amounts are in the
+ * market's collateral (`to_markets.collateral_*`).
  */
 @Entity({ name: "to_market_events" })
 @Index("ix_to_market_events_market_offset", ["marketId", "offset"])
@@ -36,24 +37,22 @@ export class MarketEventEntity {
   side!: TradeSide | null;
 
   @Column({
-    name: "amount_cc",
     type: "numeric",
     precision: 38,
     scale: 10,
     nullable: true,
     transformer: decimalTransformer,
   })
-  amountCC!: bigint | null;
+  amount!: bigint | null;
 
   @Column({
-    name: "net_cc",
     type: "numeric",
     precision: 38,
     scale: 10,
     nullable: true,
     transformer: decimalTransformer,
   })
-  netCC!: bigint | null;
+  net!: bigint | null;
 
   @Column({
     type: "numeric",
@@ -75,14 +74,13 @@ export class MarketEventEntity {
   sharesOut!: bigint | null;
 
   @Column({
-    name: "fee_cc",
     type: "numeric",
     precision: 38,
     scale: 10,
     nullable: true,
     transformer: decimalTransformer,
   })
-  feeCC!: bigint | null;
+  fee!: bigint | null;
 
   @Column({
     name: "price_before",

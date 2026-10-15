@@ -4,7 +4,7 @@ import { type EntityManager, Repository } from "typeorm";
 
 import { AuditEventEntity } from "../entities/audit-event.entity";
 import type { ActorType, ApiAuditEvent, AuditAction } from "../types";
-import { formatCC } from "../util/money";
+import { formatAmount } from "../util/money";
 
 export interface AuditInput {
   actorType: ActorType;
@@ -69,9 +69,11 @@ export class AuditService {
     limit: number;
   }): Promise<{ items: AuditEventEntity[]; total: number }> {
     const qb = this.repo.createQueryBuilder("a").orderBy("a.id", "DESC");
-    if (filter.subjectType) qb.andWhere("a.subject_type = :subjectType", { subjectType: filter.subjectType });
+    if (filter.subjectType)
+      qb.andWhere("a.subject_type = :subjectType", { subjectType: filter.subjectType });
     if (filter.subjectId) qb.andWhere("a.subject_id = :subjectId", { subjectId: filter.subjectId });
-    if (filter.actorUserId) qb.andWhere("a.actor_user_id = :actorUserId", { actorUserId: filter.actorUserId });
+    if (filter.actorUserId)
+      qb.andWhere("a.actor_user_id = :actorUserId", { actorUserId: filter.actorUserId });
     const page = Math.max(1, filter.page);
     const limit = Math.min(100, Math.max(1, filter.limit));
     const [items, total] = await qb
@@ -82,14 +84,21 @@ export class AuditService {
   }
 
   /** The user's own trail: events they performed OR that concern them. */
-  async listForUser(userId: string, page: number, limit: number): Promise<{ items: AuditEventEntity[]; total: number }> {
+  async listForUser(
+    userId: string,
+    page: number,
+    limit: number,
+  ): Promise<{ items: AuditEventEntity[]; total: number }> {
     const p = Math.max(1, page);
     const l = Math.min(100, Math.max(1, limit));
     const [items, total] = await this.repo
       .createQueryBuilder("a")
       // Two parameters on purpose: one placeholder compared with a uuid AND a text column makes
       // Postgres refuse the statement ("inconsistent types deduced for parameter").
-      .where("a.actor_user_id = :actorUserId OR (a.subject_type = 'user' AND a.subject_id = :subjectId)", { actorUserId: userId, subjectId: userId })
+      .where(
+        "a.actor_user_id = :actorUserId OR (a.subject_type = 'user' AND a.subject_id = :subjectId)",
+        { actorUserId: userId, subjectId: userId },
+      )
       .orderBy("a.id", "DESC")
       .skip((p - 1) * l)
       .take(l)
@@ -112,7 +121,7 @@ export class AuditService {
 }
 
 /**
- * Drop forbidden keys and `undefined`; a `bigint` is always a CC amount in 1e-10 units
+ * Drop forbidden keys and `undefined`; a `bigint` is always a token amount in 1e-10 units
  * (util/money), so it is rendered as the 10-decimal wire string — never as raw units, which
  * would put two money encodings into one audit trail (API.md: "Money is a string with exactly
  * 10 decimals").
@@ -122,7 +131,7 @@ export function sanitizeMetadata(metadata: Record<string, unknown>): Record<stri
   for (const [k, v] of Object.entries(metadata)) {
     if (FORBIDDEN_METADATA_KEYS.has(k)) continue;
     if (v === undefined) continue;
-    out[k] = typeof v === "bigint" ? formatCC(v) : v;
+    out[k] = typeof v === "bigint" ? formatAmount(v) : v;
   }
   return out;
 }

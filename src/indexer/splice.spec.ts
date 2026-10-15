@@ -1,5 +1,5 @@
 import { LedgerFixture, parties, SPLICE_PACKAGE_NAME } from "../../test/helpers/ledger-fixtures";
-import { formatCC, parseCC } from "../util/money";
+import { formatAmount, parseAmount } from "../util/money";
 import { extractTreasuryTransfers } from "./splice";
 
 const [treasury, alice, bob] = parties(3);
@@ -17,7 +17,7 @@ describe("extractTreasuryTransfers", () => {
       updateId: tx.updateId,
       offset: tx.offset,
     });
-    expect(formatCC(out[0].amountCC)).toBe(formatCC(parseCC("25.5")));
+    expect(formatAmount(out[0].amount)).toBe(formatAmount(parseAmount("25.5")));
   });
 
   it("attributes an outbound transfer to the receiver and ignores the treasury's change", () => {
@@ -30,7 +30,7 @@ describe("extractTreasuryTransfers", () => {
       counterparty: bob,
       choice: "AmuletRules_Transfer",
     });
-    expect(formatCC(out[0].amountCC)).toBe(formatCC(parseCC("7")));
+    expect(formatAmount(out[0].amount)).toBe(formatAmount(parseAmount("7")));
   });
 
   it("skips transfers of another package and transactions without a transfer exercise", () => {

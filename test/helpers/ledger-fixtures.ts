@@ -11,14 +11,116 @@ import type {
   ActiveContractEntry,
   CreatedLedgerEvent,
   ExercisedLedgerEvent,
+  InterfaceView,
   LedgerTransaction,
 } from "../../src/indexer/events";
-import { formatCC, parseCC } from "../../src/util/money";
+import {
+  HOLDING_INTERFACE,
+  TRANSFER_FACTORY_INTERFACE,
+  TRANSFER_INSTRUCTION_INTERFACE,
+  type TokenStandardInterface,
+} from "../../src/indexer/token-standard";
+import type { InstrumentId } from "../../src/types";
+import { formatAmount, parseAmount } from "../../src/util/money";
 
 export const FIXTURE_PACKAGE_ID = "fakepkg";
 /** Must equal TRUTHORACLE_PACKAGE_NAME in `testEnv()` (test/helpers/app.ts). */
 export const FIXTURE_PACKAGE_NAME = "truthoracle-test";
 export const SPLICE_PACKAGE_NAME = "splice-amulet";
+/** The fixture ledger's DSO party; Canton Coin's instrument admin (must equal TEST_DSO in test/helpers/app.ts). */
+export const FIXTURE_DSO = "DSO::1220" + "d".repeat(64);
+/** The collateral every fixture market and wallet is in unless a scenario names another. */
+export const FIXTURE_COLLATERAL: InstrumentId = { admin: FIXTURE_DSO, id: "Amulet" };
+/** A CIP-56 token of another package (cBYN-like): what the token-standard scenarios move unless told otherwise. */
+export const FIXTURE_TOKEN_PACKAGE = "cbyn-holding-stable";
+export const FIXTURE_TOKEN_ADMIN = "agent::1220" + "c".repeat(64);
+export const FIXTURE_TOKEN: InstrumentId = { admin: FIXTURE_TOKEN_ADMIN, id: "cBYN" };
+
+/** `pkgId:Module:Entity` of a token-standard interface as the participant reports it (the fixture pins one package id per API). */
+export function interfaceIdOf(iface: TokenStandardInterface): string {
+  return `${iface.packageName.replace(/-/g, "")}pkg:${iface.module}:${iface.entity}`;
+}
+
+/** The `HoldingV1.HoldingView` of a created holding, as `interfaceViews[]` carries it. */
+export function holdingView(input: {
+  owner: string;
+  instrument: InstrumentId;
+  amount: string;
+  lock?: { expiresAt?: Date | null } | null;
+}): InterfaceView {
+  const lock =
+    input.lock === undefined || input.lock === null
+      ? null
+      : {
+          holders: [input.instrument.admin],
+          expiresAt: input.lock.expiresAt ? input.lock.expiresAt.toISOString() : null,
+          expiresAfter: null,
+          context: "transfer",
+        };
+  return {
+    interfaceId: interfaceIdOf(HOLDING_INTERFACE),
+    templateId: interfaceIdOf(HOLDING_INTERFACE),
+    packageName: "",
+    module: HOLDING_INTERFACE.module,
+    entity: HOLDING_INTERFACE.entity,
+    view: {
+      owner: input.owner,
+      instrumentId: { admin: input.instrument.admin, id: input.instrument.id },
+      amount: formatAmount(parseAmount(input.amount)),
+      lock,
+      meta: { values: {} },
+    },
+  };
+}
+
+/** The `Transfer` record of `TransferFactory_Transfer` / a `TransferInstructionView`, JSON-encoded. */
+export function transferRecord(input: {
+  sender: string;
+  receiver: string;
+  instrument: InstrumentId;
+  amount: string;
+  inputHoldingCids?: string[];
+  requestedAt?: Date;
+  executeBefore?: Date;
+  meta?: Record<string, string>;
+}): Record<string, unknown> {
+  // Requested now, valid ten minutes — an offer the acceptor still finds live (an expired one is skipped).
+  const requestedAt = input.requestedAt ?? new Date();
+  return {
+    sender: input.sender,
+    receiver: input.receiver,
+    amount: formatAmount(parseAmount(input.amount)),
+    instrumentId: { admin: input.instrument.admin, id: input.instrument.id },
+    requestedAt: requestedAt.toISOString(),
+    executeBefore: (input.executeBefore ?? new Date(requestedAt.getTime() + 600_000)).toISOString(),
+    inputHoldingCids: input.inputHoldingCids ?? [],
+    meta: { values: input.meta ?? {} },
+  };
+}
+
+/** The `TransferInstructionV1.TransferInstructionView` of a pending two-step offer. */
+export function transferInstructionView(input: {
+  sender: string;
+  receiver: string;
+  instrument: InstrumentId;
+  amount: string;
+  executeBefore?: Date;
+  originalInstructionCid?: string | null;
+}): InterfaceView {
+  return {
+    interfaceId: interfaceIdOf(TRANSFER_INSTRUCTION_INTERFACE),
+    templateId: interfaceIdOf(TRANSFER_INSTRUCTION_INTERFACE),
+    packageName: "",
+    module: TRANSFER_INSTRUCTION_INTERFACE.module,
+    entity: TRANSFER_INSTRUCTION_INTERFACE.entity,
+    view: {
+      originalInstructionCid: input.originalInstructionCid ?? null,
+      transfer: transferRecord(input),
+      status: { tag: "TransferPendingReceiverAcceptance", value: {} },
+      meta: { values: {} },
+    },
+  };
+}
 
 export type Payload = Record<string, unknown>;
 
@@ -37,8 +139,8 @@ export interface PositionFixtureState {
   payload: Payload;
 }
 
-const dec = (v: bigint | string | number): string => formatCC(parseCC(v));
-const big = (v: unknown): bigint => parseCC(String(v));
+const dec = (v: bigint | string | number): string => formatAmount(parseAmount(v));
+const big = (v: unknown): bigint => parseAmount(String(v));
 
 /**
  * A growing ledger: `offset` advances per transaction, contract ids and update ids are unique,
@@ -53,7 +155,14 @@ export class LedgerFixture {
   constructor(
     readonly admin: string,
     readonly packageName = FIXTURE_PACKAGE_NAME,
+    /** The instrument markets and wallets are created in unless a builder is told otherwise. */
+    readonly collateral: InstrumentId = FIXTURE_COLLATERAL,
   ) {}
+
+  /** The JSON shape of a Daml `InstrumentId`. */
+  instrument(i: InstrumentId = this.collateral): { admin: string; id: string } {
+    return { admin: i.admin, id: i.id };
+  }
 
   cid(prefix: string): string {
     this.seq += 1;
@@ -73,6 +182,8 @@ export class LedgerFixture {
       signatories?: string[];
       observers?: string[];
       blob?: string | null;
+      /** Interface views the stream's InterfaceFilters would attach (docs/TOKENS.md §4.2). */
+      interfaceViews?: InterfaceView[];
     } = {},
   ): CreatedLedgerEvent {
     const module = opts.module ?? "Truthoracle";
@@ -87,6 +198,7 @@ export class LedgerFixture {
       contractId,
       createArgument: payload,
       createdEventBlob: opts.blob === undefined ? `blob-${contractId}` : opts.blob,
+      interfaceViews: opts.interfaceViews ?? [],
       signatories: opts.signatories ?? [this.admin],
       observers: opts.observers ?? [],
       witnessParties: [this.admin],
@@ -106,6 +218,8 @@ export class LedgerFixture {
       consuming?: boolean;
       children?: number;
       result?: unknown;
+      /** Set when the choice was exercised through an interface (token-standard transfers). */
+      interfaceId?: string | null;
     } = {},
   ): ExercisedLedgerEvent {
     const module = opts.module ?? "Truthoracle";
@@ -126,7 +240,7 @@ export class LedgerFixture {
       actingParties: opts.actingParties ?? [this.admin],
       witnessParties: [this.admin],
       lastDescendantNodeId: nodeId + (opts.children ?? 0),
-      interfaceId: null,
+      interfaceId: opts.interfaceId ?? null,
     };
   }
 
@@ -166,20 +280,23 @@ export class LedgerFixture {
     feeBps?: number;
     prizeFeeShareBps?: number;
     policy?: Partial<Payload>;
-    /** The market's identity (mandatory Text on truthoracle-v16); defaults are `TEST-<marketId>` in event `TEST`, `Yes` / `No`. */
+    /** The market's identity (mandatory Text on truthoracle-v17); defaults are `TEST-<marketId>` in event `TEST`, `Yes` / `No`. */
     ticker?: string;
     eventTicker?: string;
     yesSubTitle?: string;
     noSubTitle?: string;
     isDynamic?: boolean;
     liquidityL?: string;
+    /** The market's collateral (truthoracle-v17); defaults to the fixture's. */
+    collateral?: InstrumentId;
   }): Payload {
     const createdAt = input.createdAt ?? 1_760_000_000;
     return {
       admin: this.admin,
       marketId: String(input.marketId),
+      collateral: this.instrument(input.collateral),
       question: input.question ?? `Market ${input.marketId}?`,
-      // no imageUrl / description / category: v16 contracts carry no presentation (docs/MARKETS.md §1)
+      // no imageUrl / description / category: v17 contracts carry no presentation (docs/MARKETS.md §1)
       resolutionDescription: "resolves per source",
       createdAt: String(createdAt),
       expiresAt: String(input.expiresAt ?? createdAt + 7 * 86_400),
@@ -193,9 +310,9 @@ export class LedgerFixture {
       currentPrice: dec(input.price ?? "0.5"),
       feeBps: String(input.feeBps ?? 100),
       prizeFeeShareBps: String(input.prizeFeeShareBps ?? 1000),
-      accumulatedFeesCC: dec(0n),
-      prizePoolCC: dec(0n),
-      totalVolumeCC: dec(0n),
+      accumulatedFees: dec(0n),
+      prizePool: dec(0n),
+      totalVolume: dec(0n),
       status: "Trading",
       outcome: null,
       resolvedAt: null,
@@ -207,7 +324,7 @@ export class LedgerFixture {
         reporters: [],
         quorum: "0",
         challengeSecs: "0",
-        bondCC: dec(0n),
+        bond: dec(0n),
         ...(input.policy ?? {}),
       },
       auditObservers: [],
@@ -235,6 +352,7 @@ export class LedgerFixture {
     noSubTitle?: string;
     isDynamic?: boolean;
     liquidityL?: string;
+    collateral?: InstrumentId;
     /** Ledger time of the creating transaction. */
     at?: Date;
   }): { tx: LedgerTransaction; market: MarketFixtureState; counterCid: string; lpCid: string } {
@@ -247,6 +365,7 @@ export class LedgerFixture {
       input.counterCid ?? this.cid("mc"),
       "CreateMarket",
       {
+        collateral: payload.collateral,
         question: payload.question,
         resolutionDescription: payload.resolutionDescription,
         createdAt: payload.createdAt,
@@ -255,7 +374,7 @@ export class LedgerFixture {
         isDynamic: payload.isDynamic,
         liquidityPeriodSecs: payload.liquidityPeriodSecs,
         initialProbability: payload.currentPrice,
-        initialValueCC: dec("200"),
+        initialValue: dec("200"),
         feeBps: payload.feeBps,
         prizeFeeShareBps: payload.prizeFeeShareBps,
         policy: payload.policy,
@@ -280,7 +399,7 @@ export class LedgerFixture {
         admin: this.admin,
         marketId: String(input.marketId),
         lpTokens: payload.lpTokenSupply,
-        depositedCC: dec("100"),
+        deposited: dec("100"),
         auditObservers: [],
       },
       { signatories: [this.admin], observers: [] },
@@ -292,15 +411,20 @@ export class LedgerFixture {
     return { tx, market: { cid: marketCid, payload }, counterCid, lpCid };
   }
 
-  /** A treasury-created empty `UserWallet` (top-level create, as `external/submit` does it). */
-  createWallet(owner: string): { tx: LedgerTransaction; wallet: WalletFixtureState } {
+  /** A treasury-created empty `UserWallet` in `instrument` (top-level create, as `external/submit` does it). */
+  createWallet(
+    owner: string,
+    instrument: InstrumentId = this.collateral,
+  ): { tx: LedgerTransaction; wallet: WalletFixtureState } {
     const payload: Payload = {
       admin: this.admin,
       owner,
-      balanceCC: dec(0n),
-      depositedCC: dec(0n),
-      withdrawnCC: dec(0n),
-      depositRefs: [],
+      instrument: this.instrument(instrument),
+      balance: dec(0n),
+      deposited: dec(0n),
+      withdrawn: dec(0n),
+      creditRefs: [],
+      auditObservers: [],
     };
     const cid = this.cid("uw");
     const tx = this.tx([this.created("UserWallet", cid, payload, { observers: [owner] })], {
@@ -312,19 +436,19 @@ export class LedgerFixture {
   /** `UserWallet.Deposit` by the admin. */
   deposit(
     wallet: WalletFixtureState,
-    amountCC: string,
+    amount: string,
     txRef: string,
   ): { tx: LedgerTransaction; wallet: WalletFixtureState } {
     const next = this.successorWallet(wallet, {
-      balance: big(wallet.payload.balanceCC) + parseCC(amountCC),
-      deposited: big(wallet.payload.depositedCC) + parseCC(amountCC),
+      balance: big(wallet.payload.balance) + parseAmount(amount),
+      deposited: big(wallet.payload.deposited) + parseAmount(amount),
       ref: txRef,
     });
     const root = this.exercised(
       "UserWallet",
       wallet.cid,
       "Deposit",
-      { amountCC: dec(amountCC), txRef },
+      { amount: dec(amount), txRef },
       { children: 1, result: next.cid },
     );
     const created = this.created("UserWallet", next.cid, next.payload, {
@@ -334,23 +458,48 @@ export class LedgerFixture {
     return { tx, wallet: next };
   }
 
-  /** `UserWallet.Withdraw` by the owner → successor wallet + a PendingPayout. */
+  /** `UserWallet.Grant` by the admin (a reward / bonus): bumps the balance only and appends `ref` to creditRefs. */
+  grant(
+    wallet: WalletFixtureState,
+    amount: string,
+    ref: string,
+    reason: string,
+  ): { tx: LedgerTransaction; wallet: WalletFixtureState } {
+    const next = this.successorWallet(wallet, {
+      balance: big(wallet.payload.balance) + parseAmount(amount),
+      ref,
+    });
+    const root = this.exercised(
+      "UserWallet",
+      wallet.cid,
+      "Grant",
+      { amount: dec(amount), ref, reason },
+      { children: 1, result: next.cid },
+    );
+    const created = this.created("UserWallet", next.cid, next.payload, {
+      observers: [String(wallet.payload.owner)],
+    });
+    const tx = this.tx([root, created], { commandId: `grant-${ref}` });
+    return { tx, wallet: next };
+  }
+
+  /** `UserWallet.Withdraw` by the owner → successor wallet + a PendingPayout in the wallet's instrument. */
   withdraw(
     wallet: WalletFixtureState,
-    amountCC: string,
+    amount: string,
     nowSeconds = 1_760_000_500,
   ): { tx: LedgerTransaction; wallet: WalletFixtureState; payoutCid: string } {
     const owner = String(wallet.payload.owner);
     const next = this.successorWallet(wallet, {
-      balance: big(wallet.payload.balanceCC) - parseCC(amountCC),
-      withdrawn: big(wallet.payload.withdrawnCC) + parseCC(amountCC),
+      balance: big(wallet.payload.balance) - parseAmount(amount),
+      withdrawn: big(wallet.payload.withdrawn) + parseAmount(amount),
     });
     const payoutCid = this.cid("pp");
     const root = this.exercised(
       "UserWallet",
       wallet.cid,
       "Withdraw",
-      { amountCC: dec(amountCC), nowSeconds: String(nowSeconds) },
+      { amount: dec(amount), nowSeconds: String(nowSeconds) },
       { actingParties: [owner], children: 2, result: { _1: next.cid, _2: payoutCid } },
     );
     const created = this.created("UserWallet", next.cid, next.payload, { observers: [owner] });
@@ -361,9 +510,11 @@ export class LedgerFixture {
         admin: this.admin,
         user: owner,
         marketId: "0",
-        amountCC: dec(amountCC),
+        instrument: wallet.payload.instrument,
+        amount: dec(amount),
         reason: "withdraw",
         createdAt: String(nowSeconds),
+        auditObservers: [],
       },
       { observers: [owner] },
     );
@@ -388,7 +539,7 @@ export class LedgerFixture {
     position?: PositionFixtureState;
     buyer: string;
     side: "Yes" | "No";
-    collateralCC: string;
+    amount: string;
     sharesOut?: string;
     newPrice?: string;
     nowSeconds?: number;
@@ -400,22 +551,22 @@ export class LedgerFixture {
     wallet: WalletFixtureState;
     position: PositionFixtureState;
   } {
-    const collateral = parseCC(input.collateralCC);
+    const collateral = parseAmount(input.amount);
     const feeBps = BigInt(String(input.market.payload.feeBps));
     const prizeBps = BigInt(String(input.market.payload.prizeFeeShareBps));
     const fee = (collateral * feeBps) / 10_000n;
     const prizeCut = (fee * prizeBps) / 10_000n;
-    const sharesOut = parseCC(input.sharesOut ?? formatCC((collateral * 18n) / 10n));
-    const newPrice = parseCC(
+    const sharesOut = parseAmount(input.sharesOut ?? formatAmount((collateral * 18n) / 10n));
+    const newPrice = parseAmount(
       input.newPrice ??
-        formatCC(
+        formatAmount(
           big(input.market.payload.currentPrice) +
             (input.side === "Yes" ? 500_000_000n : -500_000_000n),
         ),
     );
 
     const nextWallet = this.successorWallet(input.wallet, {
-      balance: big(input.wallet.payload.balanceCC) - collateral,
+      balance: big(input.wallet.payload.balance) - collateral,
     });
     const before = input.position?.payload;
     const nextPosition: PositionFixtureState = {
@@ -430,15 +581,15 @@ export class LedgerFixture {
         noShares: dec(
           (before ? big(before.noShares) : 0n) + (input.side === "No" ? sharesOut : 0n),
         ),
-        costBasisCC: dec((before ? big(before.costBasisCC) : 0n) + collateral),
+        costBasis: dec((before ? big(before.costBasis) : 0n) + collateral),
         auditObservers: [],
       },
     };
     const nextMarket = this.successorMarket(input.market, {
       currentPrice: dec(newPrice),
-      accumulatedFeesCC: dec(big(input.market.payload.accumulatedFeesCC) + fee - prizeCut),
-      prizePoolCC: dec(big(input.market.payload.prizePoolCC) + prizeCut),
-      totalVolumeCC: dec(big(input.market.payload.totalVolumeCC) + collateral),
+      accumulatedFees: dec(big(input.market.payload.accumulatedFees) + fee - prizeCut),
+      prizePool: dec(big(input.market.payload.prizePool) + prizeCut),
+      totalVolume: dec(big(input.market.payload.totalVolume) + collateral),
       reserveYes: dec(
         big(input.market.payload.reserveYes) +
           collateral -
@@ -461,7 +612,7 @@ export class LedgerFixture {
       {
         buyer: input.buyer,
         side: input.side,
-        collateralCC: dec(collateral),
+        amount: dec(collateral),
         minSharesOut: dec(0n),
         nowSeconds: String(input.nowSeconds ?? 1_760_000_600),
         existingPosition: input.position ? input.position.cid : null,
@@ -479,7 +630,7 @@ export class LedgerFixture {
         "UserWallet",
         input.wallet.cid,
         "Debit",
-        { amountCC: dec(collateral), reason: "buy" },
+        { amount: dec(collateral), reason: "buy" },
         { actingParties: [input.buyer, this.admin], children: 1, result: nextWallet.cid },
       ),
     );
@@ -518,7 +669,7 @@ export class LedgerFixture {
     seller: string;
     side: "Yes" | "No";
     sharesIn: string;
-    grossCC: string;
+    gross: string;
     newPrice?: string;
     at?: Date;
   }): {
@@ -527,15 +678,15 @@ export class LedgerFixture {
     wallet: WalletFixtureState;
     position: PositionFixtureState;
   } {
-    const shares = parseCC(input.sharesIn);
-    const gross = parseCC(input.grossCC);
+    const shares = parseAmount(input.sharesIn);
+    const gross = parseAmount(input.gross);
     const feeBps = BigInt(String(input.market.payload.feeBps));
     const prizeBps = BigInt(String(input.market.payload.prizeFeeShareBps));
     const fee = (gross * feeBps) / 10_000n;
     const prizeCut = (fee * prizeBps) / 10_000n;
     const net = gross - fee;
     const nextWallet = this.successorWallet(input.wallet, {
-      balance: big(input.wallet.payload.balanceCC) + net,
+      balance: big(input.wallet.payload.balance) + net,
     });
     const p = input.position.payload;
     const nextPosition: PositionFixtureState = {
@@ -549,14 +700,14 @@ export class LedgerFixture {
     const nextMarket = this.successorMarket(input.market, {
       currentPrice: dec(
         input.newPrice ??
-          formatCC(
+          formatAmount(
             big(input.market.payload.currentPrice) -
               (input.side === "Yes" ? 300_000_000n : -300_000_000n),
           ),
       ),
-      accumulatedFeesCC: dec(big(input.market.payload.accumulatedFeesCC) + fee - prizeCut),
-      prizePoolCC: dec(big(input.market.payload.prizePoolCC) + prizeCut),
-      totalVolumeCC: dec(big(input.market.payload.totalVolumeCC) + gross),
+      accumulatedFees: dec(big(input.market.payload.accumulatedFees) + fee - prizeCut),
+      prizePool: dec(big(input.market.payload.prizePool) + prizeCut),
+      totalVolume: dec(big(input.market.payload.totalVolume) + gross),
     });
     const root = this.exercised(
       "PredictionMarket",
@@ -566,7 +717,7 @@ export class LedgerFixture {
         seller: input.seller,
         side: input.side,
         sharesIn: dec(shares),
-        minProceedsCC: dec(0n),
+        minProceeds: dec(0n),
         nowSeconds: "1760000700",
         positionCid: input.position.cid,
         walletCid: input.wallet.cid,
@@ -594,7 +745,7 @@ export class LedgerFixture {
         "UserWallet",
         input.wallet.cid,
         "Credit",
-        { amountCC: dec(net), reason: "sell" },
+        { amount: dec(net), reason: "sell" },
         { actingParties: [this.admin], children: 1, result: nextWallet.cid },
       ),
       this.created("UserWallet", nextWallet.cid, nextWallet.payload, { observers: [input.seller] }),
@@ -646,10 +797,10 @@ export class LedgerFixture {
         ? m.outcome === "Yes"
           ? big(p.yesShares)
           : big(p.noShares)
-        : big(p.costBasisCC);
+        : big(p.costBasis);
     const reason = m.status === "Voided" ? "void-refund" : "resolve";
     const nextWallet = this.successorWallet(input.wallet, {
-      balance: big(input.wallet.payload.balanceCC) + payout,
+      balance: big(input.wallet.payload.balance) + payout,
     });
     const root = this.exercised(
       "PredictionMarket",
@@ -676,7 +827,7 @@ export class LedgerFixture {
         "UserWallet",
         input.wallet.cid,
         "Credit",
-        { amountCC: dec(payout), reason },
+        { amount: dec(payout), reason },
         { actingParties: [this.admin], children: 1, result: nextWallet.cid },
       ),
       this.created("UserWallet", nextWallet.cid, nextWallet.payload, { observers: [input.holder] }),
@@ -684,35 +835,25 @@ export class LedgerFixture {
     return { tx: this.tx(events), wallet: nextWallet };
   }
 
-  /** A Splice transfer of `amountCC` from `sender` to the treasury (the shape the prod deposit reader relies on). */
-  spliceTransferIn(sender: string, amountCC: string): LedgerTransaction {
+  /** A Splice transfer of `amount` from `sender` to the treasury (the shape the prod deposit reader relies on). */
+  spliceTransferIn(sender: string, amount: string): LedgerTransaction {
     const events = [
       this.spliceExercised(
         "TransferPreapproval",
         this.cid("tp"),
         "TransferPreapproval_SendV2",
-        { sender, amount: dec(amountCC), description: "deposit" },
+        { sender, amount: dec(amount), description: "deposit" },
         2,
         sender,
       ),
-      this.spliceCreated(
-        "Amulet",
-        this.cid("am"),
-        { owner: this.admin, amount: { initialAmount: dec(amountCC) } },
-        "Splice.Amulet",
-      ),
-      this.spliceCreated(
-        "Amulet",
-        this.cid("am"),
-        { owner: sender, amount: { initialAmount: dec("3") } },
-        "Splice.Amulet",
-      ),
+      this.amulet(this.admin, amount),
+      this.amulet(sender, "3"),
     ];
     return this.tx(events);
   }
 
   /** A Splice transfer from the treasury to `receiver` (a payout), with change back to the treasury. */
-  spliceTransferOut(receiver: string, amountCC: string): LedgerTransaction {
+  spliceTransferOut(receiver: string, amount: string): LedgerTransaction {
     const events = [
       this.spliceExercised(
         "AmuletRules",
@@ -722,20 +863,402 @@ export class LedgerFixture {
         2,
         this.admin,
       ),
-      this.spliceCreated(
-        "Amulet",
-        this.cid("am"),
-        { owner: receiver, amount: { initialAmount: dec(amountCC) } },
-        "Splice.Amulet",
-      ),
-      this.spliceCreated(
-        "Amulet",
-        this.cid("am"),
-        { owner: this.admin, amount: { initialAmount: dec("41") } },
-        "Splice.Amulet",
-      ),
+      this.amulet(receiver, amount),
+      this.amulet(this.admin, "41"),
     ];
     return this.tx(events);
+  }
+
+  /** A `Splice.Amulet:Amulet` create — Canton Coin implements the token standard, so it carries a Holding view. */
+  amulet(owner: string, amount: string, contractId = this.cid("am")): CreatedLedgerEvent {
+    return this.spliceCreated(
+      "Amulet",
+      contractId,
+      { dso: FIXTURE_DSO, owner, amount: { initialAmount: dec(amount) } },
+      "Splice.Amulet",
+      [holdingView({ owner, instrument: FIXTURE_COLLATERAL, amount })],
+    );
+  }
+
+  // ───────────────────────────────────────── token standard (docs/TOKENS.md §4.2) ─────────────────────────────────────
+
+  /** A token-standard `Holding` create of another package (cBYN-like), with its interface view. */
+  holding(
+    owner: string,
+    amount: string,
+    opts: {
+      instrument?: InstrumentId;
+      lock?: { expiresAt?: Date | null } | null;
+      contractId?: string;
+    } = {},
+  ): CreatedLedgerEvent {
+    const instrument = opts.instrument ?? FIXTURE_TOKEN;
+    const e = this.created(
+      "Holding",
+      opts.contractId ?? this.cid("hd"),
+      {
+        owner,
+        instrument: this.instrument(instrument),
+        amount: dec(amount),
+        lock: opts.lock ? {} : null,
+        meta: { values: {} },
+      },
+      {
+        module: "TruthOracle.CBYN.Holding",
+        signatories: [instrument.admin, owner],
+        blob: null,
+        interfaceViews: [holdingView({ owner, instrument, amount, lock: opts.lock ?? null })],
+      },
+    );
+    return {
+      ...e,
+      packageName: FIXTURE_TOKEN_PACKAGE,
+      templateId: `tokenpkg:TruthOracle.CBYN.Holding:Holding`,
+    };
+  }
+
+  /** A `TransferFactory_Transfer` exercise through the TransferFactory interface on the token's factory. */
+  private transferFactoryExercise(
+    transfer: Record<string, unknown>,
+    children: number,
+    actor: string,
+    result: unknown,
+    factoryCid = this.cid("fy"),
+  ): ExercisedLedgerEvent {
+    const e = this.exercised(
+      "CbynFactory",
+      factoryCid,
+      "TransferFactory_Transfer",
+      {
+        expectedAdmin: FIXTURE_TOKEN_ADMIN,
+        transfer,
+        extraArgs: { context: { values: {} }, meta: { values: {} } },
+      },
+      {
+        module: "TruthOracle.CBYN.Factory",
+        actingParties: [actor],
+        consuming: false,
+        children,
+        result,
+        interfaceId: interfaceIdOf(TRANSFER_FACTORY_INTERFACE),
+      },
+    );
+    return {
+      ...e,
+      packageName: FIXTURE_TOKEN_PACKAGE,
+      templateId: "tokenpkg:TruthOracle.CBYN.Factory:CbynFactory",
+    };
+  }
+
+  /** A consuming `Archive` of a holding (an input spent by a transfer). */
+  private archiveHolding(contractId: string, actor: string): ExercisedLedgerEvent {
+    const e = this.exercised(
+      "Holding",
+      contractId,
+      "Archive",
+      {},
+      { module: "TruthOracle.CBYN.Holding", actingParties: [actor], consuming: true },
+    );
+    return {
+      ...e,
+      packageName: FIXTURE_TOKEN_PACKAGE,
+      templateId: "tokenpkg:TruthOracle.CBYN.Holding:Holding",
+    };
+  }
+
+  /**
+   * A direct (one-step) token-standard transfer of `amount` from `sender` to the treasury: the
+   * sender's input holding is consumed, the treasury receives a holding, the sender its change.
+   */
+  tokenTransferIn(
+    sender: string,
+    amount: string,
+    opts: { instrument?: InstrumentId; change?: string } = {},
+  ): { tx: LedgerTransaction; treasuryHoldingCid: string } {
+    const instrument = opts.instrument ?? FIXTURE_TOKEN;
+    const inputCid = this.cid("hd");
+    const treasuryHoldingCid = this.cid("hd");
+    const changeCid = this.cid("hd");
+    const root = this.transferFactoryExercise(
+      transferRecord({
+        sender,
+        receiver: this.admin,
+        instrument,
+        amount,
+        inputHoldingCids: [inputCid],
+      }),
+      3,
+      sender,
+      {
+        output: {
+          tag: "TransferInstructionResult_Completed",
+          value: { receiverHoldingCids: [treasuryHoldingCid] },
+        },
+        senderChangeCids: [changeCid],
+        meta: { values: {} },
+      },
+    );
+    const tx = this.tx([
+      root,
+      this.archiveHolding(inputCid, sender),
+      this.holding(this.admin, amount, { instrument, contractId: treasuryHoldingCid }),
+      this.holding(sender, opts.change ?? "1", { instrument, contractId: changeCid }),
+    ]);
+    return { tx, treasuryHoldingCid };
+  }
+
+  /**
+   * A direct token-standard transfer from the treasury to `receiver` (a payout): the treasury's
+   * `inputs` holdings are consumed, the receiver gets a holding, the treasury its change.
+   */
+  tokenTransferOut(
+    receiver: string,
+    amount: string,
+    inputs: string[],
+    opts: { instrument?: InstrumentId; change?: string } = {},
+  ): { tx: LedgerTransaction; changeCid: string | null } {
+    const instrument = opts.instrument ?? FIXTURE_TOKEN;
+    const receiverCid = this.cid("hd");
+    const changeCid = opts.change ? this.cid("hd") : null;
+    const children = inputs.length + 1 + (changeCid ? 1 : 0);
+    const root = this.transferFactoryExercise(
+      transferRecord({
+        sender: this.admin,
+        receiver,
+        instrument,
+        amount,
+        inputHoldingCids: inputs,
+      }),
+      children,
+      this.admin,
+      {
+        output: {
+          tag: "TransferInstructionResult_Completed",
+          value: { receiverHoldingCids: [receiverCid] },
+        },
+        senderChangeCids: changeCid ? [changeCid] : [],
+        meta: { values: {} },
+      },
+    );
+    const events: (CreatedLedgerEvent | ExercisedLedgerEvent)[] = [root];
+    for (const cid of inputs) events.push(this.archiveHolding(cid, this.admin));
+    events.push(this.holding(receiver, amount, { instrument, contractId: receiverCid }));
+    if (changeCid && opts.change)
+      events.push(this.holding(this.admin, opts.change, { instrument, contractId: changeCid }));
+    return { tx: this.tx(events), changeCid };
+  }
+
+  /**
+   * A two-step offer of `amount` from `sender` to the treasury: `TransferFactory_Transfer` locks the
+   * sender's input and creates a pending `TransferInstruction` (no holding reaches the treasury yet).
+   */
+  tokenOfferIn(
+    sender: string,
+    amount: string,
+    opts: { instrument?: InstrumentId; executeBefore?: Date } = {},
+  ): { tx: LedgerTransaction; instructionCid: string } {
+    const instrument = opts.instrument ?? FIXTURE_TOKEN;
+    const inputCid = this.cid("hd");
+    const lockedCid = this.cid("hd");
+    const instructionCid = this.cid("ti");
+    const root = this.transferFactoryExercise(
+      transferRecord({
+        sender,
+        receiver: this.admin,
+        instrument,
+        amount,
+        inputHoldingCids: [inputCid],
+        executeBefore: opts.executeBefore,
+      }),
+      3,
+      sender,
+      {
+        output: {
+          tag: "TransferInstructionResult_Pending",
+          value: { transferInstructionCid: instructionCid },
+        },
+        senderChangeCids: [],
+        meta: { values: {} },
+      },
+    );
+    const instruction = this.created(
+      "TransferInstruction",
+      instructionCid,
+      { lockedHoldingCid: lockedCid },
+      {
+        module: "TruthOracle.CBYN.Transfer",
+        signatories: [instrument.admin, sender],
+        observers: [this.admin],
+        blob: null,
+        interfaceViews: [
+          transferInstructionView({
+            sender,
+            receiver: this.admin,
+            instrument,
+            amount,
+            executeBefore: opts.executeBefore,
+          }),
+        ],
+      },
+    );
+    const tx = this.tx([
+      root,
+      this.archiveHolding(inputCid, sender),
+      this.holding(sender, amount, {
+        instrument,
+        lock: { expiresAt: opts.executeBefore ?? null },
+        contractId: lockedCid,
+      }),
+      {
+        ...instruction,
+        packageName: FIXTURE_TOKEN_PACKAGE,
+        templateId: "tokenpkg:TruthOracle.CBYN.Transfer:TransferInstruction",
+      },
+    ]);
+    return { tx, instructionCid };
+  }
+
+  /** `TransferInstruction_Accept` by the treasury: the offer is consumed and the treasury receives its holding. */
+  acceptInstruction(
+    instructionCid: string,
+    amount: string,
+    opts: { instrument?: InstrumentId } = {},
+  ): { tx: LedgerTransaction; treasuryHoldingCid: string } {
+    const instrument = opts.instrument ?? FIXTURE_TOKEN;
+    const treasuryHoldingCid = this.cid("hd");
+    const accept = this.exercised(
+      "TransferInstruction",
+      instructionCid,
+      "TransferInstruction_Accept",
+      { extraArgs: { context: { values: {} }, meta: { values: {} } } },
+      {
+        module: "TruthOracle.CBYN.Transfer",
+        actingParties: [this.admin],
+        consuming: true,
+        children: 1,
+        interfaceId: interfaceIdOf(TRANSFER_INSTRUCTION_INTERFACE),
+        result: {
+          output: {
+            tag: "TransferInstructionResult_Completed",
+            value: { receiverHoldingCids: [treasuryHoldingCid] },
+          },
+          senderChangeCids: [],
+          meta: { values: {} },
+        },
+      },
+    );
+    const tx = this.tx(
+      [
+        {
+          ...accept,
+          packageName: FIXTURE_TOKEN_PACKAGE,
+          templateId: "tokenpkg:TruthOracle.CBYN.Transfer:TransferInstruction",
+        },
+        this.holding(this.admin, amount, { instrument, contractId: treasuryHoldingCid }),
+      ],
+      { commandId: `ti-accept-${instructionCid}` },
+    );
+    return { tx, treasuryHoldingCid };
+  }
+
+  /** `TransferInstruction_Reject` / `_Withdraw`: the offer is consumed without delivering. */
+  endInstruction(
+    instructionCid: string,
+    choice: "TransferInstruction_Reject" | "TransferInstruction_Withdraw",
+    actor: string,
+  ): LedgerTransaction {
+    const e = this.exercised(
+      "TransferInstruction",
+      instructionCid,
+      choice,
+      { extraArgs: { context: { values: {} }, meta: { values: {} } } },
+      {
+        module: "TruthOracle.CBYN.Transfer",
+        actingParties: [actor],
+        consuming: true,
+        interfaceId: interfaceIdOf(TRANSFER_INSTRUCTION_INTERFACE),
+      },
+    );
+    return this.tx([
+      {
+        ...e,
+        packageName: FIXTURE_TOKEN_PACKAGE,
+        templateId: "tokenpkg:TruthOracle.CBYN.Transfer:TransferInstruction",
+      },
+    ]);
+  }
+
+  /**
+   * Canton Coin moved THROUGH the token standard (`TransferFactory_Transfer` on the DSO's
+   * ExternalPartyAmuletRules, which calls `AmuletRules_Transfer` underneath): the subtree an
+   * Amulet-only reader would count once more.
+   */
+  amuletTokenStandardTransferIn(sender: string, amount: string): LedgerTransaction {
+    const treasuryCid = this.cid("am");
+    const root = this.exercised(
+      "ExternalPartyAmuletRules",
+      this.cid("ep"),
+      "TransferFactory_Transfer",
+      {
+        expectedAdmin: FIXTURE_DSO,
+        transfer: transferRecord({
+          sender,
+          receiver: this.admin,
+          instrument: FIXTURE_COLLATERAL,
+          amount,
+        }),
+        extraArgs: { context: { values: {} }, meta: { values: {} } },
+      },
+      {
+        module: "Splice.ExternalPartyAmuletRules",
+        actingParties: [sender],
+        consuming: false,
+        children: 3,
+        interfaceId: interfaceIdOf(TRANSFER_FACTORY_INTERFACE),
+        result: {
+          output: {
+            tag: "TransferInstructionResult_Completed",
+            value: { receiverHoldingCids: [treasuryCid] },
+          },
+          senderChangeCids: [],
+          meta: { values: {} },
+        },
+      },
+    );
+    const inner = this.spliceExercised(
+      "AmuletRules",
+      this.cid("ar"),
+      "AmuletRules_Transfer",
+      { transfer: { sender, outputs: [] } },
+      2,
+      sender,
+    );
+    return this.tx([
+      {
+        ...root,
+        packageName: SPLICE_PACKAGE_NAME,
+        templateId: "splicepkg:Splice.ExternalPartyAmuletRules:ExternalPartyAmuletRules",
+      },
+      inner,
+      this.amulet(this.admin, amount, treasuryCid),
+      this.amulet(sender, "2"),
+    ]);
+  }
+
+  /** An ACS snapshot entry of a token-standard holding (its interface view included). */
+  holdingAcsEntry(
+    owner: string,
+    amount: string,
+    opts: { instrument?: InstrumentId; offset?: number; contractId?: string } = {},
+  ): ActiveContractEntry {
+    const created = this.holding(owner, amount, {
+      instrument: opts.instrument,
+      contractId: opts.contractId,
+    });
+    return {
+      created: { ...created, offset: opts.offset ?? this.offset, nodeId: 0 },
+      synchronizerId: "sync::test",
+    };
   }
 
   /** An ACS snapshot entry for a contract (its own create offset / node id preserved). */
@@ -766,12 +1289,12 @@ export class LedgerFixture {
       cid: this.cid("uw"),
       payload: {
         ...p,
-        balanceCC: dec(change.balance ?? big(p.balanceCC)),
-        depositedCC: dec(change.deposited ?? big(p.depositedCC)),
-        withdrawnCC: dec(change.withdrawn ?? big(p.withdrawnCC)),
-        depositRefs: change.ref
-          ? [change.ref, ...(p.depositRefs as string[])]
-          : [...(p.depositRefs as string[])],
+        balance: dec(change.balance ?? big(p.balance)),
+        deposited: dec(change.deposited ?? big(p.deposited)),
+        withdrawn: dec(change.withdrawn ?? big(p.withdrawn)),
+        creditRefs: change.ref
+          ? [change.ref, ...(p.creditRefs as string[])]
+          : [...(p.creditRefs as string[])],
       },
     };
   }
@@ -785,8 +1308,9 @@ export class LedgerFixture {
     contractId: string,
     payload: Payload,
     module: string,
+    interfaceViews: InterfaceView[] = [],
   ): CreatedLedgerEvent {
-    const e = this.created(entity, contractId, payload, { module, blob: null });
+    const e = this.created(entity, contractId, payload, { module, blob: null, interfaceViews });
     return { ...e, packageName: SPLICE_PACKAGE_NAME, templateId: `splicepkg:${module}:${entity}` };
   }
 

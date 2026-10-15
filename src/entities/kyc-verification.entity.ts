@@ -15,7 +15,9 @@ import { UserEntity } from "./user.entity";
 
 /** One verification attempt (ARCHITECTURE §5 `to_kyc_verifications`). */
 @Entity({ name: "to_kyc_verifications" })
-@Index("uq_to_kyc_verifications_attempt", ["userId", "provider", "levelName", "attemptNo"], { unique: true })
+@Index("uq_to_kyc_verifications_attempt", ["userId", "provider", "levelName", "attemptNo"], {
+  unique: true,
+})
 export class KycVerificationEntity {
   @PrimaryGeneratedColumn("uuid")
   id!: string;

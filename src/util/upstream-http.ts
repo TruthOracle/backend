@@ -1,6 +1,6 @@
 /**
  * Authenticated JSON call to an upstream (ledger / Enterprise Wallet). Port of
- * `authedJson` in truthoracle-canton/api/_lib/upstream.mjs: throws with the upstream status
+ * `authedJson` in pm-frontend/api/_lib/upstream.mjs: throws with the upstream status
  * and a bounded slice of the body so callers can branch on 404 without ever logging a token.
  */
 
@@ -19,7 +19,8 @@ export class UpstreamError extends Error {
 export interface UpstreamRequest {
   method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
-  token: string;
+  /** Bearer; omitted for an upstream that takes no credentials (a CIP-56 registry with `registry_auth = none`). */
+  token?: string;
   timeoutMs?: number;
 }
 
@@ -38,7 +39,7 @@ export async function authedJson<T = unknown>(
     res = await fetch(`${baseUrl}${path}`, {
       method,
       headers: {
-        Authorization: `Bearer ${opts.token}`,
+        ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
         Accept: "application/json",
         ...(opts.body === undefined ? {} : { "Content-Type": "application/json" }),
       },
@@ -55,7 +56,11 @@ export async function authedJson<T = unknown>(
   }
 
   if (!res.ok) {
-    throw new UpstreamError(`${method} ${path} failed: HTTP ${res.status} ${text.slice(0, 600)}`, res.status, text.slice(0, 2000));
+    throw new UpstreamError(
+      `${method} ${path} failed: HTTP ${res.status} ${text.slice(0, 600)}`,
+      res.status,
+      text.slice(0, 2000),
+    );
   }
   if (!text) return {} as T;
   try {

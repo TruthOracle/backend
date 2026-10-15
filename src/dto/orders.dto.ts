@@ -12,7 +12,7 @@ const DECIMAL_INPUT = /^\d{1,28}(\.\d{1,10})?$/;
 const trimmed = (): PropertyDecorator =>
   Transform(({ value }: { value: unknown }) => (typeof value === "string" ? value.trim() : value));
 
-/** `GET /markets/:market/quote?action=&side=&amountCC=&shares=&slippageBps=` */
+/** `GET /markets/:market/quote?action=&side=&amount=&shares=&slippageBps=` */
 export class QuoteQueryDto {
   @IsIn(QUOTABLE_ACTIONS as readonly string[])
   action!: Extract<OrderAction, "buy" | "sell" | "swap" | "provide_liquidity">;
@@ -24,7 +24,7 @@ export class QuoteQueryDto {
   @IsOptional()
   @trimmed()
   @Matches(DECIMAL_INPUT)
-  amountCC?: string;
+  amount?: string;
 
   @IsOptional()
   @trimmed()
@@ -51,7 +51,7 @@ export class PrepareOrderDto {
   @IsOptional()
   @trimmed()
   @Matches(DECIMAL_INPUT)
-  amountCC?: string;
+  amount?: string;
 
   @IsOptional()
   @trimmed()

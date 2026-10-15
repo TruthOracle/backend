@@ -1,6 +1,6 @@
 /**
  * Canton external-party key ↔ party binding and Ed25519 signature verification
- * (docs/ARCHITECTURE.md §7.3). Port of truthoracle-canton/api/_lib/verifyPartySignature.mjs.
+ * (docs/ARCHITECTURE.md §7.3). Port of pm-frontend/api/_lib/verifyPartySignature.mjs.
  *
  * Canton external-party keys are Ed25519, so the maths is fixed. What is NOT fixed is the
  * wire encoding: `@cantor8/wallet-connect-sdk` is a pure postMessage transport for
@@ -66,15 +66,19 @@ export function decodeFixedWidth(value: unknown, expectedBytes: number): Buffer 
  * `hex(0x12 0x20 ‖ sha256(uint32be(12) ‖ rawKey))` — exactly
  * `TopologyWriteService.createFingerprintFromKey` in `@canton-network/wallet-sdk`
  * (HashPurpose 12 = PublicKeyFingerprint, multihash sha2-256). Verified against the real
- * operator party in truthoracle-canton/.env.
+ * operator party in pm-frontend/.env.
  */
 export function partyFingerprintFromPublicKey(raw: Buffer): string {
   if (raw.length !== PUBLIC_KEY_BYTES) {
-    throw new TypeError(`partyFingerprintFromPublicKey: expected ${PUBLIC_KEY_BYTES} bytes, got ${raw.length}`);
+    throw new TypeError(
+      `partyFingerprintFromPublicKey: expected ${PUBLIC_KEY_BYTES} bytes, got ${raw.length}`,
+    );
   }
   const purpose = Buffer.alloc(4);
   purpose.writeUInt32BE(HASH_PURPOSE_PUBLIC_KEY_FINGERPRINT, 0);
-  const digest = createHash("sha256").update(Buffer.concat([purpose, raw])).digest();
+  const digest = createHash("sha256")
+    .update(Buffer.concat([purpose, raw]))
+    .digest();
   return Buffer.concat([MULTIHASH_SHA256_PREFIX, digest]).toString("hex");
 }
 
@@ -150,7 +154,8 @@ function preimages(message: string): { form: SignaturePreimageForm; bytes: Buffe
   ];
 }
 
-export type VerifyResult = { ok: true; form: SignaturePreimageForm } | { ok: false; reason: string };
+export type VerifyResult =
+  { ok: true; form: SignaturePreimageForm } | { ok: false; reason: string };
 
 export function verifyPartySignature(input: {
   message: string;

@@ -21,7 +21,9 @@ export class AppController {
 
   @Get("ready")
   @ApiOkResponse({ description: "Postgres, Redis and NATS are all reachable." })
-  @ApiServiceUnavailableResponse({ description: "At least one dependency is unreachable, or the process is draining for shutdown." })
+  @ApiServiceUnavailableResponse({
+    description: "At least one dependency is unreachable, or the process is draining for shutdown.",
+  })
   async ready(@Res({ passthrough: true }) res: Response): Promise<ReadinessResponse> {
     const readiness = await this.appService.readiness();
     if (readiness.status !== "ok") res.status(503);

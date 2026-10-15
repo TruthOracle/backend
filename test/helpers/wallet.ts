@@ -21,6 +21,7 @@ export function makeTestWallet(hint = "test"): TestWallet {
     publicKeyBase64: raw.toString("base64"),
     publicKeyHex: raw.toString("hex"),
     privateKey,
-    sign: (message: string) => cryptoSign(null, Buffer.from(message, "utf8"), privateKey).toString("base64"),
+    sign: (message: string) =>
+      cryptoSign(null, Buffer.from(message, "utf8"), privateKey).toString("base64"),
   };
 }

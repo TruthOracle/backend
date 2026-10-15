@@ -11,7 +11,12 @@ import { NatsService } from "./nats.service";
 /** `to_settings` key holding the operator's trading halt as JSON (`ApiExchangeHalt`). */
 export const SETTING_EXCHANGE_HALT = "exchange_halt";
 
-const NO_HALT: ApiExchangeHalt = { active: false, reason: null, since: null, estimatedResumeAt: null };
+const NO_HALT: ApiExchangeHalt = {
+  active: false,
+  reason: null,
+  since: null,
+  estimatedResumeAt: null,
+};
 
 /**
  * `GET /exchange/status` and the operator's trading halt (docs/MARKETS.md §8; Kalshi's
@@ -40,7 +45,8 @@ export class ExchangeService {
         active: parsed.active === true,
         reason: typeof parsed.reason === "string" ? parsed.reason : null,
         since: typeof parsed.since === "string" ? parsed.since : null,
-        estimatedResumeAt: typeof parsed.estimatedResumeAt === "string" ? parsed.estimatedResumeAt : null,
+        estimatedResumeAt:
+          typeof parsed.estimatedResumeAt === "string" ? parsed.estimatedResumeAt : null,
       };
     } catch {
       return NO_HALT;
@@ -75,7 +81,11 @@ export class ExchangeService {
           action: "exchange.halt_changed",
           subjectType: "exchange",
           subjectId: "trading",
-          metadata: { active: next.active, reason: input.reason, estimatedResumeAt: next.estimatedResumeAt },
+          metadata: {
+            active: next.active,
+            reason: input.reason,
+            estimatedResumeAt: next.estimatedResumeAt,
+          },
           ip: actor.ip ?? null,
         },
         manager,
@@ -93,7 +103,8 @@ export class ExchangeService {
     const touched = ledger.updatedAt ? Date.parse(ledger.updatedAt) : NaN;
     const stale =
       ledger.enabled &&
-      (!Number.isFinite(touched) || Date.now() - touched > this.config.exchangeStaleAfterSec * 1000);
+      (!Number.isFinite(touched) ||
+        Date.now() - touched > this.config.exchangeStaleAfterSec * 1000);
     return {
       exchangeActive: ledger.enabled,
       tradingActive: !halt.active,

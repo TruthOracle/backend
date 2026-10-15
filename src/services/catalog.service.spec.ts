@@ -9,7 +9,7 @@ describe("eventSortOrder", () => {
     expect(order[0].select).toContain("period_secs = 3600");
     expect(order[0].select).toContain("interval '24 hours'");
     expect(order[0].direction).toBe("DESC");
-    expect(order[1].select).toContain("SUM(m.total_volume_cc)");
+    expect(order[1].select).toContain("SUM(m.total_volume)");
   });
   it("closing puts the soonest still-open close first and closed events last", () => {
     const [only] = eventSortOrder("closing");
@@ -20,7 +20,7 @@ describe("eventSortOrder", () => {
   });
   it("newest and volume are single keys; no sort keeps the catalog's default", () => {
     expect(eventSortOrder("newest")).toEqual([{ select: "e.created_at", direction: "DESC" }]);
-    expect(eventSortOrder("volume")[0].select).toContain("SUM(m.total_volume_cc)");
+    expect(eventSortOrder("volume")[0].select).toContain("SUM(m.total_volume)");
     expect(eventSortOrder(undefined)).toEqual([]);
   });
 });

@@ -9,9 +9,9 @@ import { moneyTransformer } from "../util/money";
  * market version that moved the price (docs/MARKETS.md §5, docs/INDEXER.md §5). One row per
  * period that saw at least one market version; the read side fills the gaps by carrying the
  * previous close forward. `open` is set on insert only; `close` follows the latest version by
- * (offset, node id); `volume_cc` is Σ Δ`totalVolumeCC`; `notional_cc` = Σ price × Δvolume
- * (so `mean = notional / volume`); `open_interest` is the market's outstanding shares after
- * the last version of the period.
+ * (offset, node id); `volume` is Σ Δ`totalVolume` (in the market's collateral); `notional` =
+ * Σ price × Δvolume (so `mean = notional / volume`); `open_interest` is the market's outstanding
+ * shares after the last version of the period.
  */
 @Entity({ name: "to_market_candles" })
 @Index("ix_to_market_candles_period_start", ["periodSecs", "periodStart"])
@@ -37,25 +37,11 @@ export class MarketCandleEntity {
   @Column({ type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
   close!: bigint;
 
-  @Column({
-    name: "volume_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
-  volumeCC!: bigint;
+  @Column({ type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
+  volume!: bigint;
 
-  @Column({
-    name: "notional_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
-  notionalCC!: bigint;
+  @Column({ type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
+  notional!: bigint;
 
   @Column({ type: "integer", default: 0 })
   trades!: number;

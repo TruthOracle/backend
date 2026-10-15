@@ -7,7 +7,7 @@ import { MarketsService } from "../services/markets.service";
 import { QuoteService } from "../services/quote.service";
 import type { ApiPreparedOrder } from "../types";
 import { LedgerOffsetInterceptor } from "../util/ledger-offset.interceptor";
-import { parseCC } from "../util/money";
+import { parseAmount } from "../util/money";
 
 /**
  * Order preparation (docs/API.md "Quotes and orders"; docs/MARKETS.md §7): the signed-in
@@ -39,9 +39,9 @@ export class OrdersController {
     return this.quotes.prepare(user, market, {
       action: body.action,
       side: body.side,
-      amountCC: body.amountCC === undefined ? undefined : parseCC(body.amountCC),
-      shares: body.shares === undefined ? undefined : parseCC(body.shares),
-      lpTokens: body.lpTokens === undefined ? undefined : parseCC(body.lpTokens),
+      amount: body.amount === undefined ? undefined : parseAmount(body.amount),
+      shares: body.shares === undefined ? undefined : parseAmount(body.shares),
+      lpTokens: body.lpTokens === undefined ? undefined : parseAmount(body.lpTokens),
       slippageBps: body.slippageBps,
     });
   }

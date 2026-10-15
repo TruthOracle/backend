@@ -8,12 +8,21 @@ import type { RedisService } from "./redis.service";
 
 interface Mocks {
   runner: { connect: jest.Mock; query: jest.Mock; release: jest.Mock };
-  dataSource: { createQueryRunner: jest.Mock; runMigrations: jest.Mock; query: jest.Mock; getRepository: jest.Mock };
+  dataSource: {
+    createQueryRunner: jest.Mock;
+    runMigrations: jest.Mock;
+    query: jest.Mock;
+    getRepository: jest.Mock;
+  };
   repo: { findOneByOrFail: jest.Mock; update: jest.Mock };
 }
 
 function build(overrides: Partial<Config> = {}): { service: AppService; m: Mocks } {
-  const runner = { connect: jest.fn().mockResolvedValue(undefined), query: jest.fn().mockResolvedValue([]), release: jest.fn().mockResolvedValue(undefined) };
+  const runner = {
+    connect: jest.fn().mockResolvedValue(undefined),
+    query: jest.fn().mockResolvedValue([]),
+    release: jest.fn().mockResolvedValue(undefined),
+  };
   const repo = { findOneByOrFail: jest.fn(), update: jest.fn().mockResolvedValue(undefined) };
   const dataSource = {
     createQueryRunner: jest.fn().mockReturnValue(runner),
@@ -31,7 +40,12 @@ function build(overrides: Partial<Config> = {}): { service: AppService; m: Mocks
     telegramBotToken: "",
     ...overrides,
   } as unknown as Config;
-  const service = new AppService(config, dataSource as unknown as DataSource, { ping: jest.fn().mockResolvedValue(true) } as unknown as RedisService, { isConnected: () => true } as unknown as NatsService);
+  const service = new AppService(
+    config,
+    dataSource as unknown as DataSource,
+    { ping: jest.fn().mockResolvedValue(true) } as unknown as RedisService,
+    { isConnected: () => true } as unknown as NatsService,
+  );
   return { service, m: { runner, dataSource, repo } };
 }
 
@@ -48,7 +62,9 @@ describe("AppService boot", () => {
 
     m.dataSource.runMigrations.mockRejectedValueOnce(new Error("relation exists"));
     await expect(service.migrate()).rejects.toThrow("relation exists");
-    expect((m.runner.query.mock.calls as [string, unknown][]).filter((c) => c[0].includes("unlock"))).toHaveLength(2);
+    expect(
+      (m.runner.query.mock.calls as [string, unknown][]).filter((c) => c[0].includes("unlock")),
+    ).toHaveLength(2);
     expect(m.runner.release).toHaveBeenCalledTimes(2);
   });
 
@@ -57,21 +73,31 @@ describe("AppService boot", () => {
     // Both rows are ours on a fresh database.
     m.dataSource.query.mockResolvedValue([{ key: "x" }]);
     await expect(service.onModuleInit()).resolves.toBeUndefined();
-    expect(m.dataSource.query).toHaveBeenCalledWith(expect.stringContaining("ON CONFLICT (key) DO NOTHING"), ["app_network", "devnet"]);
-    expect(m.dataSource.query).toHaveBeenCalledWith(expect.stringContaining("ON CONFLICT (key) DO NOTHING"), ["kyc_pepper_hash", "hash-new"]);
+    expect(m.dataSource.query).toHaveBeenCalledWith(
+      expect.stringContaining("ON CONFLICT (key) DO NOTHING"),
+      ["app_network", "devnet"],
+    );
+    expect(m.dataSource.query).toHaveBeenCalledWith(
+      expect.stringContaining("ON CONFLICT (key) DO NOTHING"),
+      ["kyc_pepper_hash", "hash-new"],
+    );
 
     // Another replica won the insert: the stored value is read back and checked.
     m.dataSource.query.mockResolvedValue([]);
     m.repo.findOneByOrFail.mockResolvedValueOnce({ key: "app_network", value: "mainnet" });
     await expect(service.onModuleInit()).rejects.toThrow(/belongs to another network/);
-    m.repo.findOneByOrFail.mockResolvedValueOnce({ key: "app_network", value: "devnet" }).mockResolvedValueOnce({ key: "kyc_pepper_hash", value: "hash-old" });
+    m.repo.findOneByOrFail
+      .mockResolvedValueOnce({ key: "app_network", value: "devnet" })
+      .mockResolvedValueOnce({ key: "kyc_pepper_hash", value: "hash-old" });
     await expect(service.onModuleInit()).rejects.toThrow(/KYC_PEPPER_ROTATION_ACK/);
   });
 
   it("accepts an acknowledged pepper rotation and rewrites the stored hash", async () => {
     const { service, m } = build({ kycPepperRotationAck: "hash-new", dbMigrateOnBoot: false });
     m.dataSource.query.mockResolvedValue([]);
-    m.repo.findOneByOrFail.mockResolvedValueOnce({ key: "app_network", value: "devnet" }).mockResolvedValueOnce({ key: "kyc_pepper_hash", value: "hash-old" });
+    m.repo.findOneByOrFail
+      .mockResolvedValueOnce({ key: "app_network", value: "devnet" })
+      .mockResolvedValueOnce({ key: "kyc_pepper_hash", value: "hash-old" });
     await expect(service.onModuleInit()).resolves.toBeUndefined();
     expect(m.repo.update).toHaveBeenCalledWith({ key: "kyc_pepper_hash" }, { value: "hash-new" });
     expect(m.dataSource.runMigrations).not.toHaveBeenCalled();
@@ -89,13 +115,19 @@ describe("AppService boot", () => {
       ]);
 
       warn.mockClear();
-      const telegramOnly = build({ dbMigrateOnBoot: false, googleClientIds: [], telegramBotToken: "123:token" });
+      const telegramOnly = build({
+        dbMigrateOnBoot: false,
+        googleClientIds: [],
+        telegramBotToken: "123:token",
+      });
       telegramOnly.m.dataSource.query.mockResolvedValue([{ key: "x" }]);
       await telegramOnly.service.onModuleInit();
       const googleOnly = build({ dbMigrateOnBoot: false });
       googleOnly.m.dataSource.query.mockResolvedValue([{ key: "x" }]);
       await googleOnly.service.onModuleInit();
-      expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("no sign-in provider"))).toEqual([]);
+      expect(
+        warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("no sign-in provider")),
+      ).toEqual([]);
     } finally {
       warn.mockRestore();
     }
@@ -103,8 +135,15 @@ describe("AppService boot", () => {
 
   it("readiness reports draining (503) from beforeApplicationShutdown on, even while every dependency is fine", async () => {
     const { service } = build();
-    await expect(service.readiness()).resolves.toEqual({ status: "ok", checks: { postgres: "ok", redis: "ok", nats: "ok" } });
+    await expect(service.readiness()).resolves.toEqual({
+      status: "ok",
+      checks: { postgres: "ok", redis: "ok", nats: "ok" },
+    });
     service.beforeApplicationShutdown();
-    await expect(service.readiness()).resolves.toEqual({ status: "degraded", checks: { postgres: "ok", redis: "ok", nats: "ok" }, draining: true });
+    await expect(service.readiness()).resolves.toEqual({
+      status: "degraded",
+      checks: { postgres: "ok", redis: "ok", nats: "ok" },
+      draining: true,
+    });
   });
 });

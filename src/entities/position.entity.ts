@@ -45,15 +45,16 @@ export class PositionEntity {
   })
   noShares!: bigint;
 
+  /** Lifetime collateral spent on this market (`Position.costBasis`), in the market's collateral. */
   @Column({
-    name: "cost_basis_cc",
+    name: "cost_basis",
     type: "numeric",
     precision: 38,
     scale: 10,
     default: 0,
     transformer: moneyTransformer,
   })
-  costBasisCC!: bigint;
+  costBasis!: bigint;
 
   @Column({ name: "audit_observers", type: "jsonb", default: () => "'[]'::jsonb" })
   auditObservers!: string[];

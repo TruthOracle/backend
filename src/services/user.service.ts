@@ -30,7 +30,9 @@ export class UserService {
 
   /** ≤ 30 s cached read for the per-request status check (suspend/update invalidate it). */
   async findByIdCached(id: string): Promise<UserEntity | null> {
-    const cached = await this.redis.getJson<Record<string, unknown>>(`user:${id}`).catch(() => null);
+    const cached = await this.redis
+      .getJson<Record<string, unknown>>(`user:${id}`)
+      .catch(() => null);
     if (cached) return this.users.create(reviveDates(cached));
     const user = await this.findById(id);
     if (user) await this.redis.setJson(`user:${id}`, user, USER_CACHE_MS).catch(() => undefined);
@@ -58,7 +60,12 @@ export class UserService {
 
   async update(
     id: string,
-    patch: { displayName?: string | null; avatarUrl?: string | null; email?: string | null; lastLoginAt?: Date },
+    patch: {
+      displayName?: string | null;
+      avatarUrl?: string | null;
+      email?: string | null;
+      lastLoginAt?: Date;
+    },
     manager?: EntityManager,
   ): Promise<UserEntity> {
     const repo = manager ? manager.getRepository(UserEntity) : this.users;
@@ -73,7 +80,11 @@ export class UserService {
     return saved;
   }
 
-  async setPrimaryParty(userId: string, partyId: string | null, manager?: EntityManager): Promise<void> {
+  async setPrimaryParty(
+    userId: string,
+    partyId: string | null,
+    manager?: EntityManager,
+  ): Promise<void> {
     const repo = manager ? manager.getRepository(UserEntity) : this.users;
     await repo.update({ id: userId }, { partyId });
     await this.invalidate(userId);

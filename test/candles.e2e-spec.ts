@@ -5,14 +5,14 @@
  */
 import { IndexerService } from "../src/services/indexer.service";
 import type { ApiCandlesticks, ApiMarket, ApiPage } from "../src/types";
-import { formatCC, parseCC } from "../src/util/money";
+import { formatAmount, parseAmount } from "../src/util/money";
 import { TEST_TREASURY, useTestApp } from "./helpers/app";
 import { LedgerFixture, parties } from "./helpers/ledger-fixtures";
 import { bodyOf } from "./helpers/session";
 
 const ctx = useTestApp();
 const [alice, bob] = parties(2, "trader");
-const dec = (v: string): string => formatCC(parseCC(v));
+const dec = (v: string): string => formatAmount(parseAmount(v));
 const HOUR = 3600;
 
 /** Three hourly buckets of activity ending just before now: buys at −2 h, a buy at −1 h, a sell at −10 min. */
@@ -47,7 +47,7 @@ async function seedHourlyActivity(): Promise<{
     wallet: da.wallet,
     buyer: alice,
     side: "Yes",
-    collateralCC: "10",
+    amount: "10",
     sharesOut: "18",
     newPrice: "0.55",
     at: at(base + HOUR + 120),
@@ -57,7 +57,7 @@ async function seedHourlyActivity(): Promise<{
     wallet: db.wallet,
     buyer: bob,
     side: "No",
-    collateralCC: "4",
+    amount: "4",
     sharesOut: "7",
     newPrice: "0.52",
     at: at(base + HOUR + 900),
@@ -68,7 +68,7 @@ async function seedHourlyActivity(): Promise<{
     position: b1.position,
     buyer: alice,
     side: "Yes",
-    collateralCC: "6",
+    amount: "6",
     sharesOut: "10",
     newPrice: "0.6",
     at: at(base + 2 * HOUR + 30),
@@ -80,7 +80,7 @@ async function seedHourlyActivity(): Promise<{
     seller: alice,
     side: "Yes",
     sharesIn: "8",
-    grossCC: "4.5",
+    gross: "4.5",
     newPrice: "0.57",
     at: at(nowSec - 600),
   });
@@ -94,7 +94,9 @@ describe("candlesticks", () => {
     const { base, nowSec } = await seedHourlyActivity();
     const res = bodyOf<ApiCandlesticks>(
       await ctx.agent
-        .get(`/api/v1/markets/TEST-HOURLY/candlesticks?periodInterval=60&startTs=${base}&endTs=${nowSec}`)
+        .get(
+          `/api/v1/markets/TEST-HOURLY/candlesticks?periodInterval=60&startTs=${base}&endTs=${nowSec}`,
+        )
         .expect(200),
     );
     expect(res).toMatchObject({ marketId: 1, ticker: "TEST-HOURLY", periodInterval: 60 });
@@ -102,13 +104,16 @@ describe("candlesticks", () => {
     const byStart = new Map(res.candlesticks.map((c) => [c.startTs, c]));
     // Every hour from the first bucket to the current one is present, in order.
     expect(res.candlesticks.map((c) => c.startTs)).toEqual(
-      Array.from({ length: (bucket(nowSec) - bucket(base)) / HOUR + 1 }, (_, i) => bucket(base) + i * HOUR),
+      Array.from(
+        { length: (bucket(nowSec) - bucket(base)) / HOUR + 1 },
+        (_, i) => bucket(base) + i * HOUR,
+      ),
     );
 
     const creation = byStart.get(bucket(base + 60));
     expect(creation).toMatchObject({ empty: false, trades: 0 });
     expect(creation?.price).toMatchObject({ open: dec("0.5"), close: dec("0.5"), previous: null });
-    expect(creation?.volumeCC).toBe(dec("0"));
+    expect(creation?.volume).toBe(dec("0"));
 
     const hour1 = byStart.get(bucket(base + HOUR + 120));
     expect(hour1).toMatchObject({ empty: false, trades: 2 });
@@ -119,14 +124,20 @@ describe("candlesticks", () => {
       close: dec("0.52"),
       previous: dec("0.5"),
     });
-    expect(hour1?.volumeCC).toBe(dec("14"));
+    expect(hour1?.volume).toBe(dec("14"));
     // mean = (0.55 × 10 + 0.52 × 4) / 14
-    expect(hour1?.price.mean).toBe(formatCC((parseCC("0.55") * 10n + parseCC("0.52") * 4n) / 14n));
+    expect(hour1?.price.mean).toBe(
+      formatAmount((parseAmount("0.55") * 10n + parseAmount("0.52") * 4n) / 14n),
+    );
     expect(hour1?.openInterest).toBe(dec("25")); // 18 YES + 7 NO outstanding after the two buys
 
     const hour2 = byStart.get(bucket(base + 2 * HOUR + 30));
     expect(hour2).toMatchObject({ empty: false, trades: 1 });
-    expect(hour2?.price).toMatchObject({ open: dec("0.6"), close: dec("0.6"), previous: dec("0.52") });
+    expect(hour2?.price).toMatchObject({
+      open: dec("0.6"),
+      close: dec("0.6"),
+      previous: dec("0.52"),
+    });
     expect(hour2?.openInterest).toBe(dec("35"));
 
     const sellBucket = byStart.get(bucket(nowSec - 600));
@@ -134,13 +145,15 @@ describe("candlesticks", () => {
     expect(sellBucket?.openInterest).toBe(dec("27")); // alice sold 8 YES
     expect(res.candlesticks[res.candlesticks.length - 1].price.close).toBe(dec("0.57"));
     expect(res.candlesticks.reduce((n, c) => n + c.trades, 0)).toBe(4);
-    expect(formatCC(res.candlesticks.reduce((n, c) => n + parseCC(c.volumeCC), 0n))).toBe(dec("24.5"));
+    expect(formatAmount(res.candlesticks.reduce((n, c) => n + parseAmount(c.volume), 0n))).toBe(
+      dec("24.5"),
+    );
 
     // A quiet hour (if the window has one) is carried forward from the previous close.
     const quiet = res.candlesticks.filter((c) => c.empty);
     for (const c of quiet) {
       expect(c.price.open).toBe(c.price.close);
-      expect(c.volumeCC).toBe(dec("0"));
+      expect(c.volume).toBe(dec("0"));
       expect(c.trades).toBe(0);
     }
   });
@@ -152,8 +165,8 @@ describe("candlesticks", () => {
         .get(`/api/v1/markets/1/candlesticks?periodInterval=1440&startTs=${base}&endTs=${nowSec}`)
         .expect(200),
     );
-    const total = day.candlesticks.reduce((acc, c) => acc + parseCC(c.volumeCC), 0n);
-    expect(formatCC(total)).toBe(dec("24.5"));
+    const total = day.candlesticks.reduce((acc, c) => acc + parseAmount(c.volume), 0n);
+    expect(formatAmount(total)).toBe(dec("24.5"));
     expect(day.candlesticks.reduce((acc, c) => acc + c.trades, 0)).toBe(4);
     const first = day.candlesticks[0];
     expect(first.price.open).toBe(dec("0.5"));
@@ -167,7 +180,7 @@ describe("candlesticks", () => {
         .expect(200),
     );
     const withTrades = minutes.candlesticks.filter((c) => !c.empty);
-    expect(withTrades.map((c) => [c.trades, c.volumeCC])).toEqual([
+    expect(withTrades.map((c) => [c.trades, c.volume])).toEqual([
       [1, dec("10")],
       [1, dec("4")],
     ]);
@@ -187,31 +200,42 @@ describe("candlesticks", () => {
     await ctx.agent.get("/api/v1/markets/999/candlesticks").expect(404);
     await ctx.agent.get("/api/v1/markets/NOPE-1/candlesticks").expect(404);
     // Defaults: the last 200 hourly buckets.
-    const res = bodyOf<ApiCandlesticks>(await ctx.agent.get("/api/v1/markets/1/candlesticks").expect(200));
+    const res = bodyOf<ApiCandlesticks>(
+      await ctx.agent.get("/api/v1/markets/1/candlesticks").expect(200),
+    );
     expect(res.periodInterval).toBe(60);
     expect(res.candlesticks.length).toBeGreaterThan(0);
   });
 
   it("the market list carries 24 h volume, the price change and open interest from the same candles", async () => {
     await seedHourlyActivity();
-    const m = bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets").expect(200)).items[0];
+    const m = bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets").expect(200))
+      .items[0];
     expect(m.ticker).toBe("TEST-HOURLY");
     expect(m.eventTicker).toBe("TEST-EV");
-    expect(m.volume24hCC).toBe(dec("24.5"));
+    expect(m.volume24h).toBe(dec("24.5"));
     // No candle is older than 24 h, so the reference is the market's first price.
     expect(m.previousPrice).toBe(dec("0.5"));
     expect(m.priceChange24h).toBe(dec("0.07"));
     expect(m.openInterest).toEqual({ yes: dec("20"), no: dec("7"), total: dec("27") });
-    expect(parseCC(m.liquidityCC)).toBeGreaterThan(0n);
+    expect(parseAmount(m.liquidity)).toBeGreaterThan(0n);
     expect(m.book).not.toBeNull();
-    expect(parseCC(m.book!.yesAsk)).toBeGreaterThan(parseCC(m.currentPrice));
-    expect(parseCC(m.book!.yesBid)).toBeLessThan(parseCC(m.currentPrice));
+    expect(parseAmount(m.book!.yesAsk)).toBeGreaterThan(parseAmount(m.currentPrice));
+    expect(parseAmount(m.book!.yesBid)).toBeLessThan(parseAmount(m.currentPrice));
     // Markets can be addressed by ticker everywhere.
-    expect(bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/test-hourly").expect(200)).market.marketId).toBe(1);
     expect(
-      bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets?tickers=TEST-HOURLY,OTHER-1").expect(200)).total,
+      bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/test-hourly").expect(200))
+        .market.marketId,
     ).toBe(1);
-    expect(bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets?event=test-ev").expect(200)).total).toBe(1);
+    expect(
+      bodyOf<ApiPage<ApiMarket>>(
+        await ctx.agent.get("/api/v1/markets?tickers=TEST-HOURLY,OTHER-1").expect(200),
+      ).total,
+    ).toBe(1);
+    expect(
+      bodyOf<ApiPage<ApiMarket>>(await ctx.agent.get("/api/v1/markets?event=test-ev").expect(200))
+        .total,
+    ).toBe(1);
   });
 
   it("a market indexed from an ACS snapshot starts its chart at the snapshot and recomputes open interest", async () => {
@@ -219,28 +243,45 @@ describe("candlesticks", () => {
     const created = f.createMarket({ marketId: 3, price: "0.4", ticker: "SNAP-1" });
     const wa = f.createWallet(alice);
     const da = f.deposit(wa.wallet, "20", "ref");
-    const b = f.buy({ market: created.market, wallet: da.wallet, buyer: alice, side: "Yes", collateralCC: "5", sharesOut: "9" });
+    const b = f.buy({
+      market: created.market,
+      wallet: da.wallet,
+      buyer: alice,
+      side: "Yes",
+      amount: "5",
+      sharesOut: "9",
+    });
     ctx.stream.pruned = f.offset;
     ctx.stream.acs = [
       f.acsEntry("PredictionMarket", b.market.cid, b.market.payload, { offset: f.offset }),
-      f.acsEntry("Position", b.position.cid, b.position.payload, { offset: f.offset, observers: [TEST_TREASURY] }),
-      f.acsEntry("UserWallet", b.wallet.cid, b.wallet.payload, { offset: f.offset, observers: [alice] }),
+      f.acsEntry("Position", b.position.cid, b.position.payload, {
+        offset: f.offset,
+        observers: [TEST_TREASURY],
+      }),
+      f.acsEntry("UserWallet", b.wallet.cid, b.wallet.payload, {
+        offset: f.offset,
+        observers: [alice],
+      }),
     ];
     const later = f.deposit(b.wallet, "1", "later");
     ctx.stream.push(later.tx);
     await ctx.get(IndexerService).runOnce();
-    const m = bodyOf<{ market: ApiMarket }>(await ctx.agent.get("/api/v1/markets/SNAP-1").expect(200)).market;
+    const m = bodyOf<{ market: ApiMarket }>(
+      await ctx.agent.get("/api/v1/markets/SNAP-1").expect(200),
+    ).market;
     expect(m.openInterest).toEqual({ yes: dec("9"), no: dec("0"), total: dec("9") });
     // Fixture snapshot entries carry no ledger time, so the seed is dated at the snapshot (now).
     const nowSec = Math.floor(Date.now() / 1000);
     const candles = bodyOf<ApiCandlesticks>(
       await ctx.agent
-        .get(`/api/v1/markets/3/candlesticks?periodInterval=1440&startTs=${nowSec - 3 * 86_400}&endTs=${nowSec}`)
+        .get(
+          `/api/v1/markets/3/candlesticks?periodInterval=1440&startTs=${nowSec - 3 * 86_400}&endTs=${nowSec}`,
+        )
         .expect(200),
     );
     const real = candles.candlesticks.filter((c) => !c.empty);
     expect(real).toHaveLength(1);
-    expect(real[0]).toMatchObject({ trades: 0, volumeCC: dec("0") });
+    expect(real[0]).toMatchObject({ trades: 0, volume: dec("0") });
     expect(real[0].openInterest).toBe(dec("9"));
     expect(real[0].price.close).toBe(m.currentPrice);
     expect(candles.candlesticks[candles.candlesticks.length - 1].startTs).toBe(real[0].startTs);

@@ -12,7 +12,7 @@ import {
   type CandlePeriodMinutes,
 } from "../types";
 import { ApiError } from "../util/errors";
-import { formatCC, parseCC } from "../util/money";
+import { formatAmount, parseAmount } from "../util/money";
 import { MarketsService } from "./markets.service";
 
 /** Most candles one series may carry (a day of minutes is 1 440; a year of hours 8 760). */
@@ -27,8 +27,8 @@ interface CandleRow {
   high: string;
   low: string;
   close: string;
-  volume_cc: string;
-  notional_cc: string;
+  volume: string;
+  notional: string;
   trades: string | number;
   open_interest: string;
   liquidity_l: string | null;
@@ -73,6 +73,7 @@ export class CandlesService {
     return {
       marketId: market.marketId,
       ticker: market.ticker,
+      instrument: this.markets.collateralOf(market),
       periodInterval: opts.periodMinutes,
       startTs: window.firstBucket,
       endTs: window.lastBucket + window.period,
@@ -90,7 +91,9 @@ export class CandlesService {
     opts: { startTs?: number; endTs?: number; periodMinutes: CandlePeriodMinutes },
   ): Promise<ApiEventCandlesticks> {
     const eventTicker = eventTickerRaw.trim().toUpperCase();
-    const event = await this.dataSource.getRepository(CatalogEventEntity).findOneBy({ ticker: eventTicker });
+    const event = await this.dataSource
+      .getRepository(CatalogEventEntity)
+      .findOneBy({ ticker: eventTicker });
     if (!event) throw new ApiError(404, "not_found", `event ${eventTicker} does not exist`);
     const window = this.window(opts);
     const members = await this.dataSource
@@ -117,10 +120,11 @@ export class CandlesService {
       markets: ordered.map((m) => ({
         marketId: m.marketId,
         ticker: m.ticker,
+        instrument: this.markets.collateralOf(m),
         yesSubTitle: m.yesSubTitle,
         noSubTitle: m.noSubTitle,
         status: m.status,
-        currentPrice: formatCC(m.currentPrice),
+        currentPrice: formatAmount(m.currentPrice),
         candlesticks: series.get(m.marketId) ?? [],
       })),
     };
@@ -151,7 +155,11 @@ export class CandlesService {
     return out;
   }
 
-  private window(opts: { startTs?: number; endTs?: number; periodMinutes: CandlePeriodMinutes }): Window {
+  private window(opts: {
+    startTs?: number;
+    endTs?: number;
+    periodMinutes: CandlePeriodMinutes;
+  }): Window {
     const period = opts.periodMinutes * 60;
     const nowSec = Math.floor(Date.now() / 1000);
     const endTs = opts.endTs ?? nowSec;
@@ -161,9 +169,14 @@ export class CandlesService {
     const firstBucket = periodStartSec(startTs, period);
     const lastBucket = periodStartSec(endTs, period);
     if ((lastBucket - firstBucket) / period + 1 > MAX_CANDLES)
-      throw new ApiError(400, "validation_failed", `the window holds more than ${MAX_CANDLES} candles`, {
-        maxCandles: MAX_CANDLES,
-      });
+      throw new ApiError(
+        400,
+        "validation_failed",
+        `the window holds more than ${MAX_CANDLES} candles`,
+        {
+          maxCandles: MAX_CANDLES,
+        },
+      );
     return { period, firstBucket, lastBucket };
   }
 
@@ -174,7 +187,7 @@ export class CandlesService {
     const ids = marketIds.map(String);
     const { period, firstBucket, lastBucket } = window;
     const rows = await this.dataSource.query<CandleRow[]>(
-      `SELECT market_id::text, period_start, open::text, high::text, low::text, close::text, volume_cc::text, notional_cc::text,
+      `SELECT market_id::text, period_start, open::text, high::text, low::text, close::text, volume::text, notional::text,
               trades, open_interest::text, liquidity_l::text
          FROM to_market_candles
         WHERE market_id = ANY($1::bigint[]) AND period_secs = $2 AND period_start >= to_timestamp($3) AND period_start <= to_timestamp($4)
@@ -182,7 +195,7 @@ export class CandlesService {
       [ids, period, firstBucket, lastBucket],
     );
     const prior = await this.dataSource.query<CandleRow[]>(
-      `SELECT DISTINCT ON (market_id) market_id::text, period_start, open::text, high::text, low::text, close::text, volume_cc::text, notional_cc::text,
+      `SELECT DISTINCT ON (market_id) market_id::text, period_start, open::text, high::text, low::text, close::text, volume::text, notional::text,
               trades, open_interest::text, liquidity_l::text
          FROM to_market_candles
         WHERE market_id = ANY($1::bigint[]) AND period_secs = $2 AND period_start < to_timestamp($3)
@@ -199,59 +212,66 @@ export class CandlesService {
     const priorById = new Map<number, Carry>();
     for (const r of prior) priorById.set(Number(r.market_id), carryOf(r));
     for (const id of marketIds)
-      out.set(id, dense(rowsById.get(id) ?? new Map<number, CandleRow>(), priorById.get(id) ?? null, window));
+      out.set(
+        id,
+        dense(rowsById.get(id) ?? new Map<number, CandleRow>(), priorById.get(id) ?? null, window),
+      );
     return out;
   }
 }
 
 function carryOf(row: CandleRow): Carry {
   return {
-    close: parseCC(row.close),
-    openInterest: parseCC(row.open_interest),
-    liquidityL: row.liquidity_l === null ? null : parseCC(row.liquidity_l),
+    close: parseAmount(row.close),
+    openInterest: parseAmount(row.open_interest),
+    liquidityL: row.liquidity_l === null ? null : parseAmount(row.liquidity_l),
   };
 }
 
 /** Every period of the window from the market's first candle on; quiet periods flat at the last close. */
-function dense(byStart: Map<number, CandleRow>, initial: Carry | null, window: Window): ApiCandle[] {
+function dense(
+  byStart: Map<number, CandleRow>,
+  initial: Carry | null,
+  window: Window,
+): ApiCandle[] {
   const { period, firstBucket, lastBucket } = window;
   let carry = initial;
   const out: ApiCandle[] = [];
   for (let start = firstBucket; start <= lastBucket; start += period) {
     const row = byStart.get(start);
     if (row) {
-      const volume = parseCC(row.volume_cc);
-      const close = parseCC(row.close);
-      const mean = volume > 0n ? (parseCC(row.notional_cc) * 10_000_000_000n) / volume : close;
+      const volume = parseAmount(row.volume);
+      const close = parseAmount(row.close);
+      const mean = volume > 0n ? (parseAmount(row.notional) * 10_000_000_000n) / volume : close;
       out.push({
         startTs: start,
         endTs: start + period,
         price: {
-          open: formatCC(parseCC(row.open)),
-          high: formatCC(parseCC(row.high)),
-          low: formatCC(parseCC(row.low)),
-          close: formatCC(close),
-          mean: formatCC(mean),
-          previous: carry ? formatCC(carry.close) : null,
+          open: formatAmount(parseAmount(row.open)),
+          high: formatAmount(parseAmount(row.high)),
+          low: formatAmount(parseAmount(row.low)),
+          close: formatAmount(close),
+          mean: formatAmount(mean),
+          previous: carry ? formatAmount(carry.close) : null,
         },
-        volumeCC: formatCC(volume),
+        volume: formatAmount(volume),
         trades: Number(row.trades),
-        openInterest: formatCC(parseCC(row.open_interest)),
-        liquidityL: row.liquidity_l === null ? null : formatCC(parseCC(row.liquidity_l)),
+        openInterest: formatAmount(parseAmount(row.open_interest)),
+        liquidityL: row.liquidity_l === null ? null : formatAmount(parseAmount(row.liquidity_l)),
         empty: false,
       });
       carry = carryOf(row);
     } else if (carry) {
       // Nothing landed in this period: the chart still needs a point, flat at the last close.
-      const p = formatCC(carry.close);
+      const p = formatAmount(carry.close);
       out.push({
         startTs: start,
         endTs: start + period,
         price: { open: p, high: p, low: p, close: p, mean: p, previous: p },
-        volumeCC: formatCC(0n),
+        volume: formatAmount(0n),
         trades: 0,
-        openInterest: formatCC(carry.openInterest),
-        liquidityL: carry.liquidityL === null ? null : formatCC(carry.liquidityL),
+        openInterest: formatAmount(carry.openInterest),
+        liquidityL: carry.liquidityL === null ? null : formatAmount(carry.liquidityL),
         empty: true,
       });
     }

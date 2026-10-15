@@ -15,7 +15,8 @@ internal surface that other packages call.
 | **P3 — payouts** | service `payout`; controller `payouts`; processor `payout-settlement`; `src/dto/payouts.dto.ts`; specs + `test/payouts.e2e-spec.ts` |
 | **P4 — KYC** | services `kyc`, `kyc-provider-mock`, `kyc-provider-sumsub`; controllers `kyc`, `kyc-mock` (not in the barrel), `webhooks`; processor `kyc-webhook`; `src/dto/kyc.dto.ts`; `docs/KYC.md`; specs + `test/kyc.e2e-spec.ts` |
 | **P5 — admin** | service `admin`; controller `admin`; `src/dto/admin.dto.ts`; specs + `test/admin.e2e-spec.ts` |
-| **P6 — ledger index** (docs/INDEXER.md) | `src/indexer/*` (pure: `events`, `splice`, `projection`), `src/util/ledger-values.ts`, `src/util/ledger-offset.interceptor.ts`; services `ledger-stream`, `indexer`, `markets`, `portfolio`; processor `ledger-indexer`; controllers `markets`, `ledger`, `portfolio`, `ledger-wallet`, `admin-ledger`; `src/dto/ledger.dto.ts`; 14 entities + migration `LedgerIndex`; `test/helpers/ledger-fixtures.ts`, `FakeLedgerStream`; specs + `test/ledger.e2e-spec.ts` |
+| **P6 — ledger index** (docs/INDEXER.md) | `src/indexer/*` (pure: `events`, `token-standard`, `splice`, `projection`), `src/util/ledger-values.ts`, `src/util/ledger-offset.interceptor.ts`; services `ledger-stream`, `indexer`, `markets`, `portfolio`; processor `ledger-indexer`; controllers `markets`, `ledger`, `portfolio`, `ledger-wallet`, `admin-ledger`; `src/dto/ledger.dto.ts`; 16 entities + migrations `LedgerIndex`, `Instruments`; `test/helpers/ledger-fixtures.ts`, `FakeLedgerStream`; specs + `test/ledger.e2e-spec.ts`, `test/token-standard.e2e-spec.ts` |
+| **P8 — tokens** (docs/TOKENS.md) | services `instruments`, `token-registry`, `token-app`, `treasury-transfer`, `token-operations`, `rewards`; processors `transfer-instruction-acceptor`, `rewards`; controllers `instruments`, `admin-instruments`, `rewards`, `admin-rewards`, `admin-tokens`; `src/dto/{instruments,rewards,tokens}.dto.ts`; entities `InstrumentEntity`, `WalletCreditEntity`, `LedgerHoldingEntity`, `LedgerTransferInstructionEntity`, `RewardRuleEntity`, `RewardGrantEntity`; `FakeTokenRegistry`, `FakeTokenApp`; specs + `test/{token-standard,instruments,rewards,admin-tokens}.e2e-spec.ts` |
 | **P7 — market catalog, candles, quotes / orders, exchange** (docs/MARKETS.md) | `src/amm/*` (pure: `pm-amm` port of PmAmmMath, `market-state`), `src/indexer/candles.ts`; services `catalog`, `candles`, `quote`, `exchange`, `market-operator`; controllers `catalog`, `orders`, `exchange`, `admin-catalog` (+ `markets` gains candlesticks / quote and id-or-ticker params); `src/dto/catalog.dto.ts`, `src/dto/orders.dto.ts`; entities `SeriesEntity` (to_series), `CatalogEventEntity` (to_events), `MarketCandleEntity` (to_market_candles) + the catalog / open-interest columns on `MarketEntity`; migration `MarketCatalog`; fixtures carry the four identity fields and `at:`; specs + `test/{catalog,candles,orders}.e2e-spec.ts` |
 
 Nobody edits another package's files. Barrels are written once by F and not touched again
@@ -48,6 +49,12 @@ src/services/kyc.service.ts                 KycService                   (P4)
 src/services/kyc-provider-mock.service.ts   KycProviderMockService       (P4)
 src/services/kyc-provider-sumsub.service.ts KycProviderSumsubService     (P4)
 src/services/admin.service.ts               AdminService                 (P5)
+src/services/instruments.service.ts         InstrumentsService           (P8)
+src/services/token-registry.service.ts      TokenRegistryService         (P8)  CIP-56 registry client per instrument
+src/services/token-app.service.ts           TokenAppService              (P8)  Cantor8 token-app (mint / burn)
+src/services/treasury-transfer.service.ts   TreasuryTransferService      (P8)  wallet / registry transfers out of the treasury, instrument setup, indexedBalances
+src/services/token-operations.service.ts    TokenOperationsService       (P8)  operator mint / burn through token-app, mint-and-credit, GET /admin/tokens/status
+src/services/rewards.service.ts             RewardsService               (P8)  rules, grants, the float rule, the scan the RewardsProcessor drives
 
 src/controllers/app.controller.ts           AppController
 src/controllers/auth.controller.ts          AuthController               (P1)  @Controller("auth")
@@ -59,11 +66,17 @@ src/controllers/kyc.controller.ts           KycController                (P4)  @
 src/controllers/kyc-mock.controller.ts      KycMockController            (P4)  @Controller("kyc/mock") — NOT exported from the barrel; app.module registers it only when config.kycProvider === "mock"
 src/controllers/webhooks.controller.ts      WebhooksController           (P4)  @Controller("webhooks")
 src/controllers/admin.controller.ts         AdminController              (P5)  @Controller("admin")
+src/controllers/rewards.controller.ts       RewardsController            (P8)  @Controller("me/rewards")  GET /
+src/controllers/admin-rewards.controller.ts AdminRewardsController       (P8)  @Controller("admin/rewards")  rules, rules/:id, grant, grants, float
+src/controllers/admin-tokens.controller.ts  AdminTokensController        (P8)  @Controller("admin/tokens")  mint, burn, status
 
 src/processors/session-cleanup.processor.ts    SessionCleanupProcessor   (F)
 src/processors/deposit-confirm.processor.ts    DepositConfirmProcessor   (P2)
 src/processors/payout-settlement.processor.ts  PayoutSettlementProcessor (P3)
 src/processors/kyc-webhook.processor.ts        KycWebhookProcessor       (P4)
+src/processors/ledger-indexer.processor.ts     LedgerIndexerProcessor    (P6)
+src/processors/transfer-instruction-acceptor.processor.ts  TransferInstructionAcceptorProcessor (P8)
+src/processors/rewards.processor.ts            RewardsProcessor          (P8)  REWARDS_SCAN_MS, lock:rewards → RewardsService.scan()
 
 src/entities/*.entity.ts  UserEntity (to_users), AuthIdentityEntity (to_auth_identities), WalletEntity (to_wallets),
   SessionEntity (to_sessions), KycVerificationEntity (to_kyc_verifications), KycPersonEntity (to_kyc_persons),
@@ -82,7 +95,8 @@ src/auth/csrf.guard.ts      CsrfGuard (global, ARCHITECTURE §6.7): non-GET → 
                             x-requested-with: truthoracle); exempt: @Public routes under /webhooks, bearer-authenticated requests
 src/auth/decorators.ts      @Public(), @CurrentUser(), @CurrentSession(), @ClientIp(), @RequestHost()
 src/auth/request.ts         AuthedRequest type; clientIpOf(req, config); requestHostOf(req, config)   (proxy-secret rules §4.1)
-src/util/money.ts           parseCC(input: string | number): bigint; formatCC(units: bigint): string /*10 dp*/; DUST; addCC/subCC/cmpCC; round10FromNumber
+src/util/money.ts           parseAmount(input: string | number): bigint; formatAmount(units: bigint): string /*10 dp*/; DUST; addAmount/subAmount/cmpAmount/absAmount/sumAmount;
+                            quantizeDown(amount, decimals): bigint (toward zero, still 1e-10 units); formatAmountWithDecimals(amount, decimals): string (display / token-app form)
 src/util/canton-crypto.ts   decodeFixedWidth(value, bytes): Buffer | null; partyFingerprintFromPublicKey(raw: Buffer): string;
                             isValidPartyId(id): boolean; partyNamespace(id): string; publicKeyMatchesParty(pubKey, partyId): boolean;
                             verifyPartySignature({ message, signature, publicKey }): { ok: true; form } | { ok: false; reason }; describeAttempt(...)
@@ -93,7 +107,9 @@ src/util/errors.ts          ApiError(status, code, message, details?) ; AllExcep
 src/util/request-id.ts      requestIdMiddleware
 src/util/time.ts            nowMs(), isoNow()
 src/types.ts                ErrorCode union, KYC_PROVIDER token (Symbol), KycProvider + KycEvent + ApplicantSummary interfaces,
-                            LedgerWallet, PendingPayoutRecord, TransferRow, NatsSubjects const, AuditAction union, Money = bigint alias
+                            InstrumentId / InstrumentRef (+ instrumentKey, sameInstrument, parseInstrumentKey), LedgerWallet, PendingPayoutRecord,
+                            LedgerTransferRecord, LedgerHoldingRecord, LedgerTransferInstructionRecord, registry / token-app / treasury-transfer shapes,
+                            reward rule + grant shapes, NatsSubjects const, AuditAction union, Money = bigint alias (docs/TOKENS.md §4)
 src/dto/common.dto.ts       PageQueryDto { page?: number }
 ```
 
@@ -108,13 +124,16 @@ src/dto/common.dto.ts       PageQueryDto { page?: number }
 `telegramOidcClientId`, `telegramOidcClientSecret`, `telegramOidcIssuer`,
 `adminOperators (Map<partyId, pinnedPublicKey | "">)`,
 `ledgerApiUrl`, `enterpriseWalletUrl`, `treasuryPartyId`, `enterpriseWalletAppName`,
-`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v15 — `UserWallet.depositRefs` and the market identity fields are mandatory, no feature flag),
+`truthoraclePackageId`, `truthoraclePackageName` (truthoracle-v17 — `UserWallet.instrument` / `creditRefs`, `PredictionMarket.collateral` and the market identity fields are mandatory, no feature flag),
 `keycloak: { url, realm, clientId, clientSecret }`, `ledgerKeycloak`, `walletKeycloak` (same shape, optional overrides),
 `zkpc: { ledgerApiUrl, keycloakUrl, keycloakRealm, clientId, clientSecret }`,
 `kycProvider ('mock'|'sumsub')`, `kycEnforceWithdrawals` (plain flag), `kycRequiredLevel`, `kycFingerprintPepper`, `kycPepperRotationAck`,
 `payoutExternalReasons (string[])`, `payoutInappReasons (string[])`, `payoutMaxAttempts`, `payoutScanMs`, `payoutResendGraceMs`,
 `sumsub: { baseUrl, appToken, secretKey, webhookSecret, duplicateLabels: string[], allowSha1 }`,
-`sessionCleanupMs`, `ledgerCacheMs`, `depositLockTtlMs`, `depositConfirmGraceMs`, `sentryDsn`, `swaggerEnabled (resolved)`.
+`sessionCleanupMs`, `ledgerCacheMs`, `depositLockTtlMs`, `depositConfirmGraceMs`, `sentryDsn`, `swaggerEnabled (resolved)`,
+`collateralInstrument` / `rewardsInstrument: InstrumentConfig { admin, id, symbol, name, decimals, registryUrl, registryAuth, walletInstrumentId }` (+ `hasCollateralInstrument`, `hasRewardsInstrument`),
+`auditObserverParties (string[])`, `treasuryTransferMode ('wallet'|'registry')`, `treasuryTransferTtlSec`, `ledgerFreshOffsets`, `acceptorScanMs`, `registryKeycloak`,
+`tokenApp: { url, appName, keycloak }` (+ `hasTokenApp`), `rewardsEnabled`, `rewardsScanMs`, `rewardsAutoMint`, `rewardsMintMin (bigint)` — docs/TOKENS.md §4.7.
 
 ## Service signatures other packages rely on
 
@@ -132,22 +151,80 @@ publish(subject: NatsSubject, payload: object, opts?: { msgId?: string }): Promi
 consume(durable: string, filterSubject: string, handler: (msg: { subject; data: unknown; ack(); nak(delayMs?); term() }) => Promise<void>): Promise<void>  // starts a background loop; idempotent per durable
 
 // KeycloakTokenService
-bearerFor(target: "ledger" | "wallet"): Promise<string>       // throws ApiError(502, "upstream_failed") when unmintable
+bearerFor(target: "ledger" | "wallet" | "registry" | "tokenApp"): Promise<string>   // throws ApiError(502, "upstream_failed") when unmintable; registry = REGISTRY_KEYCLOAK_*, tokenApp = TOKEN_APP_KEYCLOAK_*, each field falling back to KEYCLOAK_*
+isConfigured(target): boolean · credentialsFor(target): KeycloakConfig | null
 
-// LedgerClientService (reads as the treasury party; package-name filters)
-fetchUserWallet(ownerParty: string): Promise<LedgerWallet | null>     // { contractId, owner, balanceCC: bigint, depositedCC: bigint, withdrawnCC: bigint, depositRefs: string[] }
-                                                                      // a payload without depositRefs (wrong package) → ApiError(502, "upstream_failed"), never []
+// LedgerClientService (reads as the treasury party; package-name filters; docs/TOKENS.md §4.3)
+fetchUserWallet(ownerParty: string, instrument: InstrumentId): Promise<LedgerWallet | null>   // { contractId, owner, instrument, balance, deposited, withdrawn: bigint, creditRefs: string[], auditObservers }
+                                                                      // a payload without creditRefs or instrument (wrong package) → ApiError(502, "upstream_failed"), never [] / a default token
+fetchUserWallets(ownerParty): Promise<LedgerWallet[]>                 // every instrument
 fetchAllUserWallets(): Promise<LedgerWallet[]>
-fetchPendingPayouts(): Promise<PendingPayoutRecord[]>                 // { contractId, user, marketId, amountCC: bigint, reason, createdAt }
+fetchPendingPayouts(): Promise<PendingPayoutRecord[]>                 // { contractId, user, marketId, instrument, amount: bigint, reason, createdAt, auditObservers }
 fetchPendingPayout(cid: string): Promise<PendingPayoutRecord | null>
+walletCreateCommandId(owner, instrument): string                      // wallet-create-<sha256(packageName|owner|admin|id)[:40]>
 templateId(entity: string): string
+// pure: userWalletCreateCommand({ templateId, admin, owner, instrument, auditObservers }), parseCreditRefs(value), parseInstrumentId(value)
 
-// EnterpriseWalletService
-transferHistory(partyId: string, opts?: { uncached?: boolean }): Promise<TransferRow[]>   // paged GET /api/v1/history/{party} (wallet v0.1.35+; a 404 is upstream_failed); Redis cache config.ledgerCacheMs unless uncached
-totalReceivedFrom(rows: TransferRow[], partyId: string, counterparty: string): bigint      // fixed point; settled Amulet inbound only
-transferStatus(partyId, commandId): Promise<{ known: boolean; submitted: boolean; status: string | null }>   // known=false means the read failed → callers fail closed
+// InstrumentsService (docs/TOKENS.md §4.1)
+syncFromConfig(): Promise<void>                                       // boot upsert of the env instruments (onApplicationBootstrap, after the migrations)
+list({ includeDisabled? }) · get(admin, id) · require(admin, id) /*404*/ · defaultCollateral() · requireDefaultCollateral() /*503 not_ready*/
+requireCollateral(ref?) /*400 validation_failed unless an enabled collateral instrument*/ · requireEnabled(ref) /*404 instrument_unknown, 409 instrument_disabled*/ · rewardsInstrument()
+refOf(instrument: InstrumentId): InstrumentRef                        // synchronous, from a 10 s snapshot; unknown → { symbol: id, name: id, decimals: 10 }
+toRef(row) · toApi(row) · toAdminApi(row) · transferModeOf(row) · create(input, actor, reason?) · update(admin, id, patch, actor, reason?)
+ensureKnown(ref, kind = "collateral"): Promise<boolean>               // the indexer's hook: register an unknown instrument as disabled, symbol = id
+
+// EnterpriseWalletService (no history read: deposits come from to_ledger_transfers, docs/TOKENS.md decision 5)
+transferStatus(partyId, commandId): Promise<{ known: boolean; submitted: boolean; status: string | null }>   // the TRANSFER index; known=false means the read failed → callers fail closed
+commandStatus(partyId, commandId): Promise<{ known; submitted; status }>                                   // the COMMAND index (external submits); a 404 is UNKNOWN, not "never happened"
 externalSubmit(args: { commandId; commands: unknown[]; disclosedContracts?: unknown[] }): Promise<{ commandId; status }>   // partyId = treasury, appName from config
-transfer(args: { to; amountCC: bigint; reason; commandId; metadata?: Record<string,string> }): Promise<{ commandId; status }>   // from = treasury
+transfer(args: { to; instrumentId; amount: bigint; reason; commandId; metadata?: Record<string,string> }): Promise<{ commandId; status }>   // from = treasury; instrumentId = to_instruments.wallet_instrument_id; amount already quantised
+
+// TokenRegistryService (docs/TOKENS.md §4.4; per instrument's registry_url / registry_auth)
+isConfigured(instrument): boolean · info(instrument) · instrument(instrument)
+transferFactory(instrument, choiceArguments): Promise<{ factoryId; transferKind; choiceContext: { choiceContextData; disclosedContracts } }>   // 503 not_ready without a registry URL, 502 upstream_failed
+acceptContext(instrument, cid) · rejectContext(instrument, cid) · withdrawContext(instrument, cid): Promise<RegistryChoiceContext>
+// pure: parseChoiceContext(value, symbol)
+
+// TokenAppService (docs/TOKENS.md §4.4; TOKEN_APP_URL blank → every call 503 token_app_unconfigured, status() reports it)
+mint(req) · burn(req): Promise<{ commandId; status; raw }>          // req = { commandId; instrumentId; partyId; amount: bigint; decimals } — the amount leaves in the instrument's decimals
+mintBatch(req) · burnBatch(req): Promise<{ …; entryCount }> · status(): Promise<TokenAppStatus> · holdings({ partyId?, instrumentId? }) · mints() · burns()
+// pure: tokenAppCommandBody(req, appName), tokenAppBatchBody(req, appName)
+
+// TreasuryTransferService (docs/TOKENS.md §2 decision 6, §4.4)
+transfer({ instrument, to, amount, commandId, reason, metadata? }): Promise<{ commandId; mode: "wallet" | "registry"; status }>   // 404 instrument_unknown / 409 instrument_disabled / 409 insufficient_treasury_holdings
+status(mode, commandId): Promise<TransferStatusResult>             // transferStatus for wallet, commandStatus for registry
+modeFor(instrument) · treasuryHoldings(instrument): Promise<LedgerHoldingEntity[]>
+indexedBalances(instrument): Promise<{ treasuryHoldings: bigint; liabilities: bigint }>   // Σ active treasury holdings vs Σ active UserWallet.balance in the instrument, from the index (float rule, /admin/tokens/status)
+setup(instrument, { autoAccept?, mintDelegation? }, actor, reason?): Promise<ApiInstrumentSetupResult>   // the token's factory choices for the treasury, audited token.setup
+// pure: selectHoldings(holdings, amount, now) (largest unlocked first; null when short), isSpendable, transferFactoryArgument(input), transferFactoryCommand(factoryId, arg), transferMeta, damlTime, setupCommandId
+
+// TransferInstructionAcceptorProcessor (ACCEPTOR_SCAN_MS; lock:transfer-acceptor)
+tick(): Promise<{ accepted; skipped; failed } | null> · scan() · reset() /* tests */
+// pure: acceptorDecision(row, instrument | null, treasury, now), acceptCommandId(cid), acceptCommand(cid, context)
+
+// DepositService additions (docs/TOKENS.md §4.7)
+ensureUserWallet(owner, instrument): Promise<LedgerWallet>            // public: the one wallet-creation primitive (deterministic id), shared with the rewards grant and the mint credit
+creditMint({ userId, instrument, amount, mintCommandId, actor }): Promise<{ commandId; txRef; status: "confirmed" | "submitted" }>   // UserWallet.Deposit { txRef: mint:<mintCommandId> } through the write-ahead row; idempotent per mint; 409 deposit_in_progress
+// pure: mintCreditCommandId(mintCommandId) = mint-credit-<sha256[:40]>, mintCreditTxRef(mintCommandId) = mint:<mintCommandId>
+
+// TokenOperationsService (docs/TOKENS.md §4.7)
+mint({ instrument, amount, to?, creditUserId?, reason }, actor): Promise<ApiTokenMintResult>   // 404 instrument_unknown / 409 instrument_disabled / 503 token_app_unconfigured / 400 validation_failed (finer than decimals, creditUserId with a party target); audited token.mint
+burn({ instrument, amount, party, reason }, actor): Promise<ApiTokenMintResult>               // 404 not_found; disabled instruments allowed; audited token.burn
+status(): Promise<ApiTokenStatus>                                                             // token-app status + indexedBalances per registered instrument
+// pure: tokenCommandId("mint" | "burn")
+
+// RewardsService (docs/TOKENS.md §4.6; onApplicationBootstrap → seedRules)
+seedRules(): Promise<void>                                            // the three automatic rules with REWARD_RULE_DEFAULTS, enabled iff appEnv === "dev"; ON CONFLICT (kind) DO NOTHING
+listRules() · updateRule(id, { params?, enabled? }, actor, reason) /*404; validateRuleParams per kind; audited reward.rule_updated*/ · toApiRule(row)
+requireInstrument() /*503 not_ready*/ · grantManual({ userId? | party?, amount, reason }, actor) /*queued; audited reward.grant_requested*/
+listGrants({ status?, userId?, page, limit }) · toApiGrant(row) · overview(userId): Promise<ApiRewardsOverview> /*404 without a rewards instrument*/ · float(): Promise<ApiRewardsFloat>
+scan(): Promise<RewardsScanResult>                                    // derive (cursor over to_wallet_entries / to_market_events) → submit queued + blocked_float under the float rule (requireFresh) → confirm submitted on creditRefs
+// pure: validateRuleParams(kind, params), parseRewardsCursor / formatRewardsCursor, grantRef(id), grantCommandId(id, attempt), grantAttemptOf(commandId), autoMintCommandId(id),
+//       scaledReward(amount, rate, decimals), floatHeadroom / floatShortfall(state, amount), autoMintAmount(shortfall, min, decimals),
+//       evaluateMarketEvent(event, market, rules, collateral, decimals), evaluateWalletEntry(entry, rules, collateral, decimals), grantCommand(templateId, wallet, grant)
+
+// RewardsProcessor (REWARDS_SCAN_MS while REWARDS_ENABLED and a rewards instrument is configured; lock:rewards)
+tick(): Promise<RewardsScanResult | null>
 
 // AuditService
 record(input: { actorType: 'user'|'admin'|'system'; actorUserId?: string|null; actorSessionId?: string|null; action: AuditAction;
@@ -198,15 +275,20 @@ link(userId, verified: { partyId; publicKeyBase64; kind }, opts: { label?; actor
    // the party → first-account binding is the unique to_wallets.party_id alone → 409 wallet_already_linked
 findByParty(partyId): Promise<WalletEntity | null>            // active OR revoked
 listForUser(userId): Promise<WalletEntity[]>; unlink(userId, walletId, actor): Promise<void>; setPrimary(userId, walletId, actor): Promise<WalletEntity>
-toApi(wallet, extras?: { ownLedgerWallet?: LedgerWallet|null; receivedCC?: bigint }): ApiWallet
+toApi(wallet, extras?: { credits?: WalletCreditEntity[]; ownLedgerWallets?: LedgerWallet[]; received?: Map<instrumentKey, bigint> }): ApiWallet
+toApiMany(rows, primaryPartyId): Promise<ApiWallet[]>   // credits + own ledger wallets in two batch reads
+toApiWithCredits(wallet): Promise<ApiWallet>            // link / primary responses: credits only, no ledger read
+creditsFor(walletIds): Promise<Map<walletId, WalletCreditEntity[]>> · creditOf(walletId, instrument): Promise<bigint>
 
 // DepositService (P2)
-reconcile(userId, actor): Promise<ReconcileResult>; confirmPending(userId?): Promise<{ confirmed: number; failed: number }>; overview(userId): Promise<InAppWalletOverview>
-planCredit({ wallets: { id; partyId; creditedCC; receivedCC }[]; primaryPartyId; ledgerDepositedCC }): CreditPlan   // pure: owed = received − credited; expected = Σ credited; |delta| > DUST → drift (over_credit | ledger_below_expected | ledger_above_expected)
-// confirm rule: UserWallet.depositRefs contains row.txRef (the only rule; depositedCC is never consulted)
+reconcile(userId, actor, instrument?: InstrumentId): Promise<ReconcileResult>   // one instrument per call (default the default collateral)
+confirmPending(userId?): Promise<{ confirmed: number; failed: number }>; overview(userId): Promise<InAppWalletOverview>   // one `balances` row per instrument
+planCredit({ wallets: { id; partyId; credited; received }[]; primaryPartyId; ledgerDeposited }): CreditPlan   // pure, per instrument: owed = received − credited; expected = Σ credited; |delta| > DUST → drift (over_credit | ledger_below_expected | ledger_above_expected)
+// confirm rule: UserWallet.creditRefs contains row.txRef (the only rule; deposited is never consulted)
 
 // PayoutService (P3)
 settle(cid: string, actor: { type: 'user'|'admin'|'system'; userId?: string; sessionId?: string; force?: boolean; reason?: string }): Promise<{ payout: PayoutEntity; mode: 'external'|'in_app'|'already_settled' }>
+   // external: amount quantised down to the instrument's decimals (dust → to_payouts.details.dust), EW transfer with the instrument's wallet id; in-app: the payee's wallet in the payout's instrument
 listForUser(userId): Promise<PayoutEntity[]>; listAll(filter): Promise<PayoutEntity[]>; scan(): Promise<void>; requeueBlockedKyc(userId): Promise<number>; toApi(payout, onLedger: boolean): ApiPayout
 
 // KycService (P4)
@@ -221,21 +303,29 @@ lockedIdentityId(userId): Promise<string | null>   // used by IdentityService vi
 ## Ledger index seams (P6)
 
 ```ts
-// LedgerStreamService (reads as config.indexerParty; nothing cached)
+// LedgerStreamService (reads as config.indexerParty; nothing cached; /v2/updates only — the trees endpoint is gone from Canton 3.6)
 ledgerEnd(): Promise<number>; prunedOffset(): Promise<number>
-fetchUpdates({ beginExclusive, endInclusive, limit }): Promise<LedgerTransaction[]>   // throws with PARTICIPANT_PRUNED_DATA_ACCESSED in the message when pruned
-fetchActiveContracts(activeAtOffset): Promise<ActiveContractEntry[]>                   // throws when the page fills INDEXER_ACS_LIMIT
+fetchUpdates({ beginExclusive, endInclusive, limit }): Promise<LedgerTransaction[]>   // wildcard + HoldingV1.Holding + TransferInstructionV1.TransferInstruction interface filters (views included); throws with PARTICIPANT_PRUNED_DATA_ACCESSED in the message when pruned
+fetchActiveContracts(activeAtOffset): Promise<ActiveContractEntry[]>                   // same filter; throws when the page fills INDEXER_ACS_LIMIT
 
 // IndexerService
 runOnce(): Promise<{ applied; seen; caughtUp; bootstrapped; resynced }>   // bootstrap if needed, one page, each tx atomically with the cursor
-applyTransaction(tx): Promise<boolean>                                     // false = replay; publishes the NATS fan-out after commit
+applyTransaction(tx): Promise<boolean>                                     // false = replay; publishes the NATS fan-out after commit (incl. transfer.seen, transfer.instruction_accepted)
 resync(fromOffset, reason) · resyncNow(reason) · status(): Promise<ApiLedgerStatus> · currentOffset() · waitForOffset(offset, timeoutMs)
+freshness(): Promise<{ offset; ledgerEnd; lag; maxLag; fresh }> · requireFresh()   // 503 ledger_stale unless offset ≥ ledgerEnd − LEDGER_FRESH_OFFSETS (ledger end read live); pure: freshnessOf(offset, end, maxLag)
 
 // LedgerProjection (src/indexer/projection.ts, pure over an EntityManager)
 applyTransaction(manager, tx): Promise<{ applied; summary }>; applyActiveContracts(manager, entries, atOffset, "bootstrap" | "resync")
+//   summary.transfers (any instrument), summary.instructionsAccepted, summary.instrumentsSeen (→ InstrumentsService.ensureKnown)
+
+// src/indexer/token-standard.ts (pure; docs/TOKENS.md §4.2)
+HOLDING_INTERFACE · TRANSFER_INSTRUCTION_INTERFACE · TRANSFER_FACTORY_INTERFACE · interfaceFilterId(iface) · isInterface(id, iface)
+holdingViewOf(created) · transferInstructionViewOf(created) · transferRecordOf(value)
+extractTokenStandard(tx, treasury, { holdings, instructions }): { transfers; holdingsCreated; holdingsConsumed; instructionsCreated; instructionOutcomes; claimedNodeIds; unattributed }
+// src/indexer/splice.ts — extractTreasuryTransfers(tx, treasury, splicePackage, claimed?) skips the claimed node ids
 
 // MarketsService — find(idOrTicker) · resolve(idOrTicker) (404) · list (+ event / series / tickers filters) · get · toApiMany(rows, withBlob, manager?) · extrasFor(rows) / extrasOf(market)
-//   (seriesTicker through the event, previousPrice / volume24h from the hourly candles) · toApi(m, withBlob, extras?) (+ openInterest, liquidityCC, book) · toSummary · …
+//   (seriesTicker through the event, previousPrice / volume24h from the hourly candles) · toApi(m, withBlob, extras?) (+ openInterest, liquidity, book) · toSummary · …
 // PortfolioService — partiesOf(user) (primary + active linked wallets), positions/liquidity/trades/activity/walletHistory/indexedWallet/transfers/ledgerPayouts
 ```
 
@@ -243,17 +333,17 @@ applyTransaction(manager, tx): Promise<{ applied; summary }>; applyActiveContrac
 
 ```ts
 // src/amm/pm-amm.ts (pure, doubles — the PmAmmMath port)
-quoteBuy(state, side, collateralCC, nowSec) · quoteSell(state, side, sharesIn, nowSec) · quoteSwap(state, fromSide, sharesIn, nowSec)
-quoteProvideLiquidity(state, valueIncreaseCC, nowSec) · impliedQuoteBook(state, nowSec, sizeCC) · marketEffectiveL · poolValue · optimalReserves · …
+quoteBuy(state, side, amount, nowSec) · quoteSell(state, side, sharesIn, nowSec) · quoteSwap(state, fromSide, sharesIn, nowSec)
+quoteProvideLiquidity(state, valueIncrease, nowSec) · impliedQuoteBook(state, nowSec, size) · marketEffectiveL · poolValue · optimalReserves · …
 // src/amm/market-state.ts
 ammStateOf(marketRow): AmmMarketState · decimalToNumber(bigint) · numberToDecimal(number)
 
 // src/indexer/candles.ts (pure)
 candleUpsert(contribution, periodSecs): { sql, params } · periodStartSec(sec, period) · CANDLE_TRADE_CHOICES · OPEN_INTEREST_RECOMPUTE_SQL
 
-// CatalogService
-listSeries(q) · getSeries(ticker) → { series, events } · createSeries(input, actor, reason?) · updateSeries(ticker, patch, actor, reason?)
-listEvents(q { series?, status?, category?, q?, withNestedMarkets, includeArchived, page, limit }) · getEvent(ticker) (markets nested)
+// CatalogService (listings per instrument, docs/TOKENS.md §4.5: `instrument?` = the query's pair, else the default collateral)
+listingInstrument(requested?): Promise<InstrumentRef | null> · listSeries(q { …, instrument? }) · getSeries(ticker, instrument?) → { series, events } · createSeries(input, actor, reason?) · updateSeries(ticker, patch, actor, reason?)
+listEvents(q { series?, status?, category?, q?, sort?, instrument?, withNestedMarkets, includeArchived, page, limit }) · getEvent(ticker) (markets nested)
 createEvent(input, actor, reason?) · updateEvent(ticker, patch, actor, reason?)
 deriveEventStatus(phases): EventStatus · normalizeTicker(raw)   // exported pure helpers
 
@@ -261,8 +351,8 @@ deriveEventStatus(phases): EventStatus · normalizeTicker(raw)   // exported pur
 candlesticks(idOrTicker, { startTs?, endTs?, periodMinutes: 1 | 60 | 1440 }): Promise<ApiCandlesticks>   // dense; 400 over 5 000 candles
 
 // QuoteService
-quote(market, { action, side?, amountCC?, shares?, slippageBps? }, nowSec?): ApiQuote           // 409 market_not_tradable / quote_unavailable
-prepare(user, market, { action, side?, amountCC?, shares?, lpTokens?, slippageBps? }): Promise<ApiPreparedOrder>   // reads wallet / position / LP cids from the index; 409 reasons per docs/MARKETS.md §7
+quote(market, { action, side?, amount?, shares?, slippageBps? }, nowSec?): ApiQuote           // 409 market_not_tradable / quote_unavailable
+prepare(user, market, { action, side?, amount?, shares?, lpTokens?, slippageBps? }): Promise<ApiPreparedOrder>   // reads wallet / position / LP cids from the index; 409 reasons per docs/MARKETS.md §7
 assertTradable(market, action, phase, nowSec)                                                    // mirrors the Daml asserts
 
 // ExchangeService
@@ -270,6 +360,7 @@ status(): Promise<ApiExchangeStatus> · halt(): Promise<ApiExchangeHalt> · setH
 
 // MarketOperatorService
 createMarket(input, actor, reason?): Promise<ApiCreateMarketResult>   // MarketCounter.CreateMarket via EnterpriseWalletService.externalSubmit, commandId create-market-<sha256(ticker)[:40]>; sideLabel(raw, "Yes" | "No") defaults the labels
+   // input.collateral? → InstrumentsService.requireCollateral (default collateral); 409 catalog_conflict when the event already has another; an accepted submission pins to_events.collateral_*; auditObservers = AUDIT_OBSERVER_PARTIES ∪ input
 
 // src/indexer/projection.ts (identity, docs/MARKETS.md §2)
 marketIdentityOf(manager, marketId, payload) · ensureCatalogEvent(manager, marketId, eventTicker, market) · placeholderSeriesTickerOf(eventTicker)   // exported pure helper
@@ -282,10 +373,15 @@ Fixtures: `LedgerFixture.createMarket` / `marketPayload` accept `ticker`, `event
 exercise without applying it (the market reaches the index through `FakeLedgerStream`).
 
 Fixtures: `test/helpers/ledger-fixtures.ts` builds internally consistent transactions from the Daml
-choices (`createMarket`, `createWallet`, `deposit`, `withdraw`, `markPaid`, `buy`, `sell`,
-`resolveT0`, `redeem`, `spliceTransferIn/Out`, `acsEntry`); `FakeLedgerStream` (`test/helpers/fakes.ts`)
-replaces the participant (`push()`, `pruned`, `acs`, `failNext`, `calls`). `INDEXER_ENABLED=false`
-under test — specs call `IndexerService.runOnce()` themselves.
+choices (`createMarket`, `createWallet`, `deposit`, `grant`, `withdraw`, `markPaid`, `buy`, `sell`,
+`resolveT0`, `redeem`, `spliceTransferIn/Out`, `acsEntry`) and from the token standard
+(`holding`, `tokenTransferIn/Out`, `tokenOfferIn`, `acceptInstruction`, `endInstruction`,
+`amuletTokenStandardTransferIn`, `holdingAcsEntry`; `created()` takes `interfaceViews`,
+`exercised()` an `interfaceId`; Amulets carry their `Holding` view). `FakeLedgerStream`
+(`test/helpers/fakes.ts`) replaces the participant (`push()`, `pruned`, `acs`, `end`, `failNext`,
+`calls`). `INDEXER_ENABLED=false` under test — specs call `IndexerService.runOnce()` themselves;
+a deposit is seeded by pushing a transfer's transaction and indexing it (the index is the only
+deposit source).
 
 ## Test helpers (F)
 
@@ -296,10 +392,13 @@ test/helpers/app.ts       createTestApp(overrides?): Promise<{ app: INestApplica
                           // real Redis (TEST_REDIS_URL, default redis://localhost:6379/1, FLUSHDB in beforeEach); FakeNatsService (records
                           // publishes; `dispatch(subject, payload)` invokes registered consumers); FakeLedgerClient (in-memory UserWallets /
                           // PendingPayouts; records every read in `reads` / `fetchUserWalletCalls()`; `failReads` makes every read throw) +
-                          // FakeEnterpriseWallet (transfer rows, applies treasury commands to the fake ledger, requires depositRefs on Create);
-                          // KYC provider = mock unless overridden
+                          // FakeEnterpriseWallet (records transfers and submits, applies TruthOracle commands to the fake ledger — other packages' exercises are recorded only —,
+                          // requires instrument / creditRefs / auditObservers on Create); FakeTokenRegistry (canned factory / choice contexts, `calls`, `failNext`);
+                          // FakeTokenApp (`ctx.tokenApp`: mints / burns recorded in `minted` / `burned`, `configured`, `reachable`, `failNext`; nothing reaches the index);
+                          // KYC provider = mock unless overridden. reset() re-seeds the env instruments and the reward rules and resets to_settings.rewards_cursor to '0';
+                          // REWARDS_ENABLED=false and INDEXER_ENABLED=false under test — specs drive RewardsService.scan() / RewardsProcessor.tick() and IndexerService.runOnce()
 test/helpers/wallet.ts    makeTestWallet(hint = "test"): { partyId; publicKeyBase64; publicKeyHex; sign(message: string): string /*base64*/ }  // Ed25519 keypair whose party id is hint::<fingerprint>
-test/helpers/fakes.ts     FakeNatsService, FakeLedgerClient, FakeEnterpriseWallet, FakeKycProvider (optional)
+test/helpers/fakes.ts     FakeNatsService, FakeLedgerClient, FakeEnterpriseWallet, FakeLedgerStream, FakeTokenRegistry, FakeTokenApp, FakeKycProvider (optional)
 test/helpers/session.ts   signInWithWallet(agent, wallet, purpose?): Promise<{ user; cookie: string }>   // runs the real challenge/verify flow
 ```
 
@@ -308,7 +407,7 @@ test/helpers/session.ts   signInWithWallet(agent, wallet, purpose?): Promise<{ u
 - Every write that must be atomic uses `dataSource.transaction(async (manager) => …)`; services accept an
   optional `EntityManager` where another package needs to compose.
 - Money is `bigint` internally (`util/money.ts`), `numeric(38,10)` in Postgres (TypeORM `transformer`
-  `{ to: formatCC, from: parseCC }` on the column), strings with 10 decimals on the wire.
+  `{ to: formatAmount, from: parseAmount }` on the column), strings with 10 decimals on the wire.
 - Errors: `throw new ApiError(status, code, message, details?)`; codes only from `types.ts`.
 - Audit + NATS event on every state change; NATS payloads carry ids, never PII.
 - Logging: Nest `Logger` per class; never log tokens, signatures, secrets, applicant data.

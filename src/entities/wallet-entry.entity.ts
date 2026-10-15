@@ -6,8 +6,9 @@ import { moneyTransformer } from "../util/money";
 
 /**
  * One row per `UserWallet` choice (docs/INDEXER.md §5 `to_wallet_entries`): the in-app
- * statement — deposits credited by the treasury, trade debits / credits (with the market and
- * the choice they were part of), withdrawals queued to a PendingPayout.
+ * statement — deposits and reward grants credited by the treasury, trade debits / credits (with
+ * the market and the choice they were part of), withdrawals queued to a PendingPayout. Amounts
+ * are in the wallet's instrument.
  */
 @Entity({ name: "to_wallet_entries" })
 @Index("ix_to_wallet_entries_owner_offset", ["owner", "offset"])
@@ -31,17 +32,17 @@ export class WalletEntryEntity {
   @Column({ name: "new_wallet_cid", type: "text", nullable: true })
   newWalletCid!: string | null;
 
+  @Column({ name: "instrument_admin", type: "text" })
+  instrumentAdmin!: string;
+
+  @Column({ name: "instrument_id", type: "text" })
+  instrumentId!: string;
+
   @Column({ type: "text" })
   kind!: WalletEntryKind;
 
-  @Column({
-    name: "amount_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    transformer: moneyTransformer,
-  })
-  amountCC!: bigint;
+  @Column({ type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
+  amount!: bigint;
 
   @Column({ type: "text", nullable: true })
   reason!: string | null;

@@ -32,11 +32,17 @@ export const ERROR_CODES = [
   "challenge_purpose_mismatch",
   "no_primary_wallet",
   "primary_wallet_in_use",
-  // money
+  // money (docs/TOKENS.md §4.3–§4.6)
   "deposit_in_progress",
   "deposit_attribution_drift",
   "payout_not_found",
   "payout_blocked",
+  "ledger_stale",
+  "insufficient_treasury_holdings",
+  "token_app_unconfigured",
+  "instrument_unknown",
+  "instrument_disabled",
+  "instrument_exists",
   // kyc
   "kyc_required",
   "kyc_duplicate_identity",
@@ -84,11 +90,68 @@ export interface KycLockLookup {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Money
+// Money and instruments (docs/TOKENS.md §0, §2, §4.1)
 // ---------------------------------------------------------------------------------------------
 
-/** CC in 1e-10 units (10 decimals) — see util/money.ts. */
+/**
+ * An amount of SOME instrument in 1e-10 units (the Daml `Decimal` scale) — see util/money.ts.
+ * Never meaningful on its own: every Money value travels next to the `InstrumentId` /
+ * `InstrumentRef` it is denominated in (`market.collateral`, `wallet.instrument`,
+ * `payout.instrument`).
+ */
 export type Money = bigint;
+
+/**
+ * A CIP-56 instrument id, the same JSON shape as `Splice.Api.Token.HoldingV1.InstrumentId` and
+ * truthoracle-v17's `Truthoracle.InstrumentId`: `admin` is the registry party (cBYN: the transfer
+ * agent; Canton Coin: the DSO), `id` the token identifier (`cBYN`, `TRO`, `Amulet`). Compared field
+ * by field (`sameInstrument`), keyed as `<admin>:<id>` (`instrumentKey`).
+ */
+export interface InstrumentId {
+  admin: string;
+  id: string;
+}
+
+export const INSTRUMENT_KINDS = ["collateral", "rewards"] as const;
+export type InstrumentKind = (typeof INSTRUMENT_KINDS)[number];
+
+/** How the backend authenticates to an instrument's CIP-56 registry (docs/TOKENS.md §4.4). */
+export const REGISTRY_AUTHS = ["none", "ledger", "keycloak"] as const;
+export type RegistryAuth = (typeof REGISTRY_AUTHS)[number];
+
+/** How treasury outbound transfers of an instrument are sent (docs/TOKENS.md §2 decision 6). */
+export const TREASURY_TRANSFER_MODES = ["wallet", "registry"] as const;
+export type TreasuryTransferMode = (typeof TREASURY_TRANSFER_MODES)[number];
+
+/** The wire form every money-carrying object exposes next to its amounts. */
+export interface InstrumentRef extends InstrumentId {
+  symbol: string;
+  name: string;
+  /** Display and withdrawal quantisation only; storage and the wire stay at 10 dp. */
+  decimals: number;
+}
+
+/** `<admin>:<id>` — the lookup key of an instrument, also the `?instrument=` query form. */
+export function instrumentKey(ref: InstrumentId): string {
+  return `${ref.admin}:${ref.id}`;
+}
+
+export function sameInstrument(a: InstrumentId, b: InstrumentId): boolean {
+  return a.admin === b.admin && a.id === b.id;
+}
+
+/**
+ * `?instrument=<admin>:<id>` → `InstrumentId`, or null when malformed. A Canton party id carries
+ * exactly one `::`, so the LAST `:` separates the token id (`DSO::1220…:Amulet`).
+ */
+export function parseInstrumentKey(raw: string): InstrumentId | null {
+  const at = raw.lastIndexOf(":");
+  if (at <= 0 || at === raw.length - 1) return null;
+  const admin = raw.slice(0, at);
+  const id = raw.slice(at + 1);
+  if (!admin || !id || admin.endsWith(":")) return null;
+  return { admin, id };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Users / identities / sessions
@@ -213,22 +276,28 @@ export interface KycProvider {
     level: string,
   ): Promise<KycSessionResult>;
   /** null = signature / algorithm rejected. */
-  verifyWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): KycEvent | null;
+  verifyWebhook(
+    rawBody: Buffer,
+    headers: Record<string, string | string[] | undefined>,
+  ): KycEvent | null;
   fetchApplicant(applicantId: string): Promise<ApplicantSummary>;
 }
 
 // ---------------------------------------------------------------------------------------------
-// Ledger / wallet reads (§10)
+// Ledger / wallet reads (§10; docs/TOKENS.md §4.3)
 // ---------------------------------------------------------------------------------------------
 
+/** One `UserWallet` contract: a party holds one per instrument (truthoracle-v17). */
 export interface LedgerWallet {
   contractId: string;
   owner: string;
-  balanceCC: bigint;
-  depositedCC: bigint;
-  withdrawnCC: bigint;
-  /** `UserWallet.depositRefs : [Text]` — every txRef already credited; the confirm pass keys on it (§8.3). */
-  depositRefs: string[];
+  instrument: InstrumentId;
+  balance: bigint;
+  deposited: bigint;
+  withdrawn: bigint;
+  /** `UserWallet.creditRefs : [Text]` — every deposit txRef AND grant ref already applied, newest first; the confirm passes key on it (§8.3). */
+  creditRefs: string[];
+  auditObservers: string[];
 }
 
 export interface PendingPayoutRecord {
@@ -236,22 +305,171 @@ export interface PendingPayoutRecord {
   /** Field names mirror truthoracle-contracts (PendingPayout) — the payee is `user`. */
   user: string;
   marketId: string;
-  amountCC: bigint;
+  instrument: InstrumentId;
+  amount: bigint;
   reason: string;
   createdAt: Date | null;
+  auditObservers: string[];
 }
 
-/** One Enterprise Wallet history row (transfer payload; swaps carry no instrumentId). */
-export interface TransferRow {
-  instrumentId?: string;
-  status?: string;
-  direction?: string;
-  partyId?: string;
-  partyId2?: string;
-  amount?: string | number;
-  timestamp?: string;
-  commandId?: string;
-  [key: string]: unknown;
+/** How a `to_ledger_transfers` row was derived (docs/INDEXER.md §6). */
+export const TRANSFER_KINDS = ["token_standard", "amulet"] as const;
+export type TransferKind = (typeof TRANSFER_KINDS)[number];
+
+/**
+ * One transfer involving the treasury as the ledger index holds it (`to_ledger_transfers`) — the
+ * source of every deposit attribution and payout confirmation (docs/TOKENS.md §2 decision 5).
+ */
+export interface LedgerTransferRecord {
+  updateId: string;
+  nodeId: number;
+  offset: number;
+  direction: "in" | "out";
+  /** The other party: the sender for `in`, the receiver for `out`. */
+  counterparty: string;
+  instrument: InstrumentId;
+  amount: bigint;
+  kind: TransferKind;
+  choice: string;
+  recordTime: Date | null;
+  effectiveAt: Date;
+  details: Record<string, unknown>;
+}
+
+/** A token-standard `Holding` the treasury can see (`to_ledger_holdings`). */
+export interface LedgerHoldingRecord {
+  contractId: string;
+  owner: string;
+  instrument: InstrumentId;
+  amount: bigint;
+  locked: boolean;
+  lockExpiresAt: Date | null;
+  createdOffset: number;
+  archivedOffset: number | null;
+}
+
+export const TRANSFER_INSTRUCTION_STATUSES = ["pending", "completed", "failed"] as const;
+export type TransferInstructionStatus = (typeof TRANSFER_INSTRUCTION_STATUSES)[number];
+
+/** A two-step `TransferInstruction` offer the treasury sends or receives (`to_ledger_transfer_instructions`). */
+export interface LedgerTransferInstructionRecord {
+  contractId: string;
+  instrument: InstrumentId;
+  sender: string;
+  receiver: string;
+  amount: bigint;
+  executeBefore: Date | null;
+  status: TransferInstructionStatus;
+  createdOffset: number;
+  archivedOffset: number | null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Registry, token-app and treasury transfers (docs/TOKENS.md §4.4) — domain shapes the services share
+// ---------------------------------------------------------------------------------------------
+
+/** What a CIP-56 registry returns for `transferFactory` / `acceptContext` / `rejectContext` / `withdrawContext`. */
+export interface RegistryChoiceContext {
+  choiceContextData: Record<string, unknown>;
+  disclosedContracts: ApiDisclosedContract[];
+}
+
+export interface RegistryTransferFactory {
+  factoryId: string;
+  /** `self` (direct, lands at once) or `offer` (two-step `TransferInstruction`). */
+  transferKind: string;
+  choiceContext: RegistryChoiceContext;
+}
+
+/** `TreasuryTransferService.transfer` — the one way an instrument leaves the treasury. */
+export interface TreasuryTransferRequest {
+  instrument: InstrumentId;
+  to: string;
+  /** 1e-10 units, already quantised to the instrument's decimals by the caller. */
+  amount: bigint;
+  commandId: string;
+  reason: string;
+  metadata?: Record<string, string>;
+}
+
+export interface TreasuryTransferResult {
+  commandId: string;
+  mode: TreasuryTransferMode;
+  status: string;
+}
+
+/**
+ * Cantor8 token-app `POST /api/admin/mint|burn`: `amount` is in 1e-10 units and leaves as a
+ * decimal string in the instrument's own `decimals` (token-app validates the precision).
+ * `instrumentId` is the token id token-app knows (`to_instruments.id`).
+ */
+export interface TokenAppMintRequest {
+  commandId: string;
+  instrumentId: string;
+  partyId: string;
+  amount: bigint;
+  decimals: number;
+}
+export type TokenAppBurnRequest = TokenAppMintRequest;
+
+/** `POST /api/admin/mint-batch|burn-batch`: one instrument, several parties. */
+export interface TokenAppBatchRequest {
+  commandId: string;
+  instrumentId: string;
+  decimals: number;
+  entries: { partyId: string; amount: bigint }[];
+}
+
+export interface TokenAppCommandResult {
+  commandId: string;
+  status: string;
+  raw: Record<string, unknown>;
+}
+
+export interface TokenAppBatchResult extends TokenAppCommandResult {
+  entryCount: number;
+}
+
+/** `GET /data/admin/holdings` item (token-app's own monitor scan, not the ledger index). */
+export interface TokenAppHolding {
+  contractId: string;
+  partyId: string;
+  instrumentId: string;
+  /** Decimal string as token-app serves it. */
+  amount: string;
+  locked: boolean;
+}
+
+/** `GET /data/admin/mints|burns` item. */
+export interface TokenAppRecord {
+  commandId: string;
+  partyId: string;
+  instrumentId: string;
+  amount: string;
+  updateId: string;
+  createdAt: string;
+}
+
+export interface TokenAppStatus {
+  configured: boolean;
+  url: string | null;
+  appName: string;
+  reachable: boolean;
+  raw: Record<string, unknown> | null;
+}
+
+/** `POST /admin/instruments/:admin/:id/setup` (docs/TOKENS.md §4.4): what was exercised on the token's factory. */
+export interface ApiInstrumentSetupResult {
+  instrument: InstrumentRef;
+  /** The factory contract the registry named for a self-transfer, and its concrete template. */
+  factoryId: string;
+  factoryTemplateId: string;
+  actions: {
+    kind: "autoAccept" | "mintDelegation";
+    choice: string;
+    commandId: string;
+    status: string;
+  }[];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -291,8 +509,10 @@ export const NatsSubjects = {
   walletEntry: "truthoracle.wallet.entry",
   /** A PendingPayout was created or settled on-ledger: `{ contractId, change, offset }`. */
   ledgerPayoutChanged: "truthoracle.payout.ledger_changed",
-  /** A Canton Coin transfer involving the treasury landed: `{ updateId, direction, counterparty, offset }`. */
+  /** A token transfer involving the treasury landed: `{ updateId, nodeId, direction, counterparty, instrument: { admin, id }, kind, offset }`. */
   transferSeen: "truthoracle.transfer.seen",
+  /** A `TransferInstruction` addressed to the treasury was accepted: `{ contractId, instrument, offset }`. */
+  transferInstructionAccepted: "truthoracle.transfer.instruction_accepted",
   /** The indexer resynced from an ACS snapshot and lost the updates in between: `{ fromOffset, toOffset, reason }`. */
   indexerGap: "truthoracle.indexer.gap",
   // ── market catalog / exchange (docs/MARKETS.md) ──
@@ -300,8 +520,18 @@ export const NatsSubjects = {
   catalogChanged: "truthoracle.catalog.changed",
   /** The operator halted or resumed trading: `{ active, reason }`. */
   exchangeHaltChanged: "truthoracle.exchange.halt_changed",
-  /** An operator submitted a CreateMarket through the treasury: `{ commandId, ticker, eventTicker }`. */
+  /** An operator submitted a CreateMarket through the treasury: `{ commandId, ticker, eventTicker, collateral: { admin, id } }`. */
   marketCreateSubmitted: "truthoracle.market.create_submitted",
+  // ── instruments, tokens, rewards (docs/TOKENS.md §4.1, §4.6, §4.7) — ids and instrument ids only ──
+  /** An instrument row was created or changed: `{ admin, id, enabled }`. */
+  instrumentChanged: "truthoracle.instrument.changed",
+  /** A reward grant was credited on-ledger: `{ grantId, userId, party, kind, instrument, offset? }`. */
+  rewardGranted: "truthoracle.reward.granted",
+  /** A grant could not be submitted because the treasury's rewards float is short: `{ grantId, shortfall }`. */
+  rewardBlockedFloat: "truthoracle.reward.blocked_float",
+  /** Tokens were minted / burned through token-app: `{ commandId, instrument, partyId }`. */
+  tokenMinted: "truthoracle.token.minted",
+  tokenBurned: "truthoracle.token.burned",
 } as const;
 export type NatsSubject = `truthoracle.${string}`;
 
@@ -353,13 +583,45 @@ export type AuditAction =
   | "catalog.event_updated"
   | "catalog.market_metadata_updated"
   | "market.create_submitted"
-  | "exchange.halt_changed";
+  | "exchange.halt_changed"
+  // instruments, tokens, rewards (docs/TOKENS.md §4.1, §4.6, §4.7)
+  | "instrument.created"
+  | "instrument.updated"
+  | "token.mint"
+  | "token.burn"
+  | "token.setup"
+  | "reward.rule_updated"
+  | "reward.grant_requested"
+  | "reward.granted"
+  | "reward.failed"
+  | "reward.blocked_float";
 
 // ---------------------------------------------------------------------------------------------
-// Wire shapes (docs/API.md) — money is a 10-dp string, timestamps ISO-8601
+// Wire shapes (docs/API.md) — money is a 10-dp string next to its InstrumentRef, timestamps ISO-8601
 // ---------------------------------------------------------------------------------------------
 
 export type ApiMoney = string;
+
+/** `GET /exchange/instruments` item and the admin listing (docs/TOKENS.md §4.1). */
+export interface ApiInstrument extends InstrumentRef {
+  kind: InstrumentKind;
+  enabled: boolean;
+  isDefaultCollateral: boolean;
+  /** What the Cantor8 wallet SDK's `send({ instrumentId })` expects for this token (defaults to `id`). */
+  walletInstrumentId: string;
+}
+
+/** The operator's view adds the registry / transfer wiring (`GET|POST|PATCH /admin/instruments`). */
+export interface ApiAdminInstrument extends ApiInstrument {
+  registryUrl: string | null;
+  registryAuth: RegistryAuth;
+  /** null = the process default (`TREASURY_TRANSFER_MODE`). */
+  transferMode: TreasuryTransferMode | null;
+  /** Choice names the setup action exercises on the factory (`autoAccept`, `mintDelegation`). */
+  setupChoices: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface ApiUser {
   id: string;
@@ -386,12 +648,24 @@ export interface ApiIdentity {
   kycLocked: boolean;
 }
 
+/** One on-ledger `UserWallet` (a party holds one per instrument). */
 export interface ApiLedgerWallet {
   contractId: string;
   owner: string;
-  balanceCC: ApiMoney;
-  depositedCC: ApiMoney;
-  withdrawnCC: ApiMoney;
+  instrument: InstrumentRef;
+  balance: ApiMoney;
+  deposited: ApiMoney;
+  withdrawn: ApiMoney;
+  creditRefs: string[];
+}
+
+/** What the backend attributed to a linked wallet in one instrument (`to_wallet_credits`). */
+export interface ApiWalletCredit {
+  instrument: InstrumentRef;
+  /** In-app credits attributed to this wallet (the only attribution there is — §8.3). */
+  credited: ApiMoney;
+  /** Only in `GET /in-app-wallet`: what the index says this party sent the treasury in the instrument. */
+  received?: ApiMoney;
 }
 
 export interface ApiWallet {
@@ -403,9 +677,10 @@ export interface ApiWallet {
   isPrimary: boolean;
   status: WalletStatus;
   verifiedAt: string;
-  creditedCC: ApiMoney;
-  receivedCC?: ApiMoney;
-  ownLedgerWallet: ApiLedgerWallet | null;
+  /** One entry per instrument the wallet was ever credited in (empty until the first deposit). */
+  credits: ApiWalletCredit[];
+  /** A non-primary party's own on-ledger UserWallets (one per instrument), if any. */
+  ownLedgerWallets: ApiLedgerWallet[];
 }
 
 export interface ApiKycVerification {
@@ -471,7 +746,8 @@ export interface ApiPayout {
   pendingPayoutCid: string;
   payeeParty: string;
   walletId: string | null;
-  amountCC: ApiMoney;
+  instrument: InstrumentRef;
+  amount: ApiMoney;
   reason: string;
   status: PayoutStatus;
   retryAfterKyc: boolean;
@@ -533,32 +809,45 @@ export interface ApiChallenge {
   expiresAt: string;
 }
 
+/** `POST /in-app-wallet/deposits/reconcile` — one instrument per call (default: the default collateral). */
 export interface ReconcileResult {
+  instrument: InstrumentRef;
   credited: ApiMoney;
   status: "confirmed" | "submitted" | "nothing_outstanding";
   commandId?: string;
-  perWallet: { walletId: string; partyId: string; amountCC: ApiMoney }[];
+  perWallet: { walletId: string; partyId: string; amount: ApiMoney }[];
   ledger: ApiLedgerWallet | null;
 }
 
+/** `delta = ledgerDeposited − creditedTotal`; anything beyond DUST refuses the next reconcile in that instrument (§8.3). */
+export interface ApiDepositAttribution {
+  creditedTotal: ApiMoney;
+  ledgerDeposited: ApiMoney;
+  delta: ApiMoney;
+}
+
+/** The account's in-app position in one instrument: its UserWallet (null until the first credit) and the attribution behind it. */
+export interface ApiInAppBalance {
+  instrument: InstrumentRef;
+  ledger: ApiLedgerWallet | null;
+  attribution: ApiDepositAttribution;
+}
+
+/** `GET /in-app-wallet` (docs/TOKENS.md §4.3): one balance row per instrument the account holds a wallet in, plus the default collateral and the rewards instrument even before a wallet exists. */
 export interface InAppWalletOverview {
   partyId: string | null;
-  ledger: ApiLedgerWallet | null;
   wallets: ApiWallet[];
-  /** `delta = ledgerDepositedCC − creditedTotalCC`; anything beyond DUST refuses the next reconcile (§8.3). */
-  attribution: {
-    creditedTotalCC: ApiMoney;
-    ledgerDepositedCC: ApiMoney;
-    delta: ApiMoney;
-  };
+  balances: ApiInAppBalance[];
   pending: { submitted: number };
   payouts: ApiPayout[];
 }
 
 // ---------------------------------------------------------------------------------------------
 // Ledger index — wire shapes (docs/API.md "Markets", "Portfolio", "Ledger"; docs/INDEXER.md)
-// Daml `Decimal`s (prices, shares, CC) are 10-dp strings like Money; Daml `Int` epoch seconds are
-// ISO-8601 strings; durations stay integer seconds; parties are Canton party ids.
+// Daml `Decimal`s (prices, shares, amounts) are 10-dp strings like Money; Daml `Int` epoch seconds
+// are ISO-8601 strings; durations stay integer seconds; parties are Canton party ids. Every object
+// that carries an amount also carries the `InstrumentRef` it is in (`collateral` on a market,
+// `instrument` everywhere else).
 // ---------------------------------------------------------------------------------------------
 
 /** Daml `Decimal` on the wire — same 10-dp string as Money. */
@@ -595,7 +884,8 @@ export type MarketEventKind = (typeof MARKET_EVENT_KINDS)[number];
 /** The kinds that move shares — `GET /markets/:id/trades` and `GET /me/trades` filter on these. */
 export const TRADE_KINDS: readonly MarketEventKind[] = ["buy", "sell", "swap", "split", "merge"];
 
-export const WALLET_ENTRY_KINDS = ["deposit", "credit", "debit", "withdraw"] as const;
+/** One per `UserWallet` choice: Deposit, Grant (rewards / bonuses, docs/TOKENS.md §4.6), Credit, Debit, Withdraw. */
+export const WALLET_ENTRY_KINDS = ["deposit", "grant", "credit", "debit", "withdraw"] as const;
 export type WalletEntryKind = (typeof WALLET_ENTRY_KINDS)[number];
 
 export type LedgerPayoutSettledKind = "mark_paid" | "settle_to_wallet" | "cancelled" | "archived";
@@ -607,14 +897,15 @@ export interface ApiResolutionPolicy {
   reporters: string[];
   quorum: number;
   challengeSecs: number;
-  bondCC: ApiDecimal;
+  /** In the market's collateral. */
+  bond: ApiDecimal;
 }
 
 export interface ApiProposal {
   proposer: string;
   proposedOutcome: MarketOutcome;
   proposedAt: string;
-  bondCC: ApiDecimal;
+  bond: ApiDecimal;
   challenger: string | null;
   challengerOutcome: MarketOutcome | null;
   /** `proposedAt + policy.challengeSecs` */
@@ -636,6 +927,8 @@ export interface ApiMarket {
   /** Package-id template of the active version (what a disclosed contract names); null for rows indexed before MarketCatalog. */
   templateId: string | null;
   admin: string;
+  /** The instrument every amount below is denominated in: shares cost ≤ 1 unit and pay 1 unit (docs/TOKENS.md §2). Fixed at creation. */
+  collateral: InstrumentRef;
   question: string;
   /** The market's own image when the operator set one (`metadata`), else its event's, else "". Backend-owned, never on the contract (docs/MARKETS.md §1). */
   imageUrl: string;
@@ -661,9 +954,9 @@ export interface ApiMarket {
   currentPrice: ApiDecimal;
   feeBps: number;
   prizeFeeShareBps: number;
-  accumulatedFeesCC: ApiDecimal;
-  prizePoolCC: ApiDecimal;
-  totalVolumeCC: ApiDecimal;
+  accumulatedFees: ApiDecimal;
+  prizePool: ApiDecimal;
+  totalVolume: ApiDecimal;
   status: MarketStatus;
   outcome: MarketOutcome | null;
   resolvedAt: string | null;
@@ -678,10 +971,10 @@ export interface ApiMarket {
   /** Price 24 h ago (else the first price); null without candles. */
   previousPrice: ApiDecimal | null;
   priceChange24h: ApiDecimal | null;
-  volume24hCC: ApiDecimal;
+  volume24h: ApiDecimal;
   openInterest: ApiOpenInterest;
   /** Pool value V(P) at the current effective liquidity — the AMM's "liquidity" figure. */
-  liquidityCC: ApiDecimal;
+  liquidity: ApiDecimal;
   /** Implied one-share bid / ask for a reference-sized order; null unless trading. */
   book: ApiImpliedBook | null;
   /** Offset of the ledger transaction that produced this version. */
@@ -714,6 +1007,7 @@ export interface ApiMarketSummary {
   yesSubTitle: string;
   noSubTitle: string;
   contractId: string;
+  collateral: InstrumentRef;
   question: string;
   /** Same fallback as `Market.imageUrl` (own, else the event's). */
   imageUrl: string;
@@ -735,15 +1029,17 @@ export interface ApiMarketEvent {
   kind: MarketEventKind;
   actor: string;
   side: TradeSide | null;
-  /** buy: collateral in · sell / swap: gross CC value · split / merge: CC minted / burned · provide: value increase · redeem: payout · propose / challenge: bond */
-  amountCC: ApiDecimal | null;
-  /** buy: collateral after fees · sell: proceeds credited · provide: CC debited · withdraw_liquidity: CC credited */
-  netCC: ApiDecimal | null;
+  /** The market's collateral — what `amount`, `net`, `fee` and `notional` are in. */
+  instrument: InstrumentRef;
+  /** buy: collateral in · sell / swap: gross value · split / merge: pairs minted / burned · provide: value increase · redeem: payout · propose / challenge: bond */
+  amount: ApiDecimal | null;
+  /** buy: collateral after fees · sell: proceeds credited · provide: collateral debited · withdraw_liquidity: collateral credited */
+  net: ApiDecimal | null;
   /** buy: shares received · sell / swap: shares given · split / merge: pairs · redeem: shares burned · withdraw_liquidity (early static exit): YES shares out */
   shares: ApiDecimal | null;
   /** swap: shares received · withdraw_liquidity (early static exit): NO shares out */
   sharesOut: ApiDecimal | null;
-  feeCC: ApiDecimal | null;
+  fee: ApiDecimal | null;
   priceBefore: ApiDecimal | null;
   priceAfter: ApiDecimal | null;
   lpTokens: ApiDecimal | null;
@@ -763,8 +1059,8 @@ export interface ApiMarketEvent {
   /** The YES price after the trade (`priceAfter`) and its complement; null when the kind moved no price. */
   yesPrice: ApiDecimal | null;
   noPrice: ApiDecimal | null;
-  /** CC the trade turned over (`amountCC`). */
-  notionalCC: ApiDecimal | null;
+  /** Collateral the trade turned over (`amount`). */
+  notional: ApiDecimal | null;
   /** The taker, masked (`first 8…last 6` of the party id) — a feed never shows a whole party id. */
   takerParty: string;
   /** `effectiveAt`, the ledger time of the trade. */
@@ -776,8 +1072,8 @@ export type TradeAction = (typeof TRADE_ACTIONS)[number];
 export interface ApiPricePoint {
   t: string;
   price: ApiDecimal;
-  /** Cumulative `totalVolumeCC` of the market at that point. */
-  volumeCC: ApiDecimal;
+  /** Cumulative `totalVolume` of the market at that point, in its collateral. */
+  volume: ApiDecimal;
   offset: number;
 }
 
@@ -785,26 +1081,30 @@ export interface ApiPosition {
   contractId: string;
   holder: string;
   marketId: number;
+  /** The market's collateral; null only when the market is not indexed (then `market` is null too). */
+  instrument: InstrumentRef | null;
   yesShares: ApiDecimal;
   noShares: ApiDecimal;
-  costBasisCC: ApiDecimal;
+  costBasis: ApiDecimal;
   active: boolean;
   createdAt: string;
   createdOffset: number;
   archivedAt: string | null;
   market: ApiMarketSummary | null;
   /** Mark-to-market while Trading (`yes·p + no·(1−p)`), the redeemable amount once settled, null when the market is unknown. */
-  valueCC: ApiDecimal | null;
+  value: ApiDecimal | null;
   /** Resolved: winning shares · Voided: `min(costBasis, max(yes, no))` · otherwise null. */
-  redeemableCC: ApiDecimal | null;
+  redeemable: ApiDecimal | null;
 }
 
 export interface ApiLiquidityPosition {
   contractId: string;
   provider: string;
   marketId: number;
+  /** The market's collateral; null only when the market is not indexed. */
+  instrument: InstrumentRef | null;
   lpTokens: ApiDecimal;
-  depositedCC: ApiDecimal;
+  deposited: ApiDecimal;
   active: boolean;
   createdAt: string;
   createdOffset: number;
@@ -818,11 +1118,13 @@ export interface ApiWalletEntry {
   id: string;
   eventId: string;
   owner: string;
+  /** The wallet's instrument. */
+  instrument: InstrumentRef;
   kind: WalletEntryKind;
-  amountCC: ApiDecimal;
-  /** Credit / Debit `reason` (buy, sell, split, merge, liquidity, liquidity-provide, bond, resolve, void-refund, cancel:…, a payout reason); `withdraw`; null for deposits. */
+  amount: ApiDecimal;
+  /** Credit / Debit `reason` (buy, sell, split, merge, liquidity, liquidity-provide, bond, resolve, void-refund, cancel:…, a payout reason); grant: the grant's reason (`<rule kind>`); `withdraw`; null for deposits. */
   reason: string | null;
-  /** Deposit only: the transfer reference credited. */
+  /** Deposit: the transfer reference credited · grant: `reward:<grantId>`. */
   txRef: string | null;
   balanceAfter: ApiDecimal | null;
   marketId: number | null;
@@ -837,10 +1139,11 @@ export interface ApiWalletEntry {
 export interface ApiIndexedWallet {
   contractId: string;
   owner: string;
-  balanceCC: ApiDecimal;
-  depositedCC: ApiDecimal;
-  withdrawnCC: ApiDecimal;
-  depositRefs: string[];
+  instrument: InstrumentRef;
+  balance: ApiDecimal;
+  deposited: ApiDecimal;
+  withdrawn: ApiDecimal;
+  creditRefs: string[];
   updatedOffset: number;
   updatedAt: string;
 }
@@ -849,7 +1152,8 @@ export interface ApiLedgerPayout {
   contractId: string;
   user: string;
   marketId: number;
-  amountCC: ApiDecimal;
+  instrument: InstrumentRef;
+  amount: ApiDecimal;
   reason: string;
   createdAt: string;
   createdOffset: number;
@@ -864,12 +1168,39 @@ export interface ApiLedgerPayout {
 
 export interface ApiLedgerTransfer {
   updateId: string;
+  nodeId: number;
   offset: number;
   direction: "in" | "out";
   counterparty: string;
-  amountCC: ApiDecimal;
+  instrument: InstrumentRef;
+  amount: ApiDecimal;
+  kind: TransferKind;
   choice: string;
   recordTime: string;
+}
+
+/** `GET /admin/ledger/holdings` — the treasury's token-standard holdings as indexed. */
+export interface ApiLedgerHolding {
+  contractId: string;
+  owner: string;
+  instrument: InstrumentRef;
+  amount: ApiDecimal;
+  locked: boolean;
+  lockExpiresAt: string | null;
+  createdOffset: number;
+  active: boolean;
+}
+
+/** `GET /admin/ledger/transfer-instructions` — two-step offers the treasury sent or received. */
+export interface ApiTransferInstruction {
+  contractId: string;
+  instrument: InstrumentRef;
+  sender: string;
+  receiver: string;
+  amount: ApiDecimal;
+  executeBefore: string | null;
+  status: TransferInstructionStatus;
+  createdOffset: number;
 }
 
 export interface ApiAttestation {
@@ -937,10 +1268,12 @@ export interface ApiLedgerStatus {
   updatedAt: string | null;
 }
 
+/** `GET /stats` — one instrument per answer (`?instrument=<admin>:<id>`, default the default collateral). */
 export interface ApiStats {
+  instrument: InstrumentRef;
   markets: { total: number; trading: number; proposed: number; resolved: number; voided: number };
-  totalVolumeCC: ApiDecimal;
-  volume24hCC: ApiDecimal;
+  totalVolume: ApiDecimal;
+  volume24h: ApiDecimal;
   trades: number;
   trades24h: number;
   traders: number;
@@ -949,11 +1282,115 @@ export interface ApiStats {
 
 export interface ApiLeaderboardEntry {
   party: string;
-  volumeCC: ApiDecimal;
+  /** What `volume` and `realizedPnl` are in (the board's instrument). */
+  instrument: InstrumentRef;
+  volume: ApiDecimal;
   trades: number;
   markets: number;
-  /** CC credited back (sell, merge, resolve, void-refund, liquidity) minus CC debited (buy, split, liquidity-provide) over the window. */
-  realizedPnlCC: ApiDecimal;
+  /** Collateral credited back (sell, merge, resolve, void-refund, liquidity) minus collateral debited (buy, split, liquidity-provide) over the window. */
+  realizedPnl: ApiDecimal;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rewards (docs/TOKENS.md §4.6) — TRO grants computed off-ledger from the index
+// ---------------------------------------------------------------------------------------------
+
+export const REWARD_RULE_KINDS = [
+  "trade_volume_rebate",
+  "winning_redeem_bonus",
+  "first_deposit_bonus",
+  "manual",
+] as const;
+export type RewardRuleKind = (typeof REWARD_RULE_KINDS)[number];
+
+/**
+ * `queued` (written, not yet submitted) → `submitted` (`UserWallet.Grant` sent) → `credited`
+ * (`creditRefs` carries `reward:<grantId>`); `failed` (the ledger refused it) or `blocked_float`
+ * (the treasury's rewards holdings do not cover Σ in-app balances + the grant) wait for an operator
+ * or an auto-mint.
+ */
+export const REWARD_GRANT_STATUSES = [
+  "queued",
+  "submitted",
+  "credited",
+  "failed",
+  "blocked_float",
+] as const;
+export type RewardGrantStatus = (typeof REWARD_GRANT_STATUSES)[number];
+
+/** `to_reward_rules` on the wire (`GET /admin/rewards/rules`, `PUT /admin/rewards/rules/:id`). */
+export interface ApiRewardRule {
+  id: string;
+  kind: RewardRuleKind;
+  /** Decimal strings, never numbers: `{ perUnit, minTrade }`, `{ fraction }`, `{ amount }`. */
+  params: Record<string, string>;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `to_reward_grants` on the wire (`GET /me/rewards`, `GET /admin/rewards/grants`). */
+export interface ApiRewardGrant {
+  id: string;
+  userId: string | null;
+  party: string;
+  ruleId: string | null;
+  kind: RewardRuleKind;
+  /** The wallet entry / market event the grant was earned on; null for a manual grant. */
+  sourceEventId: string | null;
+  instrument: InstrumentRef;
+  amount: ApiMoney;
+  reason: string;
+  status: RewardGrantStatus;
+  commandId: string | null;
+  /** `reward:<grantId>` — what `UserWallet.creditRefs` carries once credited. */
+  ref: string;
+  error: string | null;
+  createdAt: string;
+  creditedAt: string | null;
+}
+
+/** `GET /me/rewards`. */
+export interface ApiRewardsOverview {
+  instrument: InstrumentRef;
+  wallet: ApiLedgerWallet | null;
+  totals: { credited: ApiMoney; queued: ApiMoney };
+  grants: ApiRewardGrant[];
+}
+
+/** `GET /admin/rewards/float` — the treasury's rewards holdings against what the in-app wallets owe. */
+export interface ApiRewardsFloat {
+  instrument: InstrumentRef;
+  /** Σ of the treasury's active `Holding`s in the rewards instrument (index). */
+  treasuryHoldings: ApiMoney;
+  /** Σ `UserWallet.balance` in the rewards instrument (index). */
+  liabilities: ApiMoney;
+  /** Σ amount of grants `submitted` but not yet seen on the ledger — balances the index does not show yet. */
+  pending: ApiMoney;
+  /** `treasuryHoldings − liabilities − pending`; a grant is only submitted while it covers the grant. */
+  headroom: ApiMoney;
+}
+
+/** `GET /admin/tokens/status` (docs/TOKENS.md §4.7). */
+export interface ApiTokenStatus {
+  tokenApp: TokenAppStatus;
+  instruments: {
+    instrument: InstrumentRef;
+    treasuryHoldings: ApiMoney;
+    liabilities: ApiMoney;
+  }[];
+}
+
+/** `POST /admin/tokens/mint` (and `burn`): the token-app command plus the optional in-app credit it funded. */
+export interface ApiTokenMintResult {
+  commandId: string;
+  status: string;
+  instrument: InstrumentRef;
+  amount: ApiMoney;
+  /** The party the tokens were minted to (the treasury unless `to` named another) or burned from. */
+  party: string;
+  /** Set when `creditUserId` was given: the `UserWallet.Deposit { txRef: "mint:<commandId>" }` that followed the mint. */
+  credit: { commandId: string; txRef: string; status: "confirmed" | "submitted" } | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1019,8 +1456,14 @@ export interface ApiSeries {
   description: string;
   status: SeriesStatus;
   productMetadata: Record<string, unknown>;
+  /** The instrument the counts and `volume` below are computed over (`?instrument=`, default the default collateral); null when the platform has no collateral configured. */
+  instrument: InstrumentRef | null;
+  /** Events of the series denominated in `instrument` (events without a market yet count too). */
   eventCount: number;
+  /** Member markets in `instrument` across those events. */
   marketCount: number;
+  /** Σ `totalVolume` of those markets. */
+  volume: ApiDecimal;
   createdAt: string;
   updatedAt: string;
 }
@@ -1042,17 +1485,19 @@ export interface ApiEvent {
   archived: boolean;
   /** Derived from the member markets' phases. */
   status: EventStatus;
+  /** The event's one collateral (fixed by its first market, docs/TOKENS.md §2 decision 9); null until then. Every aggregate below is in it. */
+  instrument: InstrumentRef | null;
   marketCount: number;
-  /** Σ `totalVolumeCC` of the member markets. */
-  volumeCC: ApiDecimal;
+  /** Σ `totalVolume` of the member markets. */
+  volume: ApiDecimal;
   /** Latest `expiresAt` among the member markets; null without markets. */
   closeTime: string | null;
   /** Σ hourly-candle volume of the member markets over the last 24 h (what `sort=trending` ranks by). */
-  volume24hCC: ApiDecimal;
+  volume24h: ApiDecimal;
   /** Σ outstanding YES + NO shares across the member markets. */
-  openInterestCC: ApiDecimal;
+  openInterest: ApiDecimal;
   /** Σ pool value V(P) at the current effective liquidity across the member markets. */
-  liquidityCC: ApiDecimal;
+  liquidity: ApiDecimal;
   /** The likeliest outcome (highest YES price) — what a binary-event card shows; null without markets. */
   topMarket: ApiEventTopMarket | null;
   /** Only with `withNestedMarkets=true` (and always on `GET /events/:ticker`), likeliest outcome first. */
@@ -1076,7 +1521,7 @@ export interface ApiImpliedBook {
   noBid: ApiDecimal;
   noAsk: ApiDecimal;
   /** Collateral of the reference buy the book was quoted for. */
-  referenceCC: ApiDecimal;
+  reference: ApiDecimal;
 }
 
 export interface ApiOpenInterest {
@@ -1106,8 +1551,8 @@ export interface ApiCandle {
   startTs: number;
   endTs: number;
   price: ApiCandlePrice;
-  /** CC traded in the period (Δ `totalVolumeCC`). */
-  volumeCC: ApiDecimal;
+  /** Collateral traded in the period (Δ `totalVolume`). */
+  volume: ApiDecimal;
   /** Pool trades (Buy / Sell / SwapShares) in the period. */
   trades: number;
   /** Outstanding YES + NO shares at the end of the period. */
@@ -1120,6 +1565,8 @@ export interface ApiCandle {
 export interface ApiCandlesticks {
   marketId: number;
   ticker: string;
+  /** What every candle's `volume` is in. */
+  instrument: InstrumentRef;
   periodInterval: CandlePeriodMinutes;
   startTs: number;
   endTs: number;
@@ -1129,6 +1576,7 @@ export interface ApiCandlesticks {
 export interface ApiEventCandlestickSeries {
   marketId: number;
   ticker: string;
+  instrument: InstrumentRef;
   yesSubTitle: string;
   noSubTitle: string;
   status: MarketStatus;
@@ -1155,30 +1603,36 @@ export const ORDER_ACTIONS = [
   "redeem",
 ] as const;
 export type OrderAction = (typeof ORDER_ACTIONS)[number];
-/** Actions a quote can be produced for (the others are exact: 1 CC ↔ 1 YES + 1 NO, or a settlement). */
-export const QUOTABLE_ACTIONS: readonly OrderAction[] = ["buy", "sell", "swap", "provide_liquidity"];
+/** Actions a quote can be produced for (the others are exact: 1 unit of collateral ↔ 1 YES + 1 NO, or a settlement). */
+export const QUOTABLE_ACTIONS: readonly OrderAction[] = [
+  "buy",
+  "sell",
+  "swap",
+  "provide_liquidity",
+];
 
 export interface ApiQuoteBuy {
   action: "buy";
   side: TradeSide;
-  collateralCC: ApiDecimal;
-  feeCC: ApiDecimal;
-  netCC: ApiDecimal;
+  /** Collateral in (the `Buy.amount` argument). */
+  amount: ApiDecimal;
+  fee: ApiDecimal;
+  net: ApiDecimal;
   sharesOut: ApiDecimal;
   avgPrice: ApiDecimal;
   priceBefore: ApiDecimal;
   priceAfter: ApiDecimal;
   priceImpact: ApiDecimal;
-  /** Payout if the side wins: one CC per share. */
-  maxPayoutCC: ApiDecimal;
+  /** Payout if the side wins: one unit of collateral per share. */
+  maxPayout: ApiDecimal;
 }
 export interface ApiQuoteSell {
   action: "sell";
   side: TradeSide;
   sharesIn: ApiDecimal;
-  grossCC: ApiDecimal;
-  feeCC: ApiDecimal;
-  netCC: ApiDecimal;
+  gross: ApiDecimal;
+  fee: ApiDecimal;
+  net: ApiDecimal;
   avgPrice: ApiDecimal;
   priceBefore: ApiDecimal;
   priceAfter: ApiDecimal;
@@ -1196,8 +1650,8 @@ export interface ApiQuoteSwap {
 }
 export interface ApiQuoteLiquidity {
   action: "provide_liquidity";
-  valueIncreaseCC: ApiDecimal;
-  costCC: ApiDecimal;
+  valueIncrease: ApiDecimal;
+  cost: ApiDecimal;
   lpMinted: ApiDecimal;
   poolShare: ApiDecimal;
   newL: ApiDecimal;
@@ -1208,13 +1662,15 @@ export type ApiQuoteBody = ApiQuoteBuy | ApiQuoteSell | ApiQuoteSwap | ApiQuoteL
 export interface ApiQuoteBounds {
   slippageBps: number;
   minSharesOut?: ApiDecimal;
-  minProceedsCC?: ApiDecimal;
-  maxCostCC?: ApiDecimal;
+  minProceeds?: ApiDecimal;
+  maxCost?: ApiDecimal;
 }
 
 export interface ApiQuote {
   marketId: number;
   ticker: string;
+  /** The market's collateral — every amount in `quote` and `bounds` is in it. */
+  instrument: InstrumentRef;
   /** The market version the quote was computed against — a trade must exercise this contract. */
   contractId: string;
   updatedOffset: number;
@@ -1303,6 +1759,8 @@ export interface ApiCreateMarketResult {
   status: string;
   ticker: string;
   eventTicker: string;
+  /** The collateral the market was created in (the request's, else the default collateral). */
+  collateral: InstrumentRef;
   /** `MarketCounter.value + 1` at submission — the id the market will carry once indexed. */
   expectedMarketId: number | null;
 }

@@ -20,7 +20,10 @@ export class KycMockController {
   /** Drives the identical stored-event → applyEvent → fetchApplicant pipeline Sumsub uses. */
   @Post("submit")
   @HttpCode(200)
-  submit(@Body() body: KycMockSubmitDto, @Req() req: AuthedRequest): Promise<{ verification: ApiKycVerification; userKycStatus: UserKycStatus }> {
+  submit(
+    @Body() body: KycMockSubmitDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ verification: ApiKycVerification; userKycStatus: UserKycStatus }> {
     const { user } = principalOf(req);
     return this.kyc.submitMock(user, body);
   }

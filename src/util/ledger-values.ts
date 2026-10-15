@@ -5,17 +5,17 @@
  * shape that cannot be read yields `null` / `0n` and the caller decides whether that is fatal.
  * Nothing here ever goes through `Number` for a Decimal (util/money.ts, fixed point).
  */
-import { formatCC, parseCC, tryParseCC } from "./money";
+import { formatAmount, parseAmount, tryParseAmount } from "./money";
 
 /** Daml `Decimal` (10 dp) → 1e-10 units; `0n` when absent or malformed. */
 export function asDecimal(value: unknown): bigint {
-  return tryParseCC(value) ?? 0n;
+  return tryParseAmount(value) ?? 0n;
 }
 
 /** Daml `Decimal` → 1e-10 units or null when absent / malformed. */
 export function asOptionalDecimal(value: unknown): bigint | null {
   if (value === null || value === undefined) return null;
-  return tryParseCC(value);
+  return tryParseAmount(value);
 }
 
 /** Daml `Int` — the JSON API emits it as a string ("42") or a number; `0` when unreadable. */
@@ -135,7 +135,7 @@ export const bigintNumberTransformer = {
 /** TypeORM transformer for nullable `numeric(38,10)` columns (`moneyTransformer` already handles null; kept for readability). */
 export const decimalTransformer = {
   to: (value: bigint | null | undefined): string | null =>
-    value === null || value === undefined ? null : formatCC(value),
+    value === null || value === undefined ? null : formatAmount(value),
   from: (value: string | null | undefined): bigint | null =>
-    value === null || value === undefined ? null : parseCC(value),
+    value === null || value === undefined ? null : parseAmount(value),
 };

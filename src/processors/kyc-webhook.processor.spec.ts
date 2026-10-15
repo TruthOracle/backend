@@ -1,4 +1,8 @@
-import { KYC_WEBHOOK_MAX_ATTEMPTS, KYC_WEBHOOK_NAK_DELAY_MAX_MS, kycWebhookNakDelayMs } from "./kyc-webhook.processor";
+import {
+  KYC_WEBHOOK_MAX_ATTEMPTS,
+  KYC_WEBHOOK_NAK_DELAY_MAX_MS,
+  kycWebhookNakDelayMs,
+} from "./kyc-webhook.processor";
 
 describe("KycWebhookProcessor retry schedule", () => {
   it("doubles from 5 s and caps at 10 min, giving a horizon of hours rather than 100 s", () => {

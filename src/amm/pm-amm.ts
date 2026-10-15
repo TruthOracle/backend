@@ -12,7 +12,7 @@
  *
  * The Daml runs the same formulas in `Decimal` (10 dp, fixed point); this port runs them in IEEE
  * doubles, so a quote can differ from the on-ledger fill in the last decimals. That is why every
- * quote also carries the slippage-protected bound (`minSharesOut` / `minProceedsCC`) the choice
+ * quote also carries the slippage-protected bound (`minSharesOut` / `minProceeds`) the choice
  * argument must be built with — the ledger, not this file, is the execution engine.
  */
 
@@ -36,8 +36,7 @@ export function normCdf(z: number): number {
   const t = 1 / (1 + 0.2316419 * z);
   const poly =
     t *
-    (0.31938153 +
-      t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
   return 1 - normPdf(z) * poly;
 }
 
@@ -54,7 +53,8 @@ export function normInvCdf(pRaw: number): number {
           4.374664141) *
           q +
         2.938163983
-      ) / ((((0.007784696 * q + 0.322467129) * q + 2.445134137) * q + 3.754408662) * q + 1);
+      ) /
+      ((((0.007784696 * q + 0.322467129) * q + 2.445134137) * q + 3.754408662) * q + 1);
   } else if (p > 1 - pLow) {
     const q = Math.sqrt(-2 * Math.log(1 - p));
     x =
@@ -196,9 +196,9 @@ export function marketEffectiveL(m: AmmMarketState, nowSecs: number): number {
 export interface BuyQuote {
   kind: "buy";
   side: AmmSide;
-  collateralCC: number;
-  feeCC: number;
-  netCC: number;
+  amount: number;
+  fee: number;
+  net: number;
   sharesOut: number;
   /** collateral / shares — what one share cost all-in. */
   avgPrice: number;
@@ -213,15 +213,15 @@ export interface BuyQuote {
 export function quoteBuy(
   m: AmmMarketState,
   side: AmmSide,
-  collateralCC: number,
+  amount: number,
   nowSecs: number,
 ): BuyQuote | null {
   const l = marketEffectiveL(m, nowSecs);
-  if (l <= 0 || collateralCC <= 0) return null;
+  if (l <= 0 || amount <= 0) return null;
   const { x, y } = optimalReserves(m.currentPrice, l);
-  const feeCC = collateralCC * feeFraction(m.feeBps);
-  const netCC = collateralCC - feeCC;
-  const sharesOut = side === "Yes" ? solveBuyShares(x, y, l, netCC) : solveBuyShares(y, x, l, netCC);
+  const fee = amount * feeFraction(m.feeBps);
+  const net = amount - fee;
+  const sharesOut = side === "Yes" ? solveBuyShares(x, y, l, net) : solveBuyShares(y, x, l, net);
   if (sharesOut <= 0) return null;
   const diff = y - x;
   const newDiff = side === "Yes" ? diff + sharesOut : diff - sharesOut;
@@ -231,11 +231,11 @@ export function quoteBuy(
   return {
     kind: "buy",
     side,
-    collateralCC,
-    feeCC,
-    netCC,
+    amount,
+    fee,
+    net,
     sharesOut,
-    avgPrice: collateralCC / sharesOut,
+    avgPrice: amount / sharesOut,
     priceBefore: m.currentPrice,
     priceAfter,
     priceImpact: Math.abs(newSidePrice - sidePrice) / Math.max(1e-9, sidePrice),
@@ -247,9 +247,9 @@ export interface SellQuote {
   kind: "sell";
   side: AmmSide;
   sharesIn: number;
-  grossCC: number;
-  feeCC: number;
-  netCC: number;
+  gross: number;
+  fee: number;
+  net: number;
   /** gross / shares — what the pool paid per share before the fee. */
   avgPrice: number;
   priceBefore: number;
@@ -258,7 +258,7 @@ export interface SellQuote {
   effectiveL: number;
 }
 
-/** Quote a `Sell`: shares in → net CC out. Null when the pool cannot fill it. */
+/** Quote a `Sell`: shares in → net collateral out. Null when the pool cannot fill it. */
 export function quoteSell(
   m: AmmMarketState,
   side: AmmSide,
@@ -268,10 +268,10 @@ export function quoteSell(
   const l = marketEffectiveL(m, nowSecs);
   if (l <= 0 || sharesIn <= 0) return null;
   const { x, y } = optimalReserves(m.currentPrice, l);
-  const grossCC =
+  const gross =
     side === "Yes" ? solveSellProceeds(x, y, l, sharesIn) : solveSellProceeds(y, x, l, sharesIn);
-  if (grossCC <= 0) return null;
-  const feeCC = grossCC * feeFraction(m.feeBps);
+  if (gross <= 0) return null;
+  const fee = gross * feeFraction(m.feeBps);
   const diff = y - x;
   const newDiff = side === "Yes" ? diff - sharesIn : diff + sharesIn;
   const priceAfter = clampProb(normCdf(newDiff / l));
@@ -281,10 +281,10 @@ export function quoteSell(
     kind: "sell",
     side,
     sharesIn,
-    grossCC,
-    feeCC,
-    netCC: grossCC - feeCC,
-    avgPrice: grossCC / sharesIn,
+    gross,
+    fee,
+    net: gross - fee,
+    avgPrice: gross / sharesIn,
     priceBefore: m.currentPrice,
     priceAfter,
     priceImpact: Math.abs(newSidePrice - sidePrice) / Math.max(1e-9, sidePrice),
@@ -339,9 +339,9 @@ export function quoteSwap(
 
 export interface LiquidityQuote {
   kind: "provide_liquidity";
-  valueIncreaseCC: number;
-  /** CC debited: max(dx, dy). */
-  costCC: number;
+  valueIncrease: number;
+  /** Collateral debited: max(dx, dy). */
+  cost: number;
   lpMinted: number;
   /** Share of the pool after the deposit. */
   poolShare: number;
@@ -349,24 +349,24 @@ export interface LiquidityQuote {
   effectiveL: number;
 }
 
-/** Quote a `ProvideLiquidity`: desired pool-value increase → CC cost + LP tokens minted. */
+/** Quote a `ProvideLiquidity`: desired pool-value increase → collateral cost + LP tokens minted. */
 export function quoteProvideLiquidity(
   m: AmmMarketState,
-  valueIncreaseCC: number,
+  valueIncrease: number,
   nowSecs: number,
 ): LiquidityQuote | null {
   const l = marketEffectiveL(m, nowSecs);
-  if (l <= 0 || valueIncreaseCC <= 0) return null;
+  if (l <= 0 || valueIncrease <= 0) return null;
   const v = poolValue(m.currentPrice, l);
   if (v <= 0) return null;
-  const ratio = valueIncreaseCC / v;
+  const ratio = valueIncrease / v;
   const { x, y } = optimalReserves(m.currentPrice, l);
-  const costCC = Math.max(x * ratio, y * ratio);
+  const cost = Math.max(x * ratio, y * ratio);
   const lpMinted = m.lpTokenSupply * ratio;
   return {
     kind: "provide_liquidity",
-    valueIncreaseCC,
-    costCC,
+    valueIncrease,
+    cost,
     lpMinted,
     poolShare: lpMinted / (m.lpTokenSupply + lpMinted),
     newL: m.liquidityL * (1 + ratio),
@@ -377,23 +377,23 @@ export function quoteProvideLiquidity(
 /**
  * The best bid / ask an AMM implies for one share of a side: the marginal price moved by a
  * reference-sized order in each direction (Kalshi-style `yesBid` / `yesAsk` for a pool that has
- * no order book). `sizeCC` is the collateral of the reference buy; the sell mirrors it in shares.
+ * no order book). `size` is the collateral of the reference buy; the sell mirrors it in shares.
  */
 export function impliedQuoteBook(
   m: AmmMarketState,
   nowSecs: number,
-  sizeCC = 1,
+  size = 1,
 ): { yesBid: number; yesAsk: number; noBid: number; noAsk: number } | null {
-  const buyYes = quoteBuy(m, "Yes", sizeCC, nowSecs);
-  const buyNo = quoteBuy(m, "No", sizeCC, nowSecs);
+  const buyYes = quoteBuy(m, "Yes", size, nowSecs);
+  const buyNo = quoteBuy(m, "No", size, nowSecs);
   if (!buyYes || !buyNo) return null;
   const sellYes = quoteSell(m, "Yes", buyYes.sharesOut, nowSecs);
   const sellNo = quoteSell(m, "No", buyNo.sharesOut, nowSecs);
   if (!sellYes || !sellNo) return null;
   return {
     yesAsk: clampProb(buyYes.avgPrice),
-    yesBid: clampProb(sellYes.netCC / sellYes.sharesIn),
+    yesBid: clampProb(sellYes.net / sellYes.sharesIn),
     noAsk: clampProb(buyNo.avgPrice),
-    noBid: clampProb(sellNo.netCC / sellNo.sharesIn),
+    noBid: clampProb(sellNo.net / sellNo.sharesIn),
   };
 }

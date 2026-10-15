@@ -32,6 +32,7 @@ import {
 } from "../types";
 import { REASON_MAX_LENGTH } from "./admin.dto";
 import { PageQueryDto } from "./common.dto";
+import { InstrumentIdDto } from "./instruments.dto";
 
 const trimmed = (): PropertyDecorator =>
   Transform(({ value }: { value: unknown }) => (typeof value === "string" ? value.trim() : value));
@@ -47,6 +48,18 @@ const toBool = (): PropertyDecorator =>
 /** Loose on the wire (normalised by the service); tight enough to refuse junk early. */
 const TICKER_INPUT = /^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/;
 const DECIMAL_INPUT = /^\d{1,28}(\.\d{1,10})?$/;
+/** `?instrument=<admin party>:<token id>` — the instrument a catalog listing is computed over (docs/TOKENS.md §4.5). */
+const INSTRUMENT_KEY_INPUT =
+  /^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
+/** `GET /series/:ticker?instrument=` */
+export class CatalogInstrumentQueryDto {
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(INSTRUMENT_KEY_INPUT, { message: "instrument must be <admin party>:<token id>" })
+  instrument?: string;
+}
 
 export class SettlementSourceDto {
   @trimmed()
@@ -70,7 +83,7 @@ export class CatalogReasonDto {
   reason?: string;
 }
 
-/** `GET /series?category=&status=&q=&page=&limit=` */
+/** `GET /series?category=&status=&q=&instrument=&page=&limit=` */
 export class SeriesListQueryDto extends PageQueryDto {
   @IsOptional()
   @trimmed()
@@ -87,6 +100,13 @@ export class SeriesListQueryDto extends PageQueryDto {
   @IsString()
   @MaxLength(200)
   q?: string;
+
+  /** The instrument the counts are computed over; omitted = the default collateral. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(INSTRUMENT_KEY_INPUT, { message: "instrument must be <admin party>:<token id>" })
+  instrument?: string;
 }
 
 export class CreateSeriesDto extends CatalogReasonDto {
@@ -193,8 +213,15 @@ export class UpdateSeriesDto extends CatalogReasonDto {
   status?: "active" | "archived";
 }
 
-/** `GET /events?series=&status=&category=&q=&withNestedMarkets=&includeArchived=&page=&limit=` */
+/** `GET /events?series=&status=&category=&q=&sort=&instrument=&withNestedMarkets=&includeArchived=&page=&limit=` */
 export class EventListQueryDto extends PageQueryDto {
+  /** Only events denominated in this instrument (plus events without a market yet); omitted = the default collateral. */
+  @IsOptional()
+  @trimmed()
+  @IsString()
+  @Matches(INSTRUMENT_KEY_INPUT, { message: "instrument must be <admin party>:<token id>" })
+  instrument?: string;
+
   @IsOptional()
   @trimmed()
   @IsString()
@@ -407,14 +434,21 @@ export class ResolutionPolicyDto {
 
   @IsOptional()
   @Matches(DECIMAL_INPUT)
-  bondCC?: string;
+  bond?: string;
 }
 
 /**
  * `POST /admin/markets` — a market inside an event, created on-ledger through the treasury. The
  * contract requires all four identity fields; the side labels default to "Yes" / "No" when omitted.
+ * `collateral` names the instrument the market is denominated in (default: the default collateral;
+ * must equal the event's once the event has one — docs/TOKENS.md §4.5).
  */
 export class CreateMarketDto extends CatalogReasonDto {
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => InstrumentIdDto)
+  collateral?: InstrumentIdDto;
+
   @trimmed()
   @IsString()
   @Matches(TICKER_INPUT)
@@ -482,7 +516,7 @@ export class CreateMarketDto extends CatalogReasonDto {
   initialProbability!: string;
 
   @Matches(DECIMAL_INPUT)
-  initialValueCC!: string;
+  initialValue!: string;
 
   @IsOptional()
   @IsInt()

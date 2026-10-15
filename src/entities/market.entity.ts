@@ -12,14 +12,14 @@ export interface StoredResolutionPolicy {
   reporters: string[];
   quorum: number;
   challengeSecs: number;
-  bondCC: string;
+  bond: string;
 }
 
 export interface StoredProposal {
   proposer: string;
   proposedOutcome: MarketOutcome;
   proposedAtSec: number;
-  bondCC: string;
+  bond: string;
   challenger: string | null;
   challengerOutcome: MarketOutcome | null;
 }
@@ -34,6 +34,7 @@ export interface StoredProposal {
 @Index("ix_to_markets_status", ["status"])
 @Index("ix_to_markets_expires_at", ["expiresAtSec"])
 @Index("ix_to_markets_event_ticker", ["eventTicker"])
+@Index("ix_to_markets_collateral", ["collateralAdmin", "collateralId"])
 export class MarketEntity {
   @PrimaryColumn({ name: "market_id", type: "bigint", transformer: bigintNumberTransformer })
   marketId!: number;
@@ -44,6 +45,13 @@ export class MarketEntity {
 
   @Column({ type: "text" })
   admin!: string;
+
+  /** `PredictionMarket.collateral` — the instrument every amount of this market is in (docs/TOKENS.md §2). Immutable. */
+  @Column({ name: "collateral_admin", type: "text" })
+  collateralAdmin!: string;
+
+  @Column({ name: "collateral_id", type: "text" })
+  collateralId!: string;
 
   @Column({ type: "text" })
   question!: string;
@@ -172,34 +180,34 @@ export class MarketEntity {
   prizeFeeShareBps!: number;
 
   @Column({
-    name: "accumulated_fees_cc",
+    name: "accumulated_fees",
     type: "numeric",
     precision: 38,
     scale: 10,
     default: 0,
     transformer: moneyTransformer,
   })
-  accumulatedFeesCC!: bigint;
+  accumulatedFees!: bigint;
 
   @Column({
-    name: "prize_pool_cc",
+    name: "prize_pool",
     type: "numeric",
     precision: 38,
     scale: 10,
     default: 0,
     transformer: moneyTransformer,
   })
-  prizePoolCC!: bigint;
+  prizePool!: bigint;
 
   @Column({
-    name: "total_volume_cc",
+    name: "total_volume",
     type: "numeric",
     precision: 38,
     scale: 10,
     default: 0,
     transformer: moneyTransformer,
   })
-  totalVolumeCC!: bigint;
+  totalVolume!: bigint;
 
   @Column({ type: "text", default: "Trading" })
   status!: MarketStatus;

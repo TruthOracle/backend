@@ -29,11 +29,16 @@ export class AdminGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<AuthedRequest>();
     const session = req.session;
-    if (!session || !req.user) throw new ApiError(401, "unauthenticated", "authentication required");
-    if (session.kind !== "admin") throw new ApiError(403, "forbidden", "an admin session is required");
+    if (!session || !req.user)
+      throw new ApiError(401, "unauthenticated", "authentication required");
+    if (session.kind !== "admin")
+      throw new ApiError(403, "forbidden", "an admin session is required");
 
     const identity = await this.identities.findById(session.authIdentityId);
-    const pinned = identity && identity.provider === "canton_wallet" && identity.status === "active" ? this.config.adminOperators.get(identity.subject) : undefined;
+    const pinned =
+      identity && identity.provider === "canton_wallet" && identity.status === "active"
+        ? this.config.adminOperators.get(identity.subject)
+        : undefined;
     if (!identity || pinned === undefined) {
       this.logger.warn(`admin session ${session.id} revoked: party is no longer an operator`);
       await this.sessions.revoke(session.id, { type: "system" });
@@ -42,7 +47,9 @@ export class AdminGuard implements CanActivate {
     if (pinned) {
       const stored = identity.profile.publicKey;
       if (typeof stored !== "string" || !publicKeysEqual(stored, pinned)) {
-        this.logger.warn(`admin session ${session.id} revoked: operator key does not match the pinned key`);
+        this.logger.warn(
+          `admin session ${session.id} revoked: operator key does not match the pinned key`,
+        );
         await this.sessions.revoke(session.id, { type: "system" });
         throw new ApiError(403, "forbidden", "operator key does not match the pinned key");
       }

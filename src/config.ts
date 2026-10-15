@@ -13,6 +13,14 @@ import {
   validateSync,
 } from "class-validator";
 
+import {
+  REGISTRY_AUTHS,
+  TREASURY_TRANSFER_MODES,
+  type RegistryAuth,
+  type TreasuryTransferMode,
+} from "./types";
+import { AMOUNT_DECIMALS, tryParseAmount } from "./util/money";
+
 const APP_ENVS = ["dev", "staging", "prod"] as const;
 export type AppEnv = (typeof APP_ENVS)[number];
 
@@ -24,9 +32,6 @@ export type DbSslMode = (typeof DB_SSL_MODES)[number];
 
 const KYC_PROVIDERS = ["mock", "sumsub"] as const;
 export type KycProviderSetting = (typeof KYC_PROVIDERS)[number];
-
-const INDEXER_UPDATES_ENDPOINTS = ["auto", "updates", "trees"] as const;
-export type IndexerUpdatesEndpoint = (typeof INDEXER_UPDATES_ENDPOINTS)[number];
 
 export interface KeycloakConfig {
   url: string;
@@ -52,7 +57,33 @@ export interface SumsubConfig {
   allowSha1: boolean;
 }
 
+/**
+ * One of the two env-configured CIP-56 instruments (docs/TOKENS.md §4.1, §4.7). `admin` and `id`
+ * identify it on the ledger; `symbol` / `name` / `decimals` are presentation; `registryUrl` /
+ * `registryAuth` reach its off-ledger registry; `walletInstrumentId` is what the Cantor8 wallet
+ * SDK's `send()` expects (defaults to `id`). An instrument with a blank `id` is "not configured".
+ */
+export interface InstrumentConfig {
+  admin: string;
+  id: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  registryUrl: string;
+  registryAuth: RegistryAuth;
+  walletInstrumentId: string;
+}
+
+/** Cantor8's mint / burn service (docs/TOKENS.md §0, §4.4); blank `url` = every caller answers 503 token_app_unconfigured. */
+export interface TokenAppConfig {
+  url: string;
+  appName: string;
+  /** Bearer for token-app; empty fields fall back to `keycloak`. */
+  keycloak: Partial<KeycloakConfig>;
+}
+
 const MIN_SECRET_LENGTH = 32;
+const PARTY_ID_RE = /^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}$/;
 
 /**
  * Validated process configuration (docs/ARCHITECTURE.md §12, docs/INTERNALS.md "Config").
@@ -262,7 +293,7 @@ export class Config {
   @Min(0)
   readonly ledgerCacheMs!: number;
 
-  /** Must cover the worst-case history walk; correctness never depends on it (§8.3). */
+  /** Must cover the worst-case reconcile (confirm pass, ledger reads, the submit); correctness never depends on it (§8.3). */
   @IsInt()
   @Min(60_000)
   readonly depositLockTtlMs!: number;
@@ -315,22 +346,63 @@ export class Config {
   @Min(5_000)
   readonly indexerLockTtlMs!: number;
 
-  /** Index Canton Coin transfers between the treasury and other parties (Splice `Amulet` events). */
-  @IsBoolean()
-  readonly indexerTrackTransfers!: boolean;
-
   /** `packageName` the participant reports for Splice Amulet events (`splice-amulet` on every Splice network so far). */
   @IsString()
   @IsNotEmpty()
   readonly splicePackageName!: string;
 
-  /** `auto` tries `/v2/updates` (LEDGER_EFFECTS) and falls back to the deprecated `/v2/updates/trees` on a 404. */
-  @IsIn(INDEXER_UPDATES_ENDPOINTS as readonly string[])
-  readonly indexerUpdatesEndpoint!: IndexerUpdatesEndpoint;
-
   /** The party the indexer reads as; blank = the treasury (signatory / observer on every TruthOracle template). */
   @IsString()
   readonly indexerPartyOverride!: string;
+
+  // ── instruments, treasury transfers, token-app, rewards (docs/TOKENS.md §4.7) ──
+  /** `COLLATERAL_INSTRUMENT_*`: upserted at boot as the default collateral; `id` blank = no collateral configured (markets cannot be created). */
+  readonly collateralInstrument!: InstrumentConfig;
+
+  /** `REWARDS_INSTRUMENT_*` (TRO): upserted at boot as the rewards instrument; without an `admin` the rewards processor stays idle. */
+  readonly rewardsInstrument!: InstrumentConfig;
+
+  /** Regulator parties: observers on every UserWallet / PendingPayout the backend creates and the default for `CreateMarket.auditObservers`. */
+  @IsArray()
+  readonly auditObserverParties!: string[];
+
+  /** `wallet` = Enterprise Wallet `/api/v1/transfer`; `registry` = `TransferFactory_Transfer` via `/external/submit`. Per-instrument `transfer_mode` overrides it. */
+  @IsIn(TREASURY_TRANSFER_MODES as readonly string[])
+  readonly treasuryTransferMode!: TreasuryTransferMode;
+
+  /** `executeBefore` horizon of a registry-mode transfer. */
+  @IsInt()
+  @Min(1)
+  readonly treasuryTransferTtlSec!: number;
+
+  /** The reconcile refuses (`503 ledger_stale`) when the index lags the ledger end by more than this many offsets. */
+  @IsInt()
+  @Min(0)
+  readonly ledgerFreshOffsets!: number;
+
+  /** TransferInstruction acceptor cadence; 0 = off. */
+  @IsInt()
+  @Min(0)
+  readonly acceptorScanMs!: number;
+
+  /** Bearer for `registry_auth = keycloak`; empty fields fall back to `keycloak`. */
+  readonly registryKeycloak!: Partial<KeycloakConfig>;
+
+  readonly tokenApp!: TokenAppConfig;
+
+  @IsBoolean()
+  readonly rewardsEnabled!: boolean;
+
+  @IsInt()
+  @Min(1000)
+  readonly rewardsScanMs!: number;
+
+  /** DevNet only: mint the rewards float shortfall through token-app instead of blocking the grant. */
+  @IsBoolean()
+  readonly rewardsAutoMint!: boolean;
+
+  /** Smallest auto-mint, in 1e-10 units of the rewards instrument. */
+  readonly rewardsMintMin!: bigint;
 
   // ── derived helpers ─────────────────────────────────────────────────────────
   get isMainnet(): boolean {
@@ -353,6 +425,20 @@ export class Config {
   /** The party whose view of the ledger is indexed (`INDEXER_PARTY`, default the treasury). */
   get indexerParty(): string {
     return this.indexerPartyOverride || this.treasuryPartyId;
+  }
+
+  /** A collateral instrument is configured (both `COLLATERAL_INSTRUMENT_ADMIN` and `_ID`). */
+  get hasCollateralInstrument(): boolean {
+    return Boolean(this.collateralInstrument.admin && this.collateralInstrument.id);
+  }
+
+  /** A rewards instrument is configured; without one rewards are computed by nobody and `GET /me/rewards` answers 404. */
+  get hasRewardsInstrument(): boolean {
+    return Boolean(this.rewardsInstrument.admin && this.rewardsInstrument.id);
+  }
+
+  get hasTokenApp(): boolean {
+    return Boolean(this.tokenApp.url);
   }
 }
 
@@ -415,6 +501,31 @@ function absoluteUrl(raw: string | undefined): string {
   return /^https?:\/\//i.test(trimmed) ? trimmed : "";
 }
 
+/**
+ * `<PREFIX>_INSTRUMENT_*` → InstrumentConfig. Only `admin` and `id` are identity; the rest defaults
+ * to what the token id implies (symbol = name = id, `walletInstrumentId` = id, registry auth
+ * `keycloak`, 6 decimals — cBYN's and TRO's; Canton Coin as a stand-in needs an explicit 10).
+ */
+function instrumentFrom(
+  env: NodeJS.ProcessEnv,
+  prefix: "COLLATERAL" | "REWARDS",
+): InstrumentConfig {
+  const id = str(env[`${prefix}_INSTRUMENT_ID`]);
+  const registryUrlRaw = str(env[`${prefix}_REGISTRY_URL`]);
+  return {
+    admin: str(env[`${prefix}_INSTRUMENT_ADMIN`]),
+    id,
+    symbol: str(env[`${prefix}_INSTRUMENT_SYMBOL`]) || id,
+    name: str(env[`${prefix}_INSTRUMENT_NAME`]) || id,
+    decimals: parseIntOr(env[`${prefix}_INSTRUMENT_DECIMALS`], 6),
+    // Kept verbatim when malformed so the boot refusal below can name it; `absoluteUrl` would turn it into "".
+    registryUrl: absoluteUrl(registryUrlRaw) || registryUrlRaw,
+    registryAuth: (str(env[`${prefix}_REGISTRY_AUTH`], "keycloak").toLowerCase() ||
+      "keycloak") as RegistryAuth,
+    walletInstrumentId: str(env[`${prefix}_WALLET_INSTRUMENT_ID`]) || id,
+  };
+}
+
 function keycloakFrom(env: NodeJS.ProcessEnv, prefix: string): Partial<KeycloakConfig> {
   const out: Partial<KeycloakConfig> = {};
   const url = absoluteUrl(env[`${prefix}_URL`]);
@@ -461,7 +572,7 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     backendProxySecret: str(env.BACKEND_PROXY_SECRET),
     corsOrigins: parseList(env.CORS_ORIGINS).map((o) => o.replace(/\/$/, "")),
 
-    googleClientIds: parseList(env.GOOGLE_CLIENT_IDS ?? env.GOOGLE_CLIENT_ID),
+    googleClientIds: parseList(env.GOOGLE_CLIENT_IDS),
     googleNonceRequired: parseAutoBool(env.GOOGLE_NONCE_REQUIRED, !isDev),
     telegramBotToken: str(env.TELEGRAM_BOT_TOKEN),
     telegramBotUsername: str(env.TELEGRAM_BOT_USERNAME).replace(/^@/, ""),
@@ -490,8 +601,8 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
       ledgerApiUrl: absoluteUrl(env.ZKPC_LEDGER_API_URL),
       keycloakUrl: absoluteUrl(env.ZKPC_KEYCLOAK_URL),
       keycloakRealm: str(env.ZKPC_KEYCLOAK_REALM, "master") || "master",
-      clientId: str(env.ZKPC_KEYCLOAK_CLIENT_ID ?? env.ZKPC_CLIENT_ID),
-      clientSecret: str(env.ZKPC_KEYCLOAK_CLIENT_SECRET ?? env.ZKPC_CLIENT_SECRET),
+      clientId: str(env.ZKPC_KEYCLOAK_CLIENT_ID),
+      clientSecret: str(env.ZKPC_KEYCLOAK_CLIENT_SECRET),
     },
 
     kycProvider: str(env.KYC_PROVIDER, "mock").toLowerCase() as KycProviderSetting,
@@ -530,11 +641,27 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     indexerAcsLimit: parseIntOr(env.INDEXER_ACS_LIMIT, 10_000),
     indexerStartOffset: parseIntOr(env.INDEXER_START_OFFSET, 0),
     indexerLockTtlMs: parseIntOr(env.INDEXER_LOCK_TTL_MS, 30_000),
-    indexerTrackTransfers: parseBool(env.INDEXER_TRACK_TRANSFERS, true),
     splicePackageName: str(env.SPLICE_AMULET_PACKAGE_NAME, "splice-amulet") || "splice-amulet",
-    indexerUpdatesEndpoint: (str(env.INDEXER_UPDATES_ENDPOINT, "auto").toLowerCase() ||
-      "auto") as IndexerUpdatesEndpoint,
     indexerPartyOverride: str(env.INDEXER_PARTY),
+
+    collateralInstrument: instrumentFrom(env, "COLLATERAL"),
+    rewardsInstrument: instrumentFrom(env, "REWARDS"),
+    auditObserverParties: parseList(env.AUDIT_OBSERVER_PARTIES),
+    treasuryTransferMode: (str(env.TREASURY_TRANSFER_MODE, "wallet").toLowerCase() ||
+      "wallet") as TreasuryTransferMode,
+    treasuryTransferTtlSec: parseIntOr(env.TREASURY_TRANSFER_TTL_SEC, 600),
+    ledgerFreshOffsets: parseIntOr(env.LEDGER_FRESH_OFFSETS, 50),
+    acceptorScanMs: parseIntOr(env.ACCEPTOR_SCAN_MS, 10_000),
+    registryKeycloak: keycloakFrom(env, "REGISTRY_KEYCLOAK"),
+    tokenApp: {
+      url: absoluteUrl(env.TOKEN_APP_URL) || str(env.TOKEN_APP_URL),
+      appName: str(env.TOKEN_APP_APP_NAME, "truthoracle") || "truthoracle",
+      keycloak: keycloakFrom(env, "TOKEN_APP_KEYCLOAK"),
+    },
+    rewardsEnabled: parseBool(env.REWARDS_ENABLED, true),
+    rewardsScanMs: parseIntOr(env.REWARDS_SCAN_MS, 30_000),
+    rewardsAutoMint: parseBool(env.REWARDS_AUTO_MINT, false),
+    rewardsMintMin: tryParseAmount(str(env.REWARDS_MINT_MIN, "1000") || "1000") ?? -1n,
   };
 
   // Object.assign (not class-transformer): plainToInstance would rebuild the Map as an empty one.
@@ -555,12 +682,16 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     issues.push("SUMSUB_APP_TOKEN is a sandbox token (sbx:) but APP_NETWORK=mainnet");
   }
   if (config.kycProvider === "sumsub" && config.sumsub.appToken && !config.sumsub.webhookSecret) {
-    issues.push("KYC_PROVIDER=sumsub requires SUMSUB_WEBHOOK_SECRET (sessions would start while every webhook is rejected with 401)");
+    issues.push(
+      "KYC_PROVIDER=sumsub requires SUMSUB_WEBHOOK_SECRET (sessions would start while every webhook is rejected with 401)",
+    );
   }
   if ((isProd || config.isMainnet) && !config.dbSslInsecureAck) {
     const local = /(localhost|127\.0\.0\.1|@postgres[:/])/.test(config.databaseUrl);
     if (config.dbSsl === "true" || (config.dbSsl === "auto" && !local)) {
-      issues.push("DB_SSL=true/auto does not verify the Postgres server certificate; set DB_SSL=verify (with DB_SSL_CA when needed) or DB_SSL_INSECURE_ACK=true to accept unverified TLS in prod / on mainnet");
+      issues.push(
+        "DB_SSL=true/auto does not verify the Postgres server certificate; set DB_SSL=verify (with DB_SSL_CA when needed) or DB_SSL_INSECURE_ACK=true to accept unverified TLS in prod / on mainnet",
+      );
     }
   }
   if (config.isMainnet) {
@@ -580,23 +711,69 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
     issues.push("KYC_PEPPER_ROTATION_ACK must be the sha256 hex of the new pepper");
   }
   for (const [party, key] of config.adminOperators) {
-    if (!/^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}$/.test(party)) {
+    if (!PARTY_ID_RE.test(party)) {
       issues.push(`ADMIN_OPERATORS entry is not a Canton party id: ${party.slice(0, 24)}…`);
     }
     if (key && !/^[A-Za-z0-9+/=_-]{40,90}$/.test(key)) {
       issues.push(`ADMIN_OPERATORS pinned key for ${party.slice(0, 24)}… is not hex/base64`);
     }
   }
-  if (
-    config.indexerPartyOverride &&
-    !/^[A-Za-z0-9_.-]{1,255}::1220[0-9a-f]{64}$/.test(config.indexerPartyOverride)
-  ) {
+  if (config.indexerPartyOverride && !PARTY_ID_RE.test(config.indexerPartyOverride)) {
     issues.push("INDEXER_PARTY is not a Canton party id");
   }
   for (const origin of [...config.frontendOrigins, ...config.corsOrigins]) {
     if (!/^https?:\/\/[A-Za-z0-9*.-]+(:\d+)?$/.test(origin)) {
       issues.push(`origin entry is not an origin (scheme://host[:port]): ${origin}`);
     }
+  }
+
+  // ── instruments (docs/TOKENS.md §4.1, §4.7) ──
+  // A collateral id without its admin party identifies nothing on the ledger; the boot upsert would
+  // register a token no market can ever be denominated in, so the process refuses outright. The
+  // rewards instrument is softer: TRO may not exist on a network yet, so a missing admin leaves the
+  // rewards processor idle instead of blocking trading.
+  const collateral = config.collateralInstrument;
+  if (collateral.id && !collateral.admin) {
+    issues.push(
+      "COLLATERAL_INSTRUMENT_ID is set without COLLATERAL_INSTRUMENT_ADMIN (the instrument's registry / transfer-agent party)",
+    );
+  }
+  if (collateral.admin && !collateral.id) {
+    issues.push("COLLATERAL_INSTRUMENT_ADMIN is set without COLLATERAL_INSTRUMENT_ID");
+  }
+  for (const [prefix, instrument] of [
+    ["COLLATERAL", config.collateralInstrument],
+    ["REWARDS", config.rewardsInstrument],
+  ] as const) {
+    if (instrument.admin && !PARTY_ID_RE.test(instrument.admin)) {
+      issues.push(`${prefix}_INSTRUMENT_ADMIN is not a Canton party id`);
+    }
+    if (
+      !Number.isInteger(instrument.decimals) ||
+      instrument.decimals < 0 ||
+      instrument.decimals > AMOUNT_DECIMALS
+    ) {
+      issues.push(`${prefix}_INSTRUMENT_DECIMALS must be an integer in 0..${AMOUNT_DECIMALS}`);
+    }
+    if (!(REGISTRY_AUTHS as readonly string[]).includes(instrument.registryAuth)) {
+      issues.push(`${prefix}_REGISTRY_AUTH must be one of ${REGISTRY_AUTHS.join(", ")}`);
+    }
+    if (instrument.registryUrl && !/^https?:\/\//i.test(instrument.registryUrl)) {
+      issues.push(`${prefix}_REGISTRY_URL is not an absolute http(s) URL`);
+    }
+  }
+  for (const party of config.auditObserverParties) {
+    if (!PARTY_ID_RE.test(party))
+      issues.push(`AUDIT_OBSERVER_PARTIES entry is not a Canton party id: ${party.slice(0, 24)}…`);
+  }
+  if (config.tokenApp.url && !/^https?:\/\//i.test(config.tokenApp.url)) {
+    issues.push("TOKEN_APP_URL is not an absolute http(s) URL");
+  }
+  if (config.acceptorScanMs !== 0 && config.acceptorScanMs < 1000) {
+    issues.push("ACCEPTOR_SCAN_MS must be 0 (off) or at least 1000");
+  }
+  if (config.rewardsMintMin < 0n) {
+    issues.push("REWARDS_MINT_MIN must be a non-negative decimal amount of the rewards instrument");
   }
 
   if (issues.length > 0) {

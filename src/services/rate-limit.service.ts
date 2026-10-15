@@ -26,7 +26,10 @@ const MINUTE = 60_000;
  * Fixed-window limits keyed by client IP (from the proxy contract) AND by subject
  * (docs/ARCHITECTURE.md §13). Each entry: [dimension, max per minute].
  */
-export const RATE_LIMITS: Record<RateLimitScope, { dim: "ip" | "subject" | "userId"; max: number; windowMs: number }[]> = {
+export const RATE_LIMITS: Record<
+  RateLimitScope,
+  { dim: "ip" | "subject" | "userId"; max: number; windowMs: number }[]
+> = {
   login: [
     { dim: "ip", max: 10, windowMs: MINUTE },
     { dim: "subject", max: 5, windowMs: MINUTE },
@@ -53,7 +56,10 @@ export class RateLimitService {
     const result = await this.redis.hitRateLimit(`rl:${scope}:${key}`, windowMs, max);
     if (result.limited) {
       const retryAfterSec = Math.max(1, Math.ceil(result.retryAfterMs / 1000));
-      throw new ApiError(429, "rate_limited", "too many requests, try again shortly", { scope, retryAfterSec });
+      throw new ApiError(429, "rate_limited", "too many requests, try again shortly", {
+        scope,
+        retryAfterSec,
+      });
     }
   }
 

@@ -75,31 +75,31 @@ export class MarketSnapshotEntity {
   lpTokenSupply!: bigint;
 
   @Column({
-    name: "total_volume_cc",
+    name: "total_volume",
     type: "numeric",
     precision: 38,
     scale: 10,
     transformer: moneyTransformer,
   })
-  totalVolumeCC!: bigint;
+  totalVolume!: bigint;
 
   @Column({
-    name: "accumulated_fees_cc",
+    name: "accumulated_fees",
     type: "numeric",
     precision: 38,
     scale: 10,
     transformer: moneyTransformer,
   })
-  accumulatedFeesCC!: bigint;
+  accumulatedFees!: bigint;
 
   @Column({
-    name: "prize_pool_cc",
+    name: "prize_pool",
     type: "numeric",
     precision: 38,
     scale: 10,
     transformer: moneyTransformer,
   })
-  prizePoolCC!: bigint;
+  prizePool!: bigint;
 
   @Column({ type: "text" })
   status!: MarketStatus;

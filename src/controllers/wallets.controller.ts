@@ -1,4 +1,14 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Post, Req } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Req,
+} from "@nestjs/common";
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
@@ -25,22 +35,32 @@ export class WalletsController {
     private readonly rateLimit: RateLimitService,
   ) {}
 
-  /** Every row (active AND revoked — revoked wallets keep their attribution), with ownLedgerWallet. */
+  /** Every row (active AND revoked — revoked wallets keep their attribution), with per-instrument credits and ownLedgerWallets. */
   @Get()
   async list(@Req() req: AuthedRequest): Promise<{ wallets: ApiWallet[] }> {
     const { user } = principalOf(req);
     const rows = await this.walletLinks.listForUser(user.id);
-    const own = await this.walletLinks.ownLedgerWallets(rows, user.partyId);
-    return { wallets: rows.map((w) => this.walletLinks.toApi(w, { ownLedgerWallet: own.get(w.id) ?? null })) };
+    return { wallets: await this.walletLinks.toApiMany(rows, user.partyId) };
   }
 
   /** Rate limits: challenge 30/min/IP + 10/min per (IP, party) — the party alone is public and must not be spendable by strangers (§13). */
   @Post("link-challenge")
   @HttpCode(200)
-  async linkChallenge(@Body() body: LinkChallengeDto, @Req() req: AuthedRequest): Promise<ApiChallenge> {
+  async linkChallenge(
+    @Body() body: LinkChallengeDto,
+    @Req() req: AuthedRequest,
+  ): Promise<ApiChallenge> {
     const { session } = principalOf(req);
-    await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: `${req.clientIp ?? "unknown"}:${body.partyId}` });
-    return this.challenges.issue({ partyId: body.partyId, purpose: "link-wallet", sessionId: session.id, host: req.requestHost ?? "" });
+    await this.rateLimit.enforce("challenge", {
+      ip: req.clientIp,
+      subject: `${req.clientIp ?? "unknown"}:${body.partyId}`,
+    });
+    return this.challenges.issue({
+      partyId: body.partyId,
+      purpose: "link-wallet",
+      sessionId: session.id,
+      host: req.requestHost ?? "",
+    });
   }
 
   /**
@@ -49,7 +69,10 @@ export class WalletsController {
    */
   @Post("link")
   @HttpCode(200)
-  async link(@Body() body: LinkWalletDto, @Req() req: AuthedRequest): Promise<{ wallet: ApiWallet }> {
+  async link(
+    @Body() body: LinkWalletDto,
+    @Req() req: AuthedRequest,
+  ): Promise<{ wallet: ApiWallet }> {
     const { user, session } = principalOf(req);
     await this.rateLimit.enforce("link", { userId: user.id });
     const verified = await this.challenges.verify({
@@ -65,13 +88,16 @@ export class WalletsController {
       { partyId: verified.partyId, publicKeyBase64: verified.publicKeyBase64, kind: body.kind },
       { label: body.label, actor: actorOf(req) },
     );
-    return { wallet: this.walletLinks.toApi(linked.wallet) };
+    return { wallet: await this.walletLinks.toApiWithCredits(linked.wallet) };
   }
 
   /** `200 { ok: true }` | `409 primary_wallet_in_use` (§8.2). Identities are never touched. */
   @Delete(":id")
   @HttpCode(200)
-  async unlink(@Param("id", ParseUUIDPipe) id: string, @Req() req: AuthedRequest): Promise<{ ok: true }> {
+  async unlink(
+    @Param("id", ParseUUIDPipe) id: string,
+    @Req() req: AuthedRequest,
+  ): Promise<{ ok: true }> {
     const { user } = principalOf(req);
     await this.walletLinks.unlink(user.id, id, actorOf(req));
     return { ok: true };
@@ -80,9 +106,12 @@ export class WalletsController {
   /** §8.2: only while the user has no UserWallet on-ledger and no queued payouts → `409 primary_wallet_in_use`. */
   @Post(":id/primary")
   @HttpCode(200)
-  async setPrimary(@Param("id", ParseUUIDPipe) id: string, @Req() req: AuthedRequest): Promise<{ wallet: ApiWallet }> {
+  async setPrimary(
+    @Param("id", ParseUUIDPipe) id: string,
+    @Req() req: AuthedRequest,
+  ): Promise<{ wallet: ApiWallet }> {
     const { user } = principalOf(req);
     const wallet = await this.walletLinks.setPrimary(user.id, id, actorOf(req));
-    return { wallet: this.walletLinks.toApi(wallet) };
+    return { wallet: await this.walletLinks.toApiWithCredits(wallet) };
   }
 }

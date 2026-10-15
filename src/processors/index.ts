@@ -5,3 +5,5 @@ export { DepositConfirmProcessor } from "./deposit-confirm.processor";
 export { PayoutSettlementProcessor } from "./payout-settlement.processor";
 export { KycWebhookProcessor } from "./kyc-webhook.processor";
 export { LedgerIndexerProcessor } from "./ledger-indexer.processor";
+export { TransferInstructionAcceptorProcessor } from "./transfer-instruction-acceptor.processor";
+export { RewardsProcessor } from "./rewards.processor";
