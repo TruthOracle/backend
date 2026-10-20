@@ -3,6 +3,9 @@ import { Injectable, Logger } from "@nestjs/common";
 
 import { Config } from "../config";
 import type {
+  ApplicantAmlScreening,
+  ApplicantIdentityData,
+  ApplicantNameForm,
   ApplicantSummary,
   KycEvent,
   KycEventKind,
@@ -243,10 +246,11 @@ export function normaliseSumsubApplicant(data: unknown): ApplicantSummary {
   const completed = asString(review.reviewStatus).toLowerCase() === "completed";
   const answer = completed ? reviewAnswer(result.reviewAnswer) : null;
   const docs = Array.isArray(info.idDocs) ? info.idDocs : [];
+  const labels = stringList(result.rejectLabels);
   return {
     answer,
     rejectType: answer === "RED" ? rejectType(result.reviewRejectType) : null,
-    labels: stringList(result.rejectLabels),
+    labels,
     levelName: asString(review.levelName).trim() || asString(a.levelName).trim() || null,
     sandbox: isSandbox(a),
     documents: docs
@@ -266,7 +270,165 @@ export function normaliseSumsubApplicant(data: unknown): ApplicantSummary {
       dob: asString(info.dob).trim() || null,
       country: asString(info.country).trim() || null,
     },
+    identity: sumsubIdentity(a, info, docs.map(obj), labels),
   };
+}
+
+// ── compliance identity (SPEC §11.1; stage S7a) ──
+
+/** Sumsub's AML-type reject labels → its AML risk-label API names (rejection buttons, docs.sumsub.com). */
+const SUMSUB_AML_REJECT_LABELS: Readonly<Record<string, string>> = {
+  PEP: "pep",
+  SANCTIONS: "sanctions",
+  ADVERSE_MEDIA: "adverseMedia",
+  CRIMINAL: "crime",
+  COMPROMISED_PERSONS: "compromisedPersons",
+};
+/** Which document is "the" identity document when several are on file. */
+const SUMSUB_DOC_PREFERENCE = ["ID_CARD", "PASSPORT", "RESIDENCE_PERMIT", "DRIVERS"];
+/** Sumsub answers this date for a document marked termless (`termless: true`). */
+const SUMSUB_TERMLESS = "2099-01-01";
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function text(value: unknown): string | null {
+  return asString(value).trim() || null;
+}
+
+function isoDate(value: unknown): string | null {
+  const v = text(value);
+  return v && ISO_DATE_RE.test(v.slice(0, 10)) ? v.slice(0, 10) : null;
+}
+
+/**
+ * Every distinct name form Sumsub holds: the profile's and each document's, as written (the
+ * document's own language) and as `*En` (its transliteration) — a Belarusian document can carry
+ * Belarusian, Russian and Latin forms (M2). Forms equal up to case are kept once.
+ */
+function sumsubNames(sources: Record<string, unknown>[]): ApplicantNameForm[] {
+  const seen = new Set<string>();
+  const out: ApplicantNameForm[] = [];
+  for (const s of sources)
+    for (const suffix of ["", "En"]) {
+      const firstName = text(s[`firstName${suffix}`]);
+      const lastName = text(s[`lastName${suffix}`]);
+      if (!firstName || !lastName) continue;
+      const middleName = text(s[`middleName${suffix}`]);
+      const key = [lastName, firstName, middleName ?? ""].join("|").toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ firstName, lastName, middleName });
+    }
+  return out;
+}
+
+function sumsubDocument(docs: Record<string, unknown>[]): ApplicantIdentityData["document"] {
+  const typed = docs.filter((d) => text(d.idDocType));
+  const rank = (d: Record<string, unknown>): number => {
+    const i = SUMSUB_DOC_PREFERENCE.indexOf(asString(d.idDocType).trim().toUpperCase());
+    return i < 0 ? SUMSUB_DOC_PREFERENCE.length : i;
+  };
+  const doc = [...typed].sort((x, y) => rank(x) - rank(y))[0];
+  if (!doc) return null;
+  const validUntil = isoDate(doc.validUntil);
+  return {
+    type: asString(doc.idDocType).trim().toUpperCase(),
+    country: text(doc.country),
+    number: text(doc.number),
+    personalNumber: text(doc.additionalNumber),
+    issuedAt: isoDate(doc.issuedDate),
+    expiresAt: doc.termless === true || validUntil === SUMSUB_TERMLESS ? null : validUntil,
+  };
+}
+
+/** Labels → flags. `screened` = the source ran an AML check (an absent label is then a false). */
+export function amlFromLabels(labels: readonly string[], screened: boolean): ApplicantAmlScreening {
+  const has = (...names: string[]): boolean | null =>
+    names.some((n) => labels.includes(n)) ? true : screened ? false : null;
+  return {
+    pep: has("pep"),
+    sanctions: has("sanctions", "terrorism"),
+    adverseMedia: has("adverseMedia"),
+    labels: [...new Set(labels)],
+  };
+}
+
+/** AML evidence on the applicant record: AML-type reject labels and `riskLabels.aml` when present. */
+function sumsubApplicantAml(
+  a: Record<string, unknown>,
+  rejectLabels: readonly string[],
+): ApplicantAmlScreening | null {
+  const fromReject = rejectLabels
+    .map((l) => SUMSUB_AML_REJECT_LABELS[l])
+    .filter((l): l is string => Boolean(l));
+  const risk = obj(a.riskLabels).aml;
+  const screened = Array.isArray(risk);
+  const fromRisk = screened ? riskLabelNames(risk) : [];
+  if (!screened && fromReject.length === 0) return null;
+  return amlFromLabels([...fromReject, ...fromRisk], screened);
+}
+
+/** Risk labels as strings or `{label | name | value}` objects. */
+function riskLabelNames(list: unknown[]): string[] {
+  return list
+    .map((v) => {
+      if (typeof v === "string") return v.trim();
+      const o = obj(v);
+      return asString(o.label ?? o.name ?? o.value).trim();
+    })
+    .filter(Boolean);
+}
+
+function sumsubIdentity(
+  a: Record<string, unknown>,
+  info: Record<string, unknown>,
+  docs: Record<string, unknown>[],
+  rejectLabels: readonly string[],
+): ApplicantIdentityData {
+  const document = sumsubDocument(docs);
+  const primary = docs.find((d) => asString(d.idDocType).trim().toUpperCase() === document?.type);
+  const addresses = Array.isArray(info.addresses) ? info.addresses.map(obj) : [];
+  const addr = addresses[0] ?? obj(primary?.address);
+  const hasAddress = Object.keys(addr).length > 0;
+  const line =
+    text(addr.formattedAddress) ??
+    ([addr.street, addr.buildingNumber, addr.flatNumber, addr.subStreet, addr.postCode]
+      .map(text)
+      .filter(Boolean)
+      .join(", ") ||
+      null);
+  // Citizenship: the stated nationality, else a passport's / ID card's issuing country.
+  const citizenDoc = docs.find((d) =>
+    ["PASSPORT", "ID_CARD"].includes(asString(d.idDocType).trim().toUpperCase()),
+  );
+  const permit = docs.find(
+    (d) => asString(d.idDocType).trim().toUpperCase() === "RESIDENCE_PERMIT",
+  );
+  return {
+    names: sumsubNames([info, ...docs]),
+    birthPlace: text(info.placeOfBirthEn) ?? text(info.placeOfBirth) ?? text(primary?.placeOfBirth),
+    birthCountry: text(info.countryOfBirth),
+    nationality: text(info.nationality) ?? text(primary?.nationality) ?? text(citizenDoc?.country),
+    // Residence: the proof-of-address country, else a residence permit's, else the profile country.
+    residenceCountry: text(addr.country) ?? text(permit?.country) ?? text(info.country),
+    address: hasAddress
+      ? { country: text(addr.country), region: text(addr.state), city: text(addr.town), line }
+      : null,
+    document,
+    aml: sumsubApplicantAml(a, rejectLabels),
+  };
+}
+
+/**
+ * `GET /resources/api/applicants/{id}/amlCase` → screening (SPEC §11.1). The case's hits count
+ * unless an analyst marked them `false_positive`; a case without counting hits is a clean screen
+ * (false flags), never "unknown".
+ */
+export function normaliseSumsubAmlCase(data: unknown): ApplicantAmlScreening {
+  const hits = Array.isArray(obj(data).hits) ? (obj(data).hits as unknown[]).map(obj) : [];
+  const labels = hits
+    .filter((h) => asString(obj(h.review).matchStatus).toLowerCase() !== "false_positive")
+    .flatMap((h) => (Array.isArray(h.riskLabels) ? riskLabelNames(h.riskLabels) : []));
+  return amlFromLabels(labels, true);
 }
 
 /**
@@ -348,6 +510,24 @@ export class KycProviderSumsubService implements KycProvider {
       `/resources/applicants/${encodeURIComponent(applicantId)}/one`,
     );
     return normaliseSumsubApplicant(data);
+  }
+
+  /**
+   * The applicant's AML case (SPEC §11.1): `GET /resources/api/applicants/{id}/amlCase`. 404 = the
+   * level runs no AML screening → null (unknown, never "clean"); any other failure throws so the
+   * identity refresh fails closed.
+   */
+  async fetchAmlScreening(applicantId: string): Promise<ApplicantAmlScreening | null> {
+    try {
+      const data = await this.request<unknown>(
+        "GET",
+        `/resources/api/applicants/${encodeURIComponent(applicantId)}/amlCase`,
+      );
+      return normaliseSumsubAmlCase(data);
+    } catch (err) {
+      if (ApiError.is(err) && err.details?.upstreamStatus === 404) return null;
+      throw err;
+    }
   }
 
   /**

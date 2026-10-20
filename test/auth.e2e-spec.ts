@@ -783,6 +783,58 @@ describe("auth (e2e)", () => {
       expect(errorOf(native).error).toBe("validation_failed");
     });
 
+    it("an admin session never links an identity (SPEC §8, E-D11): Telegram and Google under the admin cookie → 403; the admin row keeps only its canton_wallet identity", async () => {
+      const login = await postAdmin(proof(operator, await issueAdminChallenge(operator))).expect(
+        200,
+      );
+      const adminCookie = cookieFromResponse(login);
+      const adminUserId = bodyOf<ApiLoginResult>(login).user.id;
+      const opal = tg("100091", "Opal");
+
+      const viaTelegram = await http()
+        .post("/api/v1/auth/telegram/widget")
+        .set(CSRF)
+        .set("Cookie", adminCookie)
+        .send(freshWidgetPayload(opal))
+        .expect(403);
+      expect(errorOf(viaTelegram)).toMatchObject({
+        error: "forbidden",
+        message: "identities cannot be linked under an admin session",
+      });
+      expect(sessionCookieOf(viaTelegram)).toBeUndefined();
+      const { nonce } = bodyOf<{ nonce: string }>(
+        await http().post("/api/v1/auth/google/nonce").set(CSRF).send({}).expect(200),
+      );
+      const viaGoogle = await http()
+        .post("/api/v1/auth/google")
+        .set(CSRF)
+        .set("Cookie", adminCookie)
+        .send({
+          credential: fakeIdToken({
+            sub: "g-admin-link",
+            email: "ops@example.test",
+            email_verified: true,
+            name: "ops",
+            nonce,
+          }),
+          nonce,
+        })
+        .expect(403);
+      expect(errorOf(viaGoogle).error).toBe("forbidden");
+
+      expect(
+        (await repo(AuthIdentityEntity).find({ where: { userId: adminUserId } })).map(
+          (i) => i.provider,
+        ),
+      ).toEqual(["canton_wallet"]);
+      expect(await repo(AuthIdentityEntity).count()).toBe(1);
+      expect(await liveSessions(adminUserId)).toBe(1);
+      // Without the admin cookie the same Telegram account simply opens its own account.
+      const own = await tgSignIn(opal);
+      expect(own.result).toMatchObject({ mode: "login", created: true });
+      expect(own.user.id).not.toBe(adminUserId);
+    });
+
     it("a non-operator is refused at verify time (403 forbidden), never at issue time; with a session cookie: 409 at issue, 403 at login BEFORE the challenge is consumed", async () => {
       // Issue answers 200 for any well-formed party: the operator list is not an anonymous 403-vs-200 oracle.
       const nobody = makeTestWallet("nobody");

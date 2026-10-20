@@ -24,6 +24,7 @@ import {
   type Actor,
   type ApiKycSummary,
   type ApiKycVerification,
+  type ApplicantIdentityData,
   type ApplicantSummary,
   KYC_PROVIDER,
   type KycEvent,
@@ -250,6 +251,59 @@ interface Collision {
   boundUserId: string;
 }
 
+// ── compliance identity (SPEC §11.1; stage S7a) ──
+
+/** An account's KYC status after a change committed (what the identity refresh listens to). */
+export interface KycStatusChange {
+  userId: string;
+  userKycStatus: UserKycStatus;
+}
+
+/** The mock applicant's art.8 data (`POST /kyc/mock/submit` `identity`, defaults from `person`). */
+export function mockApplicantIdentity(dto: KycMockSubmitDto): ApplicantIdentityData {
+  const id = dto.identity;
+  const doc = dto.documents[0];
+  const residence = id?.residenceCountry ?? dto.person.country;
+  return {
+    names: id?.names?.length
+      ? id.names.map((n) => ({
+          firstName: n.firstName,
+          lastName: n.lastName,
+          middleName: n.middleName ?? null,
+        }))
+      : [{ firstName: dto.person.firstName, lastName: dto.person.lastName, middleName: null }],
+    birthPlace: id?.birthPlace ?? null,
+    birthCountry: null,
+    nationality: id?.nationality ?? dto.person.country,
+    residenceCountry: residence,
+    address: id?.addressLine
+      ? { country: residence, region: null, city: null, line: id.addressLine }
+      : null,
+    document: doc
+      ? {
+          type: doc.docType,
+          country: doc.country,
+          number: doc.number,
+          personalNumber: id?.personalNumber ?? null,
+          issuedAt: id?.docIssuedAt ?? null,
+          expiresAt: id?.docExpiresAt ?? null,
+        }
+      : null,
+    aml: id?.aml
+      ? {
+          pep: id.aml.pep ?? null,
+          sanctions: id.aml.sanctions ?? null,
+          adverseMedia: id.aml.adverseMedia ?? null,
+          labels: [
+            ...(id.aml.pep ? ["pep"] : []),
+            ...(id.aml.sanctions ? ["sanctions"] : []),
+            ...(id.aml.adverseMedia ? ["adverseMedia"] : []),
+          ],
+        }
+      : null,
+  };
+}
+
 /**
  * KYC lifecycle (ARCHITECTURE §9): sessions bound to the sign-in identity, provider events
  * ordered by `occurredAt`, approval only after the provider API confirms GREEN, one person one
@@ -259,6 +313,8 @@ interface Collision {
 @Injectable()
 export class KycService implements KycLockLookup {
   private readonly logger = new Logger(KycService.name);
+  /** SPEC §11.1 (S7a): after-commit listeners of account KYC status changes (the identity refresh). */
+  private readonly statusListeners = new Set<(change: KycStatusChange) => Promise<void>>();
 
   constructor(
     private readonly config: Config,
@@ -309,7 +365,11 @@ export class KycService implements KycLockLookup {
   }
 
   /** §9.4: the gate is evaluated on the given (payee) account. */
-  async withdrawalGate(userId: string): Promise<GateResult> {
+  /**
+   * `enforce` overrides KYC_ENFORCE_WITHDRAWALS: the fiat ramp (docs/RAMP.md §6) gates both
+   * directions on KYC whatever the withdrawal flag says (`RAMP_REQUIRE_KYC`).
+   */
+  async withdrawalGate(userId: string, opts: { enforce?: boolean } = {}): Promise<GateResult> {
     const user = await this.users.findOne({ where: { id: userId } });
     if (!user) return { allowed: false, reason: "user_suspended" };
     const hasApprovedAtLevel =
@@ -318,7 +378,7 @@ export class KycService implements KycLockLookup {
       })) > 0;
     const hasBinding = (await this.persons.count({ where: { userId, releasedAt: IsNull() } })) > 0;
     return gateDecision({
-      enforce: this.config.kycEnforceWithdrawals,
+      enforce: opts.enforce ?? this.config.kycEnforceWithdrawals,
       userStatus: user.status,
       kycStatus: user.kycStatus,
       hasApprovedAtLevel,
@@ -501,6 +561,8 @@ export class KycService implements KycLockLookup {
         dob: dto.person.dob,
         country: dto.person.country,
       },
+      // SPEC §11.1 (S7a): what a real provider holds besides the person (the identity refresh keeps it).
+      identity: mockApplicantIdentity(dto),
     };
     const event: StoredKycEvent = {
       type: "mock.submit",
@@ -702,7 +764,31 @@ export class KycService implements KycLockLookup {
     // Published once the transaction committed: a consumer (payout re-queue) that reads the user's
     // KYC state on receipt must see the approval, not the pre-commit row.
     this.publishStatusChanges(events);
+    await this.notifyStatusListeners(events);
     return outcome;
+  }
+
+  /**
+   * SPEC §11.1 (S7a): listen to account KYC status changes after they committed (the identity
+   * refresh on approval). Returns the unsubscribe.
+   */
+  onStatusChanged(listener: (change: KycStatusChange) => Promise<void>): () => void {
+    this.statusListeners.add(listener);
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  }
+
+  /** Awaited after commit; a failing listener is logged and never undoes the change (it retries lazily). */
+  private async notifyStatusListeners(events: StatusChangedEvent[]): Promise<void> {
+    for (const e of events)
+      for (const listener of this.statusListeners) {
+        try {
+          await listener({ userId: e.userId, userKycStatus: e.userKycStatus });
+        } catch (err) {
+          this.logger.warn(`KYC status listener failed for ${e.userId}: ${(err as Error).message}`);
+        }
+      }
   }
 
   private publishStatusChanges(events: StatusChangedEvent[]): void {
@@ -1107,6 +1193,7 @@ export class KycService implements KycLockLookup {
       return { row, event };
     });
     this.publishStatusChanges([event]);
+    await this.notifyStatusListeners([event]);
     return row;
   }
 
@@ -1241,6 +1328,7 @@ export class KycService implements KycLockLookup {
       });
     }
     this.publishStatusChanges(events);
+    await this.notifyStatusListeners(events);
   }
 
   /**

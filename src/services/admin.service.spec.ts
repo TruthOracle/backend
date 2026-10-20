@@ -25,6 +25,10 @@ const actor: AdminActor = {
   userId: "admin-user",
   sessionId: "admin-sess",
   ip: "10.0.0.1",
+  operatorParty: "op::1220" + "a".repeat(64),
+  personId: "op",
+  roles: ["ops", "approver", "aml", "export"],
+  publicKey: null,
 };
 const NOW = new Date("2026-09-10T10:00:00.000Z");
 

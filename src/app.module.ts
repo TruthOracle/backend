@@ -10,6 +10,7 @@ import { SessionGuard } from "./auth/session.guard";
 import { Config } from "./config";
 import * as controllers from "./controllers";
 import { KycMockController } from "./controllers/kyc-mock.controller";
+import { RampMockController } from "./controllers/ramp-mock.controller";
 import { buildDataSourceOptions, resolveDbSslCa } from "./data-source";
 import { postgresEntities } from "./entities";
 import * as processors from "./processors";
@@ -17,7 +18,14 @@ import * as services from "./services";
 import { KycProviderMockService } from "./services/kyc-provider-mock.service";
 import { KycProviderSumsubService } from "./services/kyc-provider-sumsub.service";
 import { KycService } from "./services/kyc.service";
-import { KYC_LOCK_LOOKUP, KYC_PROVIDER, type KycProvider } from "./types";
+import { RampProviderMockService } from "./services/ramp-provider-mock.service";
+import {
+  KYC_LOCK_LOOKUP,
+  KYC_PROVIDER,
+  RAMP_PROVIDER,
+  type KycProvider,
+  type RampProvider,
+} from "./types";
 import { AllExceptionsFilter } from "./util/errors";
 import { LedgerOffsetInterceptor } from "./util/ledger-offset.interceptor";
 
@@ -59,6 +67,12 @@ export class AppModule {
         ): KycProvider => (config.kycProvider === "mock" ? mock : sumsub),
         inject: [KycProviderMockService, KycProviderSumsubService],
       },
+      // The card acquirer (docs/RAMP.md §9): only the mock exists until the bank is chosen.
+      {
+        provide: RAMP_PROVIDER,
+        useFactory: (mock: RampProviderMockService): RampProvider => mock,
+        inject: [RampProviderMockService],
+      },
       // IdentityService resolves this lazily via ModuleRef (no constructor-time cycle with KycService).
       { provide: KYC_LOCK_LOOKUP, useExisting: KycService },
       // Order matters: SessionGuard resolves req.authKind before CsrfGuard consults it.
@@ -89,6 +103,9 @@ export class AppModule {
       controllers: [
         ...Object.values(controllers).filter(isClass),
         ...(config.kycProvider === "mock" ? [KycMockController] : []),
+        ...(config.ramp.provider === "mock" && config.appEnv !== "prod" && !config.isMainnet
+          ? [RampMockController]
+          : []),
       ],
       providers,
     };

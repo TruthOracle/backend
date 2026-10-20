@@ -39,7 +39,7 @@ import {
   type UserKycStatus,
 } from "../src/types";
 import type { ErrorBody } from "../src/util/errors";
-import { type TestApp, testEnv, useTestApp } from "./helpers/app";
+import { type TestApp, testEnv, useTestApp, PROD_CONTROLS } from "./helpers/app";
 import { FakeKycProvider, subjectMatches } from "./helpers/fakes";
 import { bodyOf, issueSessionDirect, linkWallet, signInAsAdmin } from "./helpers/session";
 import { nextTelegramUser, signInWithTelegram, type TelegramTestUser } from "./helpers/telegram";
@@ -1359,6 +1359,13 @@ describe("KYC (e2e)", () => {
       ZKPC_KEYCLOAK_CLIENT_ID: "zkpc-client",
       ZKPC_KEYCLOAK_CLIENT_SECRET: "zkpc-secret",
     };
+    // Prod-like boots need explicit sealing keyrings (SPEC §8).
+    const keyrings = {
+      DATA_KEYS: `k1:${Buffer.alloc(32, 1).toString("base64")}`,
+      DATA_KEY_ID: "k1",
+      DATA_INDEX_KEYS: `i1:${Buffer.alloc(32, 2).toString("base64")}`,
+      DATA_INDEX_KEY_ID: "i1",
+    };
 
     it("refuses KYC_PROVIDER=mock on APP_NETWORK=mainnet and on APP_ENV=prod", () => {
       expect(() =>
@@ -1375,6 +1382,10 @@ describe("KYC (e2e)", () => {
           SUMSUB_APP_TOKEN: "prd:token",
           SUMSUB_WEBHOOK_SECRET: "wh",
           ...zkpc,
+          ...keyrings,
+          ...PROD_CONTROLS,
+          // R2b-4: compliance stays on when prod-like, with the ramp off too.
+          RAMP_COMPLIANCE: "on",
         }),
       );
       expect(cfg.kycProvider).toBe("sumsub");

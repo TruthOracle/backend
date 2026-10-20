@@ -258,14 +258,19 @@ export class TreasuryTransferService {
   }
 
   /**
-   * The treasury's float in `instrument` against what the in-app wallets owe, both from the index
-   * (docs/TOKENS.md §4.6 float rule, §4.7 `GET /admin/tokens/status`): Σ of the treasury's active
-   * holdings, and Σ `UserWallet.balance` of every active wallet in the instrument. Canton Coin
-   * counts the same way — its Amulets are indexed as holdings (docs/INDEXER.md §6).
+   * The treasury's float in `instrument` against what it owes, all from the index (docs/TOKENS.md
+   * §4.6 float rule, §4.7 `GET /admin/tokens/status`): Σ of the treasury's active holdings, and
+   * the liabilities — Σ `UserWallet.balance` of every active wallet in the instrument plus Σ of
+   * every live `PendingPayout` in it (a withdrawal debited the wallet but the tokens are still the
+   * treasury's until the payout settles — T-D9). Canton Coin counts the same way — its Amulets
+   * are indexed as holdings (docs/INDEXER.md §6).
    */
-  async indexedBalances(
-    instrument: InstrumentId,
-  ): Promise<{ treasuryHoldings: bigint; liabilities: bigint }> {
+  async indexedBalances(instrument: InstrumentId): Promise<{
+    treasuryHoldings: bigint;
+    liabilities: bigint;
+    walletBalances: bigint;
+    pendingPayouts: bigint;
+  }> {
     const [held] = await this.holdings.manager.query<{ total: string }[]>(
       `SELECT COALESCE(SUM(amount), 0)::text AS total
          FROM to_ledger_holdings
@@ -278,7 +283,20 @@ export class TreasuryTransferService {
         WHERE instrument_admin = $1 AND instrument_id = $2 AND active = true`,
       [instrument.admin, instrument.id],
     );
-    return { treasuryHoldings: parseAmount(held.total), liabilities: parseAmount(owed.total) };
+    const [pending] = await this.holdings.manager.query<{ total: string }[]>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total
+         FROM to_ledger_payouts
+        WHERE instrument_admin = $1 AND instrument_id = $2 AND active = true`,
+      [instrument.admin, instrument.id],
+    );
+    const walletBalances = parseAmount(owed.total);
+    const pendingPayouts = parseAmount(pending.total);
+    return {
+      treasuryHoldings: parseAmount(held.total),
+      liabilities: walletBalances + pendingPayouts,
+      walletBalances,
+      pendingPayouts,
+    };
   }
 
   private async transferThroughRegistry(

@@ -10,6 +10,7 @@ import { KycVerificationEntity } from "../entities/kyc-verification.entity";
 import { UserEntity } from "../entities/user.entity";
 import type {
   Actor,
+  AdminRole,
   ApiAuditEvent,
   ApiIdentity,
   ApiKycSummary,
@@ -29,7 +30,7 @@ import { AuditService } from "./audit.service";
 import { IdentityService } from "./identity.service";
 import { KycService, verificationToApi } from "./kyc.service";
 import { LedgerClientService } from "./ledger-client.service";
-import { PayoutService } from "./payout.service";
+import { type PayoutMode, PayoutService } from "./payout.service";
 import { SessionService } from "./session.service";
 import { UserService } from "./user.service";
 import { WalletLinkService } from "./wallet-link.service";
@@ -40,6 +41,12 @@ export interface AdminActor extends Actor {
   userId: string;
   sessionId: string;
   ip: string | null;
+  /** SPEC §6.5 (X11): the operator's party, the PERSON behind it and their roles (AdminGuard). */
+  operatorParty: string;
+  personId: string;
+  roles: AdminRole[];
+  /** The key a signed decision is verified against (pinned, else the sign-in's); never logged or audited. */
+  publicKey: string | null;
 }
 
 /** `GET /admin/users/:id` (docs/API.md "Admin"). */
@@ -328,7 +335,7 @@ export class AdminService {
     cid: string,
     opts: { force: boolean; reason: string },
     actor: AdminActor,
-  ): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
+  ): Promise<{ payout: ApiPayout; mode: PayoutMode }> {
     const { payout, mode } = await this.payouts.settle(cid, {
       type: "admin",
       userId: actor.userId,

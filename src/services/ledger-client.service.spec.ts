@@ -52,6 +52,7 @@ const walletRow = (
 ): ActiveContract => ({
   contractId,
   payload: {
+    admin: TREASURY,
     owner,
     instrument,
     balance: deposited,
@@ -121,6 +122,7 @@ describe("LedgerClientService.fetchUserWallet", () => {
       {
         contractId: "uw-1",
         payload: {
+          admin: TREASURY,
           owner: OWNER,
           instrument: CC,
           balance: "1.0000000000",
@@ -147,6 +149,7 @@ describe("LedgerClientService.fetchUserWallet", () => {
       {
         contractId: "uw-1",
         payload: {
+          admin: TREASURY,
           owner: OWNER,
           balance: "1.0000000000",
           deposited: "1.0000000000",
@@ -195,13 +198,90 @@ describe("LedgerClientService.fetchPendingPayouts", () => {
     const legacy = build([
       {
         contractId: "pp-2",
-        payload: { user: OWNER, marketId: "0", amount: "1.0000000000", reason: "withdraw" },
+        payload: {
+          admin: TREASURY,
+          user: OWNER,
+          marketId: "0",
+          amount: "1.0000000000",
+          reason: "withdraw",
+        },
       },
     ]);
     await expect(legacy.service.fetchPendingPayouts()).rejects.toMatchObject({
       status: 502,
       code: "upstream_failed",
     });
+  });
+});
+
+describe("contracts the treasury only observes (review R3-01)", () => {
+  const MALLORY = "mallory::1220" + "b".repeat(64);
+  const payoutRow = (contractId: string, admin: string, user: string): ActiveContract => ({
+    contractId,
+    payload: {
+      admin,
+      user,
+      marketId: "0",
+      instrument: CC,
+      amount: "50000.0000000000",
+      reason: "withdraw",
+      createdAt: "1700000000",
+      auditObservers: [TREASURY],
+    },
+  });
+
+  it("a PendingPayout another party signed as admin is never owed by the treasury, and alerts once", async () => {
+    const { service, sentry } = build([
+      payoutRow("pp-ours", TREASURY, OWNER),
+      payoutRow("pp-planted", MALLORY, MALLORY),
+    ]);
+    await expect(service.fetchPendingPayouts({ uncached: true })).resolves.toEqual([
+      expect.objectContaining({ contractId: "pp-ours", user: OWNER }),
+    ]);
+    await expect(service.fetchPendingPayout("pp-planted", { uncached: true })).resolves.toBeNull();
+    await expect(service.fetchPendingPayout("pp-ours")).resolves.toMatchObject({
+      contractId: "pp-ours",
+    });
+    expect(sentry.captureMessage).toHaveBeenCalledTimes(1);
+    expect(sentry.captureMessage).toHaveBeenCalledWith(
+      "contract naming the treasury only as an observer ignored",
+      "error",
+      { entity: "PendingPayout", contractId: "pp-planted", admin: MALLORY },
+    );
+  });
+
+  it("a planted UserWallet for the same owner is not a duplicate wallet and not the owner's balance", async () => {
+    const planted = walletRow("uw-planted", OWNER, "50000.0000000000");
+    planted.payload.admin = MALLORY;
+    const { service } = build([walletRow("uw-ours", OWNER), planted]);
+    await expect(service.fetchUserWallet(OWNER, CC)).resolves.toMatchObject({
+      contractId: "uw-ours",
+      balance: 10_000_000_000n,
+    });
+    await expect(service.fetchAllUserWallets()).resolves.toHaveLength(1);
+  });
+
+  it("a PredictionMarket another party signed is not a market to resolve", async () => {
+    const { service } = build([
+      { contractId: "mk-ours", payload: { admin: TREASURY, marketId: "7" } },
+      { contractId: "mk-planted", payload: { admin: MALLORY, marketId: "7" } },
+    ]);
+    await expect(service.fetchMarketContracts("7")).resolves.toEqual(["mk-ours"]);
+  });
+});
+
+describe("LedgerClientService.fetchMarketContracts (W9g F0)", () => {
+  it("names the active PredictionMarket contracts of one market id, uncached, as the treasury", async () => {
+    const { service } = build([
+      { contractId: "mk-7a", payload: { admin: TREASURY, marketId: "7", status: "Trading" } },
+      { contractId: "mk-70", payload: { admin: TREASURY, marketId: "70", status: "Trading" } },
+      { contractId: "mk-8", payload: { admin: TREASURY, marketId: 8, status: "Trading" } },
+    ]);
+    const reads = jest.spyOn(service, "activeContracts");
+    await expect(service.fetchMarketContracts("7", { uncached: true })).resolves.toEqual(["mk-7a"]);
+    await expect(service.fetchMarketContracts("8")).resolves.toEqual(["mk-8"]);
+    await expect(service.fetchMarketContracts("9")).resolves.toEqual([]);
+    expect(reads).toHaveBeenCalledWith(TREASURY, "PredictionMarket", { uncached: true });
   });
 });
 

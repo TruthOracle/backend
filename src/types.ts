@@ -43,6 +43,71 @@ export const ERROR_CODES = [
   "instrument_unknown",
   "instrument_disabled",
   "instrument_exists",
+  // token-app commands (docs/RAMP.md §7; S1)
+  "token_app_unauthorized",
+  "token_app_forbidden",
+  "token_app_invalid_request",
+  "token_app_cap",
+  "token_command_conflict",
+  "token_command_state",
+  // fiat ramp (docs/RAMP.md §8)
+  "ramp_unavailable",
+  "ramp_not_eligible",
+  "ramp_limit_exceeded",
+  "ramp_quote_changed",
+  "ramp_order_open",
+  "ramp_order_state",
+  "idempotency_key_reused",
+  // methods, card cash-out, exposure, rails (SPEC §9, §12.1; S5)
+  "ramp_exposure",
+  "ramp_card_cashout_limit",
+  "ramp_rail_unavailable",
+  // controls: halts, gates, four-eyes approvals (SPEC §6, §12.2; S4)
+  "ramp_paused",
+  "reserve_gate",
+  "payout_gate",
+  "role_required",
+  "approval_pending",
+  "approval_not_pending",
+  "approval_expired",
+  "approval_self",
+  "approval_same_person",
+  "approval_linked_person",
+  "approval_role_required",
+  "approval_signature_required",
+  "approval_signature_invalid",
+  "approval_precondition_changed",
+  "approval_failed",
+  "ramp_card_state",
+  // review group A: a webhook already applied or closed (C31)
+  "ramp_event_state",
+  // bank rail: accounts, batches, statements (SPEC §10, §12; S6)
+  "bank_account_invalid",
+  "bank_account_exists",
+  "bank_account_limit",
+  "bank_account_in_use",
+  "recent_auth_required",
+  "kyc_identity_unavailable",
+  "batch_state",
+  "batch_held",
+  "batch_export_mismatch",
+  "statement_invalid",
+  "statement_account",
+  "statement_duplicate",
+  "statement_continuity",
+  "statement_mismatch",
+  "bank_line_state",
+  // compliance: consent, alerts, exports (SPEC §11, §12; S7a)
+  "compliance_alert_state",
+  "export_range",
+  // screening, freezes (SPEC §11.6; S7b)
+  "screening_list_invalid",
+  "screening_list_exists",
+  "screening_hit_state",
+  "screening_hits_open",
+  "rescreen_running",
+  "freeze_active",
+  "freeze_state",
   // kyc
   "kyc_required",
   "kyc_duplicate_identity",
@@ -57,6 +122,8 @@ export const ERROR_CODES = [
   "insufficient_shares",
   "quote_unavailable",
   "catalog_conflict",
+  // review F0: the market's status, clock window, policy or attestations refuse the resolution
+  "market_not_resolvable",
   // generic
   "validation_failed",
   "bad_request",
@@ -78,6 +145,8 @@ export type ErrorCode = (typeof ERROR_CODES)[number];
 
 /** Bound in AppModule to KycProviderMockService (KYC_PROVIDER=mock) or KycProviderSumsubService. */
 export const KYC_PROVIDER = Symbol("KYC_PROVIDER");
+/** Bound in AppModule to the RAMP_PROVIDER adapter (docs/RAMP.md §9); only `mock` exists until the bank is chosen. */
+export const RAMP_PROVIDER = Symbol("RAMP_PROVIDER");
 /**
  * Lazy lookup used by IdentityService to honour the KYC lock (§6.5) without a constructor-time
  * dependency on KycService. AppModule binds it with `useExisting: KycService`.
@@ -236,6 +305,59 @@ export interface ApplicantSummary {
     dob: string | null;
     country: string | null;
   };
+  /**
+   * SPEC §11.1 (S7a): the art.8 identity data the provider holds — every name form, birth place,
+   * nationality, residence, address, the identity document — plus any AML screening it exposes.
+   * Optional: summaries built in memory elsewhere (the mock submit, fakes) may omit it.
+   */
+  identity?: ApplicantIdentityData;
+}
+
+// ── compliance identity (SPEC §11.1; stage S7a) ──
+
+/** One way the provider writes the applicant's name (original script, or its Latin transliteration). */
+export interface ApplicantNameForm {
+  firstName: string;
+  lastName: string;
+  middleName: string | null;
+}
+
+/** Countries exactly as the provider gives them (Sumsub: ISO alpha-3); dates `YYYY-MM-DD`. */
+export interface ApplicantIdentityData {
+  /** Every distinct name form: profile and documents, original script and transliterations. */
+  names: ApplicantNameForm[];
+  birthPlace: string | null;
+  birthCountry: string | null;
+  nationality: string | null;
+  residenceCountry: string | null;
+  address: {
+    country: string | null;
+    region: string | null;
+    city: string | null;
+    line: string | null;
+  } | null;
+  /** The primary identity document (ID card, passport, residence permit, …). */
+  document: {
+    type: string;
+    country: string | null;
+    number: string | null;
+    /** The personal / identification number (Belarus: идентификационный номер). */
+    personalNumber: string | null;
+    issuedAt: string | null;
+    /** null = termless or unknown. */
+    expiresAt: string | null;
+  } | null;
+  /** AML screening the applicant record itself carries (null = none exposed). */
+  aml: ApplicantAmlScreening | null;
+}
+
+/** A provider's AML screening result. A flag is null when the provider did not screen it (never false then). */
+export interface ApplicantAmlScreening {
+  pep: boolean | null;
+  sanctions: boolean | null;
+  adverseMedia: boolean | null;
+  /** The provider's risk labels (Sumsub API names: pep, sanctions, terrorism, crime, adverseMedia, …). */
+  labels: string[];
 }
 
 export interface KycSessionResult {
@@ -281,6 +403,325 @@ export interface KycProvider {
     headers: Record<string, string | string[] | undefined>,
   ): KycEvent | null;
   fetchApplicant(applicantId: string): Promise<ApplicantSummary>;
+  /**
+   * SPEC §11.1 (S7a): the applicant's AML screening case, when the provider runs one. null = no
+   * case (not screened); throws when unreachable (the identity refresh fails closed).
+   */
+  fetchAmlScreening?(applicantId: string): Promise<ApplicantAmlScreening | null>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fiat ramp (docs/RAMP.md) — orders and the acquirer abstraction (§9)
+// ---------------------------------------------------------------------------------------------
+
+/** Add the bank adapter's name here and to the RAMP_PROVIDER factory (docs/RAMP.md §9). */
+export type RampProviderName = "mock";
+
+export const RAMP_DIRECTIONS = ["onramp", "offramp"] as const;
+export type RampDirection = (typeof RAMP_DIRECTIONS)[number];
+
+/** How an on-ramp is paid (SPEC §9.2; KROK is out of scope). */
+export const RAMP_METHODS = ["card", "erip"] as const;
+export type RampMethod = (typeof RAMP_METHODS)[number];
+/** Where a cash-out's fiat goes (SPEC §9.3): back to the funding card, or a BYN IBAN (S6). */
+export const RAMP_PAYOUT_RAILS = ["card", "bank"] as const;
+export type RampPayoutRail = (typeof RAMP_PAYOUT_RAILS)[number];
+/** Card cash-out (SPEC §9.3): partial refunds of the card's captures, an OCT, or none. */
+export type RampCardCashoutMode = "refund" | "oct" | "none";
+
+/**
+ * What the payer does next (SPEC §9.1): the acquirer's hosted page, or an ERIP payment by service
+ * code + account number. Validated before it is stored (X15, `rampNextProblem`); never fetched.
+ */
+export type RampPaymentNext =
+  | { kind: "redirect"; url: string }
+  | {
+      kind: "erip";
+      serviceCode: string;
+      /** The order's payout-reference digits (12). */
+      accountNumber: string;
+      /** F as a 10-dp decimal string. */
+      amount: string;
+      instructions: string[];
+      /** Base64 PNG of the payment QR (≤ 64 KB decoded). */
+      qrPng?: string;
+      qrRaw?: string;
+      /** Bank-app links (bePaid `banks[].platform_urls`): scheme ∈ RAMP_DEEPLINK_SCHEMES or https on RAMP_CHECKOUT_HOSTS. */
+      deeplinks?: { name: string; url: string }[];
+    };
+
+/** What the acquirer can do (SPEC §9.1); RAMP_METHODS must be a subset of `methods`. */
+export interface RampProviderCapabilities {
+  methods: RampMethod[];
+  /** Methods the acquirer refunds itself (ERIP: only after settlement + eripRefundMinHoursAfterSettle). */
+  refundMethods: RampMethod[];
+  cardCashout: RampCardCashoutMode;
+  /** How old a capture may be for a refund (card cash-out uses min(this, RAMP_CARD_REFUND_MAX_DAYS)). */
+  cardRefundMaxDays: number;
+  /** OCT only to cards issued in RAMP_CARD_PAYOUT_COUNTRIES. */
+  payoutDomesticOnly: boolean;
+  /** Unpaid checkouts can be voided (`cancelPayment`). */
+  cancelPayment: boolean;
+  eripRefundMinHoursAfterSettle: number;
+  /**
+   * The merchant's ERIP service code (null without ERIP): with our reference digits as the account
+   * number it re-derives the instructions of an order adopted after a lost create answer (H5, S8).
+   */
+  eripServiceCode: string | null;
+}
+
+/** How an ERIP payment reached the acquirer; `unknown` counts as cash for TM-CASH (X14). */
+export type RampPayerChannel = "online" | "cash" | "card" | "unknown";
+
+/**
+ * Who paid, as the acquirer reports it (SPEC §9.1). `name` lives in memory for one call: it is
+ * sealed before it is stored and handed to the compliance port. Only `nameSource = bank` (the
+ * payer's bank) is evidence; a checkout cardholder name never is (§11.4).
+ */
+export interface RampPayer {
+  name?: string | null;
+  nameSource: "bank" | "checkout" | null;
+  channel: RampPayerChannel;
+  bankBic?: string | null;
+  /** Keyed blind index of the payer IBAN (purpose `ramp-iban`, `rampIbanIndex`): S6's payer_match proof. */
+  ibanHash?: { kid: string; hash: string } | null;
+}
+
+/** Every `to_ramp_orders.status` (SPEC §3.2; the migration's CHECK repeats it). */
+export const RAMP_ORDER_STATUSES = [
+  // on-ramp
+  "created",
+  "awaiting_payment",
+  "paid",
+  "minting",
+  "crediting",
+  // off-ramp
+  "awaiting_withdrawal",
+  "withdrawing",
+  "burning",
+  "paying_out",
+  "reversing",
+  // bank rail: off-ramp payouts AND on-ramp bank refunds (the direction tells them apart)
+  "payout_queued",
+  "payout_sent",
+  // either
+  "needs_review",
+  "refunding",
+  "completed",
+  "failed",
+  "expired",
+  "cancelled",
+  "refunded",
+  "chargeback",
+] as const;
+export type RampOrderStatus = (typeof RAMP_ORDER_STATUSES)[number];
+
+/** Why an order is in `needs_review` (`review_step`, SPEC §3.2); `details.reviewFrom` says where it was. */
+export const RAMP_STEPS = [
+  "payment",
+  "mint",
+  "credit",
+  "withdrawal",
+  "burn",
+  "payout",
+  "refund",
+  "reversal",
+  "compliance",
+] as const;
+export type RampStep = (typeof RAMP_STEPS)[number];
+
+/**
+ * What the acquirer says about a payment. `chargeback` = the issuer took the money back;
+ * `chargeback_reversed` = the dispute was won and it came back. Adapters map anything they do not
+ * know to `pending`, never `succeeded` (SPEC §9.1).
+ */
+export type RampPaymentStatus =
+  | "pending"
+  | "succeeded"
+  | "failed"
+  | "expired"
+  | "cancelled"
+  | "refunded"
+  | "chargeback"
+  | "chargeback_reversed";
+export type RampPayoutStatus = "pending" | "succeeded" | "failed";
+/** 3-D Secure outcome as the acquirer reports it; only `authenticated` satisfies RAMP_REQUIRE_3DS. */
+export type RampThreeDs = "authenticated" | "attempted" | "not_authenticated" | "unknown";
+/** `cancelPayment`: voided / too late to void (the user may still pay; ERIP) / already captured (M7). */
+export type RampCancelOutcome = "cancelled" | "not_cancellable" | "already_paid";
+
+/** A card as the acquirer describes it after a payment — never a PAN. `token` is sealed before it is stored. */
+export interface RampCard {
+  token: string;
+  fingerprint: string;
+  brand: string | null;
+  last4: string | null;
+  expMonth: number | null;
+  expYear: number | null;
+  issuerCountry: string | null;
+  issuerName?: string | null;
+}
+
+/** `getPayment` — what every transition reads (the webhook only triggers the read). Amounts in 1e-10 units. */
+export interface RampPayment {
+  paymentId: string;
+  /** The merchant reference the acquirer echoes (our order id). */
+  orderId: string | null;
+  status: RampPaymentStatus;
+  method: RampMethod;
+  /** F: what the checkout asked for. */
+  amount: bigint;
+  /** C: what the acquirer captured; null before a capture (C ≠ F is refund-only, SPEC §4.1). */
+  capturedAmount: bigint | null;
+  /** Σ refunds the acquirer executed on this payment — ours and its own. */
+  refundedAmount: bigint;
+  /**
+   * What a chargeback took back (status `chargeback` / `chargeback_reversed`), when the acquirer
+   * reports it; a dispute can only reach what was not refunded (C − refunded), so the books use
+   * min(reported, C − refunded) — S8.
+   */
+  chargebackAmount: bigint | null;
+  /** The acquirer's fee for this payment when it reports one (else the accrual rate applies, SPEC §5). */
+  fee: bigint | null;
+  currency: string;
+  threeDs: RampThreeDs;
+  card: RampCard | null;
+  failureCode: string | null;
+  sandbox: boolean;
+  /** When the acquirer settled the capture to us (ERIP refunds open `eripRefundMinHoursAfterSettle` later). */
+  settledAt: Date | null;
+  payer: RampPayer | null;
+  /** Card: the retrieval reference number (SPEC §3.1 details.payment, M11). */
+  rrn: string | null;
+  /** ERIP: the operation number and the accepting agent. */
+  erip: { transactionId: string | null; agentCode: string | null; agentName: string | null } | null;
+}
+
+export interface RampPayout {
+  payoutId: string;
+  orderId: string | null;
+  status: RampPayoutStatus;
+  amount: bigint;
+  currency: string;
+  failureCode: string | null;
+  sandbox: boolean;
+  /** The acquirer's fee for this payout when it reports one. */
+  fee: bigint | null;
+}
+
+/** A refund as the acquirer keeps it, found by the merchant key it was created under (`findRefund`). */
+export interface RampRefund {
+  refundId: string;
+  paymentId: string;
+  key: string;
+  status: RampPayoutStatus;
+  amount: bigint;
+  currency: string;
+  /** The acquirer's fee for this refund when it charges one (else nothing is accrued). */
+  fee: bigint | null;
+}
+
+export interface RampCreatePaymentInput {
+  orderId: string;
+  method: RampMethod;
+  /** The order's payout reference (`TO` + 12 digits): ERIP's account number, the card payment's description. */
+  reference: string;
+  amount: bigint;
+  currency: string;
+  description: string;
+  /** The frontend page the hosted checkout returns to (it only polls; it decides nothing). */
+  returnUrl: string;
+  notificationUrl: string;
+  customer: { userId: string; ip: string | null };
+  expiresAt: Date;
+  require3ds: boolean;
+  /** Ask for a card-on-file token (the closed-loop payout destination). */
+  saveCard: boolean;
+  /** The merchant reference (bePaid `tracking_id`): the order id. */
+  idempotencyKey: string;
+}
+
+export interface RampCreatePayoutInput {
+  orderId: string;
+  amount: bigint;
+  currency: string;
+  /** The unsealed card token of the destination, held in memory for this call only. */
+  cardToken: string;
+  /** OCT recipient (bePaid `recipient_billing_address`): the verified identity's Latin name. */
+  recipient: { firstName: string; lastName: string };
+  /** What the cardholder's statement shows: the order's `TO-…` reference. */
+  depositRef?: string;
+  /** The order id: the acquirer must refuse a second payout under it. */
+  idempotencyKey: string;
+  notificationUrl: string;
+}
+
+/** A verified webhook, normalised. `eventKey` is stable per delivery so redeliveries are idempotent. */
+export interface RampWebhookEvent {
+  eventKey: string;
+  type: string;
+  kind: "payment" | "payout" | "refund" | "chargeback" | "unknown";
+  /** The provider's payment or payout id the event is about. */
+  objectId: string;
+  orderId: string | null;
+  occurredAt: Date;
+  sandbox: boolean;
+}
+
+/**
+ * What the receive path knows about a delivery besides its bytes (SPEC §8, §9.1): the media type
+ * (JSON or `application/x-www-form-urlencoded`, both captured raw) and the resolved source address
+ * (already checked against the allow-list for IP-authenticated providers).
+ */
+export interface RampWebhookMeta {
+  contentType: string;
+  sourceIp: string;
+}
+
+export type RampProviderHealth = KycProviderHealth;
+
+export interface RampProvider {
+  readonly name: RampProviderName;
+  readonly capabilities: RampProviderCapabilities;
+  /** false → every ramp route answers 503 ramp_unavailable. */
+  isConfigured(): boolean;
+  healthCheck(): Promise<RampProviderHealth>;
+  createPayment(
+    input: RampCreatePaymentInput,
+  ): Promise<{ paymentId: string; expiresAt: Date; next: RampPaymentNext }>;
+  getPayment(paymentId: string): Promise<RampPayment>;
+  /**
+   * The payment created under `orderId` (the merchant reference), or null when the acquirer has
+   * none: how a `created` order whose createPayment answer was lost is adopted (H5). Throws when
+   * the acquirer cannot be read — the caller then decides nothing (I7).
+   */
+  findPaymentByOrder(orderId: string): Promise<RampPayment | null>;
+  /** Void an unpaid checkout on cancel and expiry (M7). */
+  cancelPayment(paymentId: string): Promise<RampCancelOutcome>;
+  /**
+   * `amount` = what to refund now (C − already refunded, M4; or one card cash-out part);
+   * `idempotencyKey` = the merchant key; `description` = what the cardholder sees (the reference).
+   */
+  refundPayment(
+    paymentId: string,
+    amount: bigint,
+    idempotencyKey: string,
+    description?: string,
+  ): Promise<{ refundId: string; status: RampPayoutStatus }>;
+  /** The refund created under `key`, or null — asked before EVERY refundPayment (I3: the PSP's key memory is finite). */
+  findRefund(paymentId: string, key: string): Promise<RampRefund | null>;
+  createPayout(
+    input: RampCreatePayoutInput,
+  ): Promise<{ payoutId: string; status: RampPayoutStatus }>;
+  getPayout(payoutId: string): Promise<RampPayout>;
+  /** The payout created under `orderId` (merchant reference), or null — asked before EVERY createPayout (I3, C3). */
+  findPayoutByOrder(orderId: string): Promise<RampPayout | null>;
+  /** null = signature, timestamp or format rejected. Verifies over the RAW body, JSON or form. */
+  verifyWebhook(
+    rawBody: Buffer,
+    headers: Record<string, string | string[] | undefined>,
+    meta: RampWebhookMeta,
+  ): RampWebhookEvent | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -532,6 +973,14 @@ export const NatsSubjects = {
   /** Tokens were minted / burned through token-app: `{ commandId, instrument, partyId }`. */
   tokenMinted: "truthoracle.token.minted",
   tokenBurned: "truthoracle.token.burned",
+  // ── fiat ramp (docs/RAMP.md) — order ids, user ids, statuses only ──
+  /** `truthoracle.ramp.webhook.<provider>`, payload `{ eventId }` only. */
+  rampWebhook: (provider: RampProviderName): `truthoracle.ramp.webhook.${RampProviderName}` =>
+    `truthoracle.ramp.webhook.${provider}`,
+  /** An order changed status: `{ orderId, userId, direction, from, to }`. */
+  rampOrderChanged: "truthoracle.ramp.order_changed",
+  /** An order needs an operator: `{ orderId, userId, step, detail }`. */
+  rampReviewRequired: "truthoracle.ramp.review_required",
 } as const;
 export type NatsSubject = `truthoracle.${string}`;
 
@@ -583,6 +1032,10 @@ export type AuditAction =
   | "catalog.event_updated"
   | "catalog.market_metadata_updated"
   | "market.create_submitted"
+  // review F0: an approved ResolveT0 / Resolve / VoidMarket submitted treasury-signed
+  | "market.resolution_submitted"
+  // … and the ledger rejected it (the wallet reports it FAILED; W9g)
+  | "market.resolution_failed"
   | "exchange.halt_changed"
   // instruments, tokens, rewards (docs/TOKENS.md §4.1, §4.6, §4.7)
   | "instrument.created"
@@ -590,11 +1043,86 @@ export type AuditAction =
   | "token.mint"
   | "token.burn"
   | "token.setup"
+  // token-app command ledger (docs/RAMP.md §7; S1)
+  | "token.command.resent"
+  | "token.command.abandoned"
+  | "token.command.compensated"
+  | "token.records.adopted"
   | "reward.rule_updated"
   | "reward.grant_requested"
   | "reward.granted"
   | "reward.failed"
-  | "reward.blocked_float";
+  | "reward.blocked_float"
+  // fiat ramp (docs/RAMP.md)
+  | "ramp.order_created"
+  | "ramp.order_transition"
+  | "ramp.review_required"
+  | "ramp.admin_action"
+  | "ramp.card_saved"
+  | "ramp.card_removed"
+  | "ramp.chargeback"
+  | "ramp.chargeback_reversed"
+  // C19: a dispute won after refund_cancel owes the cancelled bank refund again
+  | "ramp.refund_reinstated"
+  | "ramp.event_dead"
+  | "ramp.webhook_received"
+  // controls: halts, reconciliation, four-eyes approvals (SPEC §6; S4)
+  | "ramp.controls.halted"
+  | "ramp.controls.resumed"
+  | "ramp.recon.red"
+  | "ramp.payment_method.unblocked"
+  | "payout.marked_paid"
+  | "admin.approval.requested"
+  | "admin.approval.executed"
+  | "admin.approval.failed"
+  | "admin.approval.rejected"
+  | "admin.approval.cancelled"
+  | "admin.approval.expired"
+  // compliance: identity, consent, alerts (SPEC §11; S7a)
+  | "kyc.identity_refreshed"
+  | "compliance.consent_given"
+  | "compliance.alert_raised"
+  | "compliance.alert_decided"
+  | "compliance.alerts_exported"
+  // review group C: the AML officer opens a consent declaration (C13)
+  | "compliance.consent_unsealed"
+  // bank rail: accounts, batches, statements (SPEC §10; S6)
+  | "ramp.bank_account.added"
+  | "ramp.bank_account.removed"
+  | "ramp.bank_account.activated"
+  | "ramp.bank_account.verified"
+  | "ramp.bank_account.blocked"
+  | "ramp.bank_account.unblocked"
+  | "ramp.bank_account.shared_iban"
+  | "ramp.batch.created"
+  | "ramp.batch.approved"
+  | "ramp.batch.exported"
+  | "ramp.batch.submitted"
+  | "ramp.batch.cancelled"
+  | "ramp.batch.voided"
+  // an order left a draft batch (C25: AML returned it; C19: its bank refund was cancelled)
+  | "ramp.batch.item_removed"
+  | "ramp.statement.imported"
+  | "ramp.statement.copy_verified"
+  | "ramp.statement.copy_mismatch"
+  | "ramp.statement.confirmed"
+  | "ramp.bank_line.classified"
+  | "ramp.bank.flagged"
+  | "ramp.bank.unbooked_debit"
+  // screening, freezes, operations export (SPEC §11.6; S7b)
+  | "compliance.freeze.created"
+  | "compliance.freeze.confirmed"
+  | "compliance.freeze.lifted"
+  | "compliance.screening.imported"
+  | "compliance.screening.rescreened"
+  | "compliance.screening.hit"
+  | "compliance.screening.decided"
+  | "compliance.screening.identity_viewed"
+  | "compliance.frozen_activity"
+  | "ramp.operations.exported"
+  // review group A: an operator replays or closes a dead / unprocessed acquirer webhook (C31)
+  | "ramp.event_replayed"
+  | "ramp.event_closed";
 
 // ---------------------------------------------------------------------------------------------
 // Wire shapes (docs/API.md) — money is a 10-dp string next to its InstrumentRef, timestamps ISO-8601
@@ -737,10 +1265,23 @@ export const PAYOUT_STATUSES = [
   "blocked_wallet_revoked",
   "failed",
   "archived",
+  // a withdrawal of the ramp instrument past max(0, balance − card exposure) (SPEC §9.3, I5; S5) — retried as exposure decays
+  "blocked_ramp_exposure",
+  // the payee is frozen, or a compliance review holds the cash-out (SPEC §11.5, §11.6; S5) — neutral to the user
+  "blocked_compliance",
+  // a cash-out's MarkPaid deferred by the payout gate (SPEC §6.4; S4) — retried until the gate passes
+  "blocked_payout_gate",
 ] as const;
 export type PayoutStatus = (typeof PAYOUT_STATUSES)[number];
 
 export const CHALLENGE_PURPOSES: readonly ChallengePurpose[] = ["link-wallet", "admin-sign-in"];
+
+/**
+ * C8 / C11 (I10, no tipping-off): what the PAYEE sees for every internal hold — a freeze, a
+ * compliance review, the payout gate. Operators see the real status.
+ */
+export const USER_PAYOUT_PROCESSING = "processing" as const;
+export type ApiPayoutStatus = PayoutStatus | typeof USER_PAYOUT_PROCESSING;
 
 export interface ApiPayout {
   pendingPayoutCid: string;
@@ -749,13 +1290,16 @@ export interface ApiPayout {
   instrument: InstrumentRef;
   amount: ApiMoney;
   reason: string;
-  status: PayoutStatus;
+  /** Operators: the `to_payouts.status`; the payee: the same, every internal hold as `processing`. */
+  status: ApiPayoutStatus;
   retryAfterKyc: boolean;
   attempts: number;
   lastError: string | null;
   firstSeenAt: string;
   settledAt: string | null;
   onLedger: boolean;
+  /** The cash-out order this withdrawal is bound to (only that order may consume it; S4, F2 D11). */
+  offrampOrderId?: string | null;
 }
 
 export interface ApiAuditEvent {
@@ -1377,7 +1921,10 @@ export interface ApiTokenStatus {
   instruments: {
     instrument: InstrumentRef;
     treasuryHoldings: ApiMoney;
+    /** Σ in-app wallet balances + Σ live PendingPayouts (owed, still held by the treasury — T-D9). */
     liabilities: ApiMoney;
+    /** The PendingPayout part of `liabilities`. */
+    pendingPayouts: ApiMoney;
   }[];
 }
 
@@ -1390,7 +1937,12 @@ export interface ApiTokenMintResult {
   /** The party the tokens were minted to (the treasury unless `to` named another) or burned from. */
   party: string;
   /** Set when `creditUserId` was given: the `UserWallet.Deposit { txRef: "mint:<commandId>" }` that followed the mint. */
-  credit: { commandId: string; txRef: string; status: "confirmed" | "submitted" } | null;
+  /** `pending` = the Deposit waits for token-app's record of the mint; the token sync submits it (docs/RAMP.md §7). */
+  credit: {
+    commandId: string;
+    txRef: string;
+    status: "pending" | "confirmed" | "submitted";
+  } | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1763,4 +2315,906 @@ export interface ApiCreateMarketResult {
   collateral: InstrumentRef;
   /** `MarketCounter.value + 1` at submission — the id the market will carry once indexed. */
   expectedMarketId: number | null;
+}
+
+// ── review F0: approval-backed market resolution (`/admin/markets/:marketId/resolution`) ──
+
+/** The PredictionMarket choices the four-eyes `market.resolve` submits treasury-signed. */
+export const MARKET_RESOLUTION_CHOICES = ["ResolveT0", "Resolve", "VoidMarket"] as const;
+export type MarketResolutionChoice = (typeof MARKET_RESOLUTION_CHOICES)[number];
+/** The outcome a ResolveT0 request names; `Void` is the contract's `VoidOutcome`. */
+export const MARKET_RESOLUTION_OUTCOMES = ["Yes", "No", "Void"] as const;
+export type MarketResolutionOutcome = (typeof MARKET_RESOLUTION_OUTCOMES)[number];
+/** Request limits: attestations per Resolve, characters of a ResolveT0 `sourceUri`. */
+export const MARKET_RESOLUTION_MAX_ATTESTATIONS = 50;
+export const MARKET_RESOLUTION_MAX_SOURCE_URI = 2048;
+
+/**
+ * `market.resolve`'s precondition: the decision fields only. Never the contract id or the pool
+ * figures — a trade re-creates the contract, the market id is the stable subject.
+ */
+export interface ApiMarketResolutionSnapshot {
+  /** Decimal string, the approval's subject. */
+  marketId: string;
+  ticker: string;
+  question: string;
+  status: MarketStatus;
+  expiresAt: string;
+  gracePeriodSecs: number;
+  collateral: InstrumentId;
+  operatorResolution: boolean;
+  sources: string[];
+  outcome: MarketOutcome | null;
+  /** Resolve only, in request order; null fields = not in the ledger index. */
+  attestations?: {
+    cid: string;
+    outcome: MarketOutcome | null;
+    sourceUri: string | null;
+    fetchedAt: string | null;
+  }[];
+}
+
+/** `GET /admin/markets/:marketId/resolution` — every time is ISO-8601 UTC, judged by the backend clock (`asOf`). */
+export interface ApiMarketResolution {
+  market: Omit<ApiMarketResolutionSnapshot, "attestations" | "collateral"> & {
+    collateral: InstrumentRef;
+  };
+  /** Inclusive bounds: ResolveT0 [resolveT0From, resolveT0To]; Resolve from resolveFrom; VoidMarket from voidFrom. */
+  windows: { resolveT0From: string; resolveT0To: string; resolveFrom: string; voidFrom: string };
+  /** The choices whose status, window and policy checks pass at `asOf` (Resolve still needs valid attestations). */
+  choicesAvailable: MarketResolutionChoice[];
+  /** The pending `market.resolve` approval of this market. */
+  pending: ApiApproval | null;
+  /**
+   * The market's latest submitted resolution (its `market.resolution_submitted` /
+   * `market.resolution_failed` audit row) and what the wallet says of it now (a ~2 s read;
+   * `unknown` when it cannot say); null before any.
+   */
+  lastSubmission: ApiMarketResolutionSubmission | null;
+  /** Every indexed active attestation of the market, judged alone as Resolve's validate judges it. */
+  attestations: ApiMarketResolutionAttestation[];
+  asOf: string;
+}
+
+export interface ApiMarketResolutionSubmission {
+  commandId: string;
+  choice: MarketResolutionChoice;
+  /** ISO-8601 UTC, when it was submitted (or found failed). */
+  at: string;
+  status: "submitted" | "succeeded" | "failed" | "unknown";
+  /** `failed`: the wallet's reason. */
+  error: string | null;
+}
+
+export interface ApiMarketResolutionAttestation {
+  cid: string;
+  /** As the index names it. */
+  outcome: MarketOutcome;
+  sourceUri: string;
+  /** ISO-8601 UTC. */
+  fetchedAt: string;
+  /** Passes Resolve's asserts on the attestation itself (the tiers judge the set). */
+  usable: boolean;
+  /** The `market_not_resolvable` reason it fails, else null. */
+  reason: string | null;
+}
+
+/** `market.resolve`'s result once executed (the indexer projects the ledger outcome as usual). */
+export interface ApiMarketResolutionResult {
+  marketId: string;
+  choice: MarketResolutionChoice;
+  commandId: string;
+  /** What the wallet said within ~15 s: committed (`succeeded`), or no outcome yet (`submitted`). */
+  status: "submitted" | "succeeded";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fiat ramp wire shapes (docs/RAMP.md §8) — fiat and token amounts are 10-dp strings; 1 BYN = 1 cBYN
+// ---------------------------------------------------------------------------------------------
+
+/** A saved card: never the token, never a name. */
+export interface ApiRampPaymentMethod {
+  id: string;
+  brand: string | null;
+  last4: string | null;
+  expMonth: number | null;
+  expYear: number | null;
+  issuerCountry: string | null;
+  status: "active" | "removed" | "blocked";
+  /** Funded a completed, 3DS-authenticated on-ramp of this account: a valid cash-out destination. */
+  payoutEligible: boolean;
+  /**
+   * How a cash-out to this card works and how much it can take now (SPEC §9.3): `refund` = up to
+   * what this card's captures can still refund (other cash-outs in flight excluded); `oct` = the
+   * balance above the card exposure; `none` = no card cash-out.
+   */
+  cashout: { mode: RampCardCashoutMode; available: ApiMoney };
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+/** `GET /ramp/payment-methods`. */
+export interface ApiRampCards {
+  cards: ApiRampPaymentMethod[];
+}
+
+/** Where a cash-out goes (SPEC §12.1). */
+export type ApiRampDestination =
+  | { kind: "card"; paymentMethodId: string; brand: string | null; last4: string | null }
+  | { kind: "bank"; bankAccountId: string; bankName: string | null; ibanMasked: string };
+
+/** The operator of record stamped on an order (SPEC §9.3, R1). */
+export interface RampOperatorSnapshot {
+  name: string;
+  unp: string;
+  htpRef: string;
+  termsVersion: string;
+}
+
+/** One status change of an order, as the user sees it (compliance review entries are left out). */
+export interface ApiRampTimelineEntry {
+  status: RampOrderStatus;
+  at: string;
+}
+
+export interface ApiRampOrder {
+  id: string;
+  direction: RampDirection;
+  status: RampOrderStatus;
+  /** `processing` while an operator, a review or a hold has it (one word for every reason: no tipping-off); else null. */
+  statusText: string | null;
+  /** Why it waits for an operator; null outside `needs_review` and for compliance reviews (SPEC §12.1). */
+  reviewStep: RampStep | null;
+  /** On-ramp only. */
+  method: RampMethod | null;
+  /** Off-ramp only. */
+  rail: RampPayoutRail | null;
+  instrument: InstrumentRef;
+  fiatCurrency: string;
+  /** On-ramp: what is paid. Off-ramp: what the card or bank account receives. */
+  fiatAmount: ApiMoney;
+  /** On-ramp: what the in-app wallet is credited. Off-ramp: what the user withdraws. */
+  tokenAmount: ApiMoney;
+  feeAmount: ApiMoney;
+  /** Only while `awaiting_payment`: the hosted page or the ERIP payment details. */
+  next: RampPaymentNext | null;
+  /** Only while `awaiting_withdrawal`: sign `UserWallet.Withdraw { amount }` on this wallet. */
+  withdraw: { walletContractId: string; amount: ApiMoney } | null;
+  /** Off-ramp: the card or bank account the fiat goes to. */
+  destination: ApiRampDestination | null;
+  /** The card that paid an on-ramp. */
+  card: { brand: string | null; last4: string | null } | null;
+  /** `TO-` + 12 digits: the ERIP account number, the bank transfer's purpose, the refund description. */
+  payoutReference: string | null;
+  expiresAt: string | null;
+  timeline: ApiRampTimelineEntry[];
+  operator: { name: string } | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+}
+
+export interface ApiAdminRampOrder extends ApiRampOrder {
+  /** The full snapshot (name, UNP, HTP reference, terms version). */
+  operator: RampOperatorSnapshot | null;
+  userId: string;
+  partyId: string;
+  provider: string;
+  idempotencyKey: string;
+  paymentMethodId: string | null;
+  pendingPayoutCid: string | null;
+  bankAccountId: string | null;
+  payoutBatchId: string | null;
+  consentId: string | null;
+  /** Compliance decisions by point (SPEC §3.1, §11.5). */
+  risk: Record<string, unknown>;
+  /** The CAS version an approval snapshots (I6); never on the user API. */
+  version: number;
+  providerPaymentId: string | null;
+  providerPayoutId: string | null;
+  providerRefundId: string | null;
+  capturedAmount: ApiMoney | null;
+  capturedAt: string | null;
+  refundedAmount: ApiMoney;
+  mintCommandId: string | null;
+  creditCommandId: string | null;
+  burnCommandId: string | null;
+  remintCommandId: string | null;
+  remintCreditCommandId: string | null;
+  attempts: number;
+  lastError: string | null;
+  details: Record<string, unknown>;
+}
+
+export interface ApiRampQuote {
+  direction: RampDirection;
+  instrument: InstrumentRef;
+  fiatCurrency: string;
+  fiatAmount: ApiMoney;
+  tokenAmount: ApiMoney;
+  fee: ApiMoney;
+  /** false = an order with these inputs would be refused now; `limit` says which one (F-D7). */
+  withinLimits: boolean;
+  /** `min | max | daily | monthly | card_cashout | exposure` with its figure. */
+  limit: { name: RampLimitName; min?: ApiMoney; max?: ApiMoney; available?: ApiMoney } | null;
+}
+
+/** The limit a quote or a create ran into (F1's wire names). */
+export type RampLimitName = "min" | "max" | "daily" | "monthly" | "card_cashout" | "exposure";
+
+export interface ApiRampLimits {
+  min: ApiMoney;
+  max: ApiMoney;
+  dailyMax: ApiMoney;
+  monthlyMax: ApiMoney;
+  dailyRemaining: ApiMoney;
+  monthlyRemaining: ApiMoney;
+}
+
+/** A fee as basis points of the amount plus a fixed part. */
+export interface ApiRampFee {
+  bps: number;
+  fixed: ApiMoney;
+}
+
+/** `GET /ramp` — everything the buy / cash-out panels render (SPEC §12.1). */
+export interface ApiRampOverview {
+  enabled: boolean;
+  /** SPEC §6.1: new orders are halted (an operator's or an automatic halt); never the internal reason. */
+  paused: { orders: boolean; reason: null };
+  provider: RampProviderName | null;
+  /** The operator of record and its terms (R1); null while unconfigured (dev only — refused prod-like). */
+  operator: { name: string; termsUrl: string; termsVersion: string } | null;
+  /** Whether the user must accept the current terms first (the compliance port answers; S7a). */
+  consent: { required: boolean; termsVersion: string; termsUrl: string };
+  instrument: InstrumentRef | null;
+  fiat: { currency: string; decimals: number };
+  methods: { method: RampMethod; ttlMinutes: number; fee: ApiRampFee }[];
+  rails: { rail: RampPayoutRail; fee: ApiRampFee; eta: { businessDays: number } }[];
+  limits: Record<RampDirection, ApiRampLimits>;
+  /** Card value still inside the dispute window, and what may leave other than back to the card now (I5). */
+  exposure: { amount: ApiMoney; withdrawableToBank: ApiMoney };
+  /** `reasons`: user-facing codes; every compliance reason is the neutral `compliance` (X6, M3). */
+  eligibility: Record<RampDirection, { allowed: boolean; reasons: string[] }>;
+  openOrders: ApiRampOrder[];
+}
+
+export interface ApiRampOnrampResult {
+  order: ApiRampOrder;
+}
+
+/** `GET /ramp/orders?cursor&limit` (SPEC §12.1). */
+export interface ApiRampOrderList {
+  orders: ApiRampOrder[];
+  nextCursor: string | null;
+}
+
+/** The frontend signs `UserWallet.Withdraw { amount }` on `order.withdraw.walletContractId`, then calls attach. */
+export interface ApiRampOfframpResult {
+  order: ApiRampOrder;
+}
+
+/**
+ * `POST /ramp/orders/:id/attach` (F6). `bindPending`: the signed withdrawal matched this cash-out
+ * but is not bound to it yet — the order still waits for it (`awaiting_withdrawal`): keep it as
+ * signed, attach again later, never sign twice. Only a 409 `ramp_order_state` means it is not
+ * this order's. `bindReason` (bindPending only): why — `settlement_in_progress`, `in_flight`, a
+ * payout hold as the payee sees it (`blocked_kyc`, `blocked_ramp_exposure`, `processing`, …), or
+ * `not_bound` when the settlement answered without binding.
+ */
+export interface ApiRampAttachResult {
+  order: ApiRampOrder;
+  bindPending: boolean;
+  bindReason: string | null;
+}
+
+export interface ApiRampJournalLine {
+  entryId: string;
+  /** The posting's kind (SPEC §5): `onramp.captured`, `offramp.burned`, … */
+  kind: string;
+  orderId: string | null;
+  statementLineId: string | null;
+  /** Set on client-liability lines (issuance_pending, customer_liability, payout_clearing). */
+  userId: string | null;
+  account: string;
+  currency: string;
+  /** + debit, − credit. */
+  amount: ApiMoney;
+  createdAt: string;
+}
+
+export interface ApiRampEvent {
+  id: string;
+  type: string;
+  kind: string;
+  objectId: string;
+  sandbox: boolean;
+  receivedAt: string;
+  processedAt: string | null;
+  attempts: number;
+  nextAttemptAt: string | null;
+  /** Set after RAMP_EVENT_DEAD_AFTER_HOURS of failure: an operator must look (S4 `events_dead`). */
+  deadAt: string | null;
+  error: string | null;
+}
+
+// ── review group A: the operator's webhook inbox (C31) ──
+
+/** `GET /admin/ramp/events?status=dead|unprocessed` rows: one stored acquirer webhook. */
+export interface ApiRampEventRow extends ApiRampEvent {
+  provider: string;
+  orderId: string | null;
+  occurredAt: string;
+  lastAttemptAt: string | null;
+  /** The last operator replay (its RAMP_EVENT_DEAD_AFTER_HOURS window starts here). */
+  replayedAt: string | null;
+  /** Closed by a four-eyes `ramp.event.close`: never applied (`processedAt` is set with it). */
+  closedAt: string | null;
+  closeReason: string | null;
+}
+
+export type RampEventListStatus = "dead" | "unprocessed";
+
+/** A token-app command of the order (`to_token_commands`, SPEC §3.4). */
+export interface ApiRampTokenCommand {
+  commandId: string;
+  kind: "mint" | "burn";
+  amount: ApiMoney;
+  status: string;
+  attempts: number;
+  lastPostAt: string | null;
+  lastError: string | null;
+  recordedAt: string | null;
+  resolvedBy: string | null;
+}
+
+export interface ApiAdminRampOrderDetail {
+  order: ApiAdminRampOrder;
+  events: ApiRampEvent[];
+  journal: ApiRampJournalLine[];
+  tokenCommands: ApiRampTokenCommand[];
+  audit: ApiAuditEvent[];
+  /** Four-eyes approvals of this order, newest first (S4). */
+  approvals: ApiApproval[];
+}
+
+// ── controls: halts, reconciliation, four-eyes approvals (SPEC §6, §12.2; S4) ──
+
+/** Operator roles (SPEC §6.5): `ops` runs the ramp, `approver` decides four-eyes requests, `aml` alerts, `export` files. */
+export const ADMIN_ROLES = ["ops", "approver", "aml", "export"] as const;
+export type AdminRole = (typeof ADMIN_ROLES)[number];
+
+/** `to_ramp_controls.halted_scopes` (SPEC §6.1). */
+export const HALT_SCOPES = ["orders", "mints", "payouts"] as const;
+export type HaltScope = (typeof HALT_SCOPES)[number];
+
+export const RECON_STATUSES = ["green", "amber", "red", "unknown"] as const;
+export type ReconStatus = (typeof RECON_STATUSES)[number];
+export const RECON_TRIGGERS = ["schedule", "admin", "pre_batch", "sync"] as const;
+export type ReconTrigger = (typeof RECON_TRIGGERS)[number];
+
+export const APPROVAL_STATUSES = [
+  "pending",
+  "approved",
+  "rejected",
+  "executed",
+  "failed",
+  "expired",
+  "cancelled",
+] as const;
+export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
+
+/** `GET /admin/session` (SPEC §12.2): who the operator is and what they may do. */
+export interface ApiAdminSession {
+  party: string;
+  personId: string;
+  roles: AdminRole[];
+  /** RAMP_APPROVAL_SIGNATURES: decisions must carry the wallet signature. */
+  approvalSignatures: boolean;
+  /** RAMP_DUAL_CONTROL: false = requests execute at once (dev / test). */
+  dualControl: boolean;
+}
+
+/** One reconciliation check's outcome (SPEC §6.2). `figures` are 10-dp strings, counts and ISO times. */
+export interface ApiReconCheck {
+  name: string;
+  status: ReconStatus;
+  detail: string | null;
+  figures: Record<string, unknown> | null;
+  /** What a red (or a long unknown) halts. */
+  haltScopes: HaltScope[];
+}
+
+export interface ApiReconRun {
+  id: string;
+  trigger: ReconTrigger;
+  startedAt: string;
+  finishedAt: string | null;
+  status: ReconStatus;
+  checks: ApiReconCheck[];
+  /** This run set a halt. */
+  halted: boolean;
+}
+
+/** `GET /admin/ramp/controls` → `{controls}`. */
+export interface ApiRampControls {
+  haltedScopes: HaltScope[];
+  reason: string | null;
+  source: "admin" | "auto" | null;
+  /** The red checks behind an automatic halt (name, detail). */
+  failingChecks: { name: string; detail: string | null }[] | null;
+  since: string | null;
+  setByUserId: string | null;
+  updatedAt: string | null;
+}
+
+/**
+ * `GET /admin/ramp/reconciliation` (SPEC §6.2): the latest FULL run, whether one is running, the
+ * reserve figures the gate uses now (SPEC §6.3) and the journal's balances per account.
+ */
+export interface ApiRampReconciliation {
+  run: ApiReconRun | null;
+  running: boolean;
+  reserve: Record<string, string | number | boolean | null> | null;
+  journal: Record<string, ApiMoney>;
+}
+
+/** A four-eyes approval (SPEC §6.5, `to_admin_approvals`). */
+export interface ApiApproval {
+  id: string;
+  action: string;
+  subjectType: string;
+  subjectId: string;
+  params: Record<string, unknown>;
+  /** What a signed decision commits to: `truthoracle-approval:<id>:<paramsHash>:<approve|reject>`. */
+  paramsHash: string;
+  precondition: Record<string, unknown> | null;
+  /** The registry's one line on what executing it does. */
+  description: string | null;
+  reason: string;
+  status: ApprovalStatus;
+  singleControl: boolean;
+  requestedByUserId: string;
+  requestedByParty: string;
+  requestedByPerson: string;
+  requestedAt: string;
+  decidedByUserId: string | null;
+  decidedByParty: string | null;
+  decidedByPerson: string | null;
+  decidedAt: string | null;
+  decisionReason: string | null;
+  executedAt: string | null;
+  result: unknown;
+  error: string | null;
+  expiresAt: string;
+}
+
+/** An approval-backed route's answer: 202 `{approval}` while pending, 200 `{approval, result}` once executed. */
+export interface ApiApprovalOutcome<R = unknown> {
+  approval: ApiApproval;
+  result?: R;
+}
+
+export interface ApiApproveManyResult {
+  results: {
+    id: string;
+    approval?: ApiApproval;
+    result?: unknown;
+    error?: { error: string; message?: string } | null;
+  }[];
+}
+
+/** `GET /admin/tokens/commands` item: a `to_token_commands` row (SPEC §3.4). */
+export interface ApiAdminTokenCommand {
+  commandId: string;
+  kind: "mint" | "burn";
+  instrumentAdmin: string;
+  instrumentId: string;
+  partyId: string;
+  amount: ApiMoney;
+  source: string;
+  ref: string | null;
+  status: string;
+  attempts: number;
+  lastPostAt: string | null;
+  lastError: string | null;
+  lastHttpStatus: number | null;
+  updateId: string | null;
+  recordedAmount: ApiMoney | null;
+  recordedAt: string | null;
+  resolvedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Screening, freezes, operations export (SPEC §3.4 S7b, §11.6; stage S7b)
+// ---------------------------------------------------------------------------------------------
+
+/** Who a freeze answers to (SPEC §3.4): a list hit, a sanctions finding, an AML decision, an operator, a court. */
+export const FREEZE_SOURCES = ["screening", "sanctions", "aml", "manual", "court"] as const;
+export type FreezeSource = (typeof FREEZE_SOURCES)[number];
+
+/**
+ * The lists (B1): the Belarusian list of persons involved in terrorist activity, the UN Security
+ * Council list, the Decree No. 48 register of addresses — a hit on these freezes provisionally — and
+ * any foreign list (a hit denies new orders, never freezes).
+ */
+export const SCREENING_LISTS = ["by_terror", "un", "decree48", "foreign"] as const;
+export type ScreeningListName = (typeof SCREENING_LISTS)[number];
+/** The lists whose hits freeze (Belarusian law: its own list and the UN's, plus the Decree No. 48 register). */
+export const FREEZING_LISTS: readonly ScreeningListName[] = ["by_terror", "un", "decree48"];
+
+export const SCREENING_ENTRY_KINDS = ["person", "org", "address"] as const;
+export type ScreeningEntryKind = (typeof SCREENING_ENTRY_KINDS)[number];
+
+export const SCREENING_HIT_STATUSES = ["open", "confirmed", "cleared"] as const;
+export type ScreeningHitStatus = (typeof SCREENING_HIT_STATUSES)[number];
+
+export type ScreeningRunTrigger = "import" | "schedule" | "admin" | "user";
+export type ScreeningRunScope = "full" | "user";
+export type ScreeningRunStatus = "running" | "done" | "partial" | "failed";
+
+/**
+ * What a hit matched. The list side verbatim (public data); the account side only as the matched
+ * name form and how far the birth dates agree — never the account's name (it stays sealed, I4).
+ */
+export type ScreeningHitMatch =
+  | {
+      basis: "name";
+      entryName: string;
+      entryBirthDate: string | null;
+      entryIds: string[];
+      script: "be" | "ru" | "lat";
+      birthDate: "exact" | "partial" | "unknown";
+      /**
+       * How the forms met (C12): `fold` the exact name keys; `bridge` the be / ru / Latin forms
+       * bridged (consonant skeletons, given-name table); `surname_dob` the surname and the exact
+       * birth date only (a candidate for the AML officer).
+       */
+      via?: "fold" | "bridge" | "surname_dob";
+    }
+  | { basis: "party"; party: string; listed: string }
+  /** The principal a consent declares the account acts for (C13; free text, no birth date). */
+  | {
+      basis: "principal";
+      consentId: string;
+      entryName: string;
+      entryBirthDate: string | null;
+      entryIds: string[];
+    };
+
+/** `GET /admin/compliance/freezes` item / `POST …` answer (F2's ApiComplianceFreeze, plus the lift facts). */
+export interface ApiComplianceFreeze {
+  id: string;
+  userId: string;
+  reason: string;
+  source: FreezeSource;
+  provisional: boolean;
+  active: boolean;
+  createdByUserId: string | null;
+  createdByPerson: string | null;
+  liftApprovalId: string | null;
+  liftedByUserId: string | null;
+  liftReason: string | null;
+  liftedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `GET /admin/compliance/screening-lists` item. */
+export interface ApiScreeningList {
+  id: string;
+  list: ScreeningListName;
+  version: string;
+  deliveredAt: string;
+  importedAt: string;
+  importedByPerson: string | null;
+  charset: string;
+  sha256: string;
+  entryCount: number;
+}
+
+/** `GET /admin/compliance/screening-hits` item. */
+export interface ApiScreeningHit {
+  id: string;
+  listId: string;
+  list: ScreeningListName;
+  listVersion: string;
+  entryId: string;
+  entryKind: ScreeningEntryKind;
+  userId: string;
+  match: ScreeningHitMatch;
+  status: ScreeningHitStatus;
+  alertId: string | null;
+  freezeId: string | null;
+  decidedByPerson: string | null;
+  decidedAt: string | null;
+  decisionReason: string | null;
+  createdAt: string;
+}
+
+/** A re-screen as the console shows it. */
+export interface ApiScreeningRun {
+  id: string;
+  trigger: ScreeningRunTrigger;
+  scope: ScreeningRunScope;
+  userId: string | null;
+  status: ScreeningRunStatus;
+  listIds: string[];
+  startedAt: string;
+  finishedAt: string | null;
+  subjects: number;
+  identities: number;
+  parties: number;
+  hits: number;
+  failures: number;
+  /** C44: accounts whose identity could not be read (their parties screened; refused until read). */
+  unreadable: number;
+  error: string | null;
+}
+
+/** `POST /admin/compliance/screening-lists` answer: the stored list and the import's re-screen (null when another re-screen was running — the processor follows up). */
+export interface ApiScreeningImport {
+  list: ApiScreeningList;
+  hits: number | null;
+  run: ApiScreeningRun | null;
+}
+
+/**
+ * `GET /admin/compliance/screening-hits/:id` (role `aml`): the hit and the account's VERIFIED identity — what the
+ * AML officer compares with the entry before deciding. `identity` null: no verified identity, or (with
+ * `identityError`) it could not be read now.
+ */
+export interface ApiScreeningHitDetail {
+  hit: ApiScreeningHit;
+  identity: {
+    names: { script: "be" | "ru" | "lat"; last: string; first: string; middle?: string | null }[];
+    birthDate: string | null;
+    citizenship: string | null;
+    residenceCountry: string | null;
+  } | null;
+  identityError?: string;
+}
+
+// ── bank rail: user accounts, payout batches, statements (SPEC §10, §12; S6) ──
+
+export const RAMP_BANK_ACCOUNT_STATUSES = [
+  "cooling_off",
+  "pending_proof",
+  "active",
+  "removed",
+  "blocked",
+] as const;
+export type RampBankAccountStatus = (typeof RAMP_BANK_ACCOUNT_STATUSES)[number];
+/** How an IBAN was proved to be held in the user's verified name (X10). */
+export const RAMP_BANK_PROOFS = ["bank_name_check", "payer_match", "manual"] as const;
+export type RampBankProof = (typeof RAMP_BANK_PROOFS)[number];
+/** Which verified name form is the beneficiary name (M2). */
+export const RAMP_NAME_FORMS = ["be", "ru", "lat"] as const;
+export type RampNameForm = (typeof RAMP_NAME_FORMS)[number];
+
+/** `GET /ramp/bank-accounts` → `{accounts}`, `POST` → `{account}` (SPEC §10.2). */
+export interface ApiRampBankAccount {
+  id: string;
+  /** `BY•• •••• … 1234`. */
+  ibanMasked: string;
+  bankName: string | null;
+  bic: string | null;
+  /** The verified name in the account's form — every payout's beneficiary name; null when unreadable. */
+  holderName: string | null;
+  status: RampBankAccountStatus;
+  /** When a `cooling_off` account becomes provable (UTC); null otherwise. */
+  usableFrom: string | null;
+  proof: RampBankProof | null;
+}
+
+/** `GET /admin/ramp/bank-accounts` item. */
+export interface ApiAdminBankAccount {
+  id: string;
+  userId: string;
+  ibanMasked: string;
+  bankCode: string;
+  bankName: string | null;
+  bic: string | null;
+  nameForm: RampNameForm;
+  status: RampBankAccountStatus;
+  coolingOffUntil: string;
+  proof: RampBankProof | null;
+  proofRef: string | null;
+  verifiedAt: string | null;
+  firstPayoutOrderId: string | null;
+  lastUsedAt: string | null;
+  /** The bank directory's sanctions flags (informational, belarus-legal.md §4). */
+  sanctions: { eu: readonly string[]; us: readonly string[]; uk: readonly string[] };
+  createdAt: string;
+}
+
+export const PAYOUT_BATCH_STATUSES = [
+  "draft",
+  "approved",
+  "exported",
+  "submitted",
+  "settled",
+  "cancelled",
+  "voided",
+] as const;
+export type PayoutBatchStatus = (typeof PAYOUT_BATCH_STATUSES)[number];
+export const PAYOUT_ITEM_STATUSES = ["included", "paid", "returned", "voided", "unpaid"] as const;
+export type PayoutItemStatus = (typeof PAYOUT_ITEM_STATUSES)[number];
+
+export interface ApiPayoutBatch {
+  id: string;
+  status: PayoutBatchStatus;
+  currency: string;
+  itemCount: number;
+  totalAmount: ApiMoney;
+  createdByUserId: string;
+  approvalId: string | null;
+  fileFormat: string | null;
+  fileSha256: string | null;
+  exportedAt: string | null;
+  exportedByUserId: string | null;
+  exportCount: number;
+  submittedAt: string | null;
+  submittedByUserId: string | null;
+  bankReference: string | null;
+  settledAt: string | null;
+  voidApprovalId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ApiPayoutBatchItem {
+  batchId: string;
+  orderId: string;
+  /** `payout` = an off-ramp, `refund` = an on-ramp's bank refund. */
+  kind: "payout" | "refund";
+  documentNo: string;
+  amount: ApiMoney;
+  status: PayoutItemStatus;
+  /** `TO-…`. */
+  payoutReference: string;
+  userId: string;
+  bankAccountId: string;
+  ibanMasked: string | null;
+  bankName: string | null;
+  paidLineId: string | null;
+  returnedLineId: string | null;
+}
+
+/** `POST /admin/ramp/payout-batches` → the draft and what was left out (and why). */
+export interface ApiPayoutBatchDraft {
+  batch: ApiPayoutBatch;
+  items: ApiPayoutBatchItem[];
+  skipped: { orderId: string; reason: string }[];
+}
+
+export const BANK_STATEMENT_STATUSES = ["draft", "confirmed", "rejected"] as const;
+export type BankStatementStatus = (typeof BANK_STATEMENT_STATUSES)[number];
+export const BANK_LINE_STATUSES = ["unmatched", "proposed", "matched"] as const;
+export type BankLineStatus = (typeof BANK_LINE_STATUSES)[number];
+/**
+ * What a statement line was matched as (SPEC §10.4). `refund_return`: an on-ramp bank refund the
+ * bank sent back (S8). PSP fee true-ups are a journal kind (`psp.fee`) booked with a settlement.
+ */
+export const BANK_MATCH_KINDS = [
+  "payout",
+  "payout_batch",
+  "payout_return",
+  "refund",
+  "refund_return",
+  "psp_settlement",
+  "psp_funding",
+  "bank_fee",
+  "operator_topup",
+  "operator_sweep",
+  "suspense",
+] as const;
+export type BankMatchKind = (typeof BANK_MATCH_KINDS)[number];
+/** `reference_credit`: a credit quoting an order that is not a return; the other two halt payouts. */
+export const BANK_LINE_FLAGS = ["reference_credit", "iban_mismatch", "payout_duplicate"] as const;
+export type BankLineFlag = (typeof BANK_LINE_FLAGS)[number];
+
+export interface ApiBankStatement {
+  id: string;
+  accountIban: string;
+  format: "csv" | "camt053";
+  fileSha256: string;
+  periodFrom: string;
+  periodTo: string;
+  openingBalance: ApiMoney;
+  closingBalance: ApiMoney;
+  currency: string;
+  status: BankStatementStatus;
+  prevStatementId: string | null;
+  importedByUserId: string;
+  approvalId: string | null;
+  confirmedAt: string | null;
+  lineCount: number;
+  createdAt: string;
+}
+
+export interface ApiBankLine {
+  id: string;
+  statementId: string;
+  lineRef: string;
+  bookingDate: string;
+  valueDate: string | null;
+  /** Signed: + credit to the client-money account, − debit. */
+  amount: ApiMoney;
+  currency: string;
+  counterpartyName: string | null;
+  counterpartyIbanLast4: string | null;
+  counterpartyBic: string | null;
+  bankTxCode: string | null;
+  returnInfo: boolean;
+  returnCode: string | null;
+  /** `TO-…` when the line quotes one. */
+  reference: string | null;
+  documentNo: string | null;
+  matchKind: BankMatchKind | null;
+  matchedOrderId: string | null;
+  matchedBatchId: string | null;
+  status: BankLineStatus;
+  flags: BankLineFlag[];
+}
+
+/** An upload's answer and `GET /admin/ramp/bank-statements/:id`: the file's figures and its lines. */
+export interface ApiStatementPreview {
+  statement: ApiBankStatement;
+  lines: ApiBankLine[];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Compliance: identity, consent, eligibility, monitoring rules, alerts (SPEC §11, §12; stage S7a)
+// ---------------------------------------------------------------------------------------------
+
+/** `info` never holds; `review` holds the value point (single AML decision); `block` holds it (four-eyes). */
+export const COMPLIANCE_ALERT_SEVERITIES = ["info", "review", "block"] as const;
+export type ComplianceAlertSeverity = (typeof COMPLIANCE_ALERT_SEVERITIES)[number];
+/**
+ * `open` and `escalated` wait for a decision; `reported` (DFM special form filed) still holds;
+ * `cleared` releases; `returned` (C25, final) ends the hold WITHOUT releasing: the payment goes back.
+ */
+export const COMPLIANCE_ALERT_STATUSES = [
+  "open",
+  "cleared",
+  "escalated",
+  "reported",
+  "returned",
+] as const;
+export type ComplianceAlertStatus = (typeof COMPLIANCE_ALERT_STATUSES)[number];
+/** `return` (C25): refuse the held payment — the ramp gives it back (refund / refund_bank), never mints it. */
+export const COMPLIANCE_ALERT_DECISIONS = ["clear", "escalate", "report", "return"] as const;
+export type ComplianceAlertDecision = (typeof COMPLIANCE_ALERT_DECISIONS)[number];
+
+/** `GET /admin/compliance/alerts[/:id]` (SPEC §11.6). Figures never carry PII. */
+export interface ApiComplianceAlert {
+  id: string;
+  userId: string;
+  rule: string;
+  /** The value point (`onramp.create` …) or what raised it (`consent`, `identity`, `bank_account`, …). */
+  point: string | null;
+  severity: ComplianceAlertSeverity;
+  orderId: string | null;
+  figures: Record<string, unknown>;
+  windowKey: string;
+  status: ComplianceAlertStatus;
+  /** The legal deadline (Belarusian business days, UTC); null for info. */
+  dueAt: string | null;
+  rulesVersion: string;
+  /** The base value (BYN) the thresholds were computed with. */
+  bvByn: ApiMoney | null;
+  decidedByUserId: string | null;
+  decidedAt: string | null;
+  decisionReason: string | null;
+  reportRef: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `POST /ramp/consent` (SPEC §12.1). */
+export interface ApiRampConsentResult {
+  consent: { required: boolean; termsVersion: string };
 }

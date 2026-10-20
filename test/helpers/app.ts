@@ -49,6 +49,18 @@ export const TEST_REWARDS = { admin: TEST_TRO_ADMIN, id: "TRO" } as const;
 /** The bot token the test env configures; test/helpers/telegram.ts signs Login Widget payloads with it. */
 export const TEST_TELEGRAM_BOT_TOKEN = "123456789:AAFakeBotTokenForE2E";
 
+/**
+ * The production values of the SPEC §6 controls (S4): spread into a prod-like `testEnv(…)` — the
+ * test defaults below switch them off and prod-like boots refuse that.
+ */
+export const PROD_CONTROLS: Record<string, string> = {
+  RAMP_DUAL_CONTROL: "true",
+  RAMP_APPROVAL_SIGNATURES: "true",
+  RAMP_RESERVE_GATE: "enforce",
+  RAMP_PAYOUT_GATE: "enforce",
+  RAMP_AUTO_HALT: "true",
+};
+
 export function testEnv(overrides: Record<string, string> = {}): Record<string, string> {
   return {
     APP_ENV: "dev",
@@ -78,6 +90,18 @@ export function testEnv(overrides: Record<string, string> = {}): Record<string, 
     INDEXER_ENABLED: "false",
     // So does the rewards loop; specs drive RewardsService.scan() / RewardsProcessor.tick().
     REWARDS_ENABLED: "false",
+    // And the token-app sync loop; specs drive TokenAppSyncService.syncOnce() (docs/RAMP.md §7).
+    TOKEN_APP_SYNC_SEC: "0",
+    // SPEC §6 controls (S4): the production defaults (four-eyes, signed decisions, enforcing gates,
+    // auto-halt) are switched on only by the specs that test them (ramp-controls, approvals).
+    RAMP_DUAL_CONTROL: "false",
+    RAMP_APPROVAL_SIGNATURES: "false",
+    RAMP_RESERVE_GATE: "warn",
+    RAMP_PAYOUT_GATE: "warn",
+    RAMP_AUTO_HALT: "false",
+    // SPEC §11 compliance (S7a): eligibility, consent and the monitoring rules are on only in the specs
+    // that test them (compliance.e2e-spec); identities are stored and raised alerts recorded either way.
+    RAMP_COMPLIANCE: "off",
     // Canton Coin as the default collateral (10 decimals, symbol CC) and TRO as the rewards instrument.
     COLLATERAL_INSTRUMENT_ADMIN: TEST_DSO,
     COLLATERAL_INSTRUMENT_ID: TEST_COLLATERAL.id,
@@ -137,6 +161,42 @@ async function ensureDatabase(url: string): Promise<void> {
   }
 }
 
+/**
+ * Empties every `to_*` table but settings and migrations through its own connection. Each spec file
+ * starts and ends on an empty database: rows another file sealed under ANOTHER keyring (or a run that
+ * died) would otherwise make this file's boot refuse them — S3's keyring check runs at bootstrap,
+ * before any `reset()` (SPEC §8).
+ */
+export async function purgeTestDatabase(url = TEST_DATABASE_URL): Promise<void> {
+  const ds = new DataSource({ type: "postgres", url, entities: [], synchronize: false });
+  try {
+    await ds.initialize();
+  } catch (err) {
+    // 3D000: no database yet, so nothing to purge (the boot creates it).
+    if ((err as { code?: string }).code === "3D000") return;
+    throw err;
+  }
+  try {
+    const rows = await ds.query<{ name: string }[]>(
+      `SELECT tablename AS name FROM pg_tables
+        WHERE schemaname = current_schema() AND tablename LIKE 'to\\_%'
+          AND tablename NOT IN ('to_settings', 'to_migrations')`,
+    );
+    if (rows.length === 0) return;
+    const journal = rows.some((r) => r.name === "to_ramp_journal");
+    // The ramp journal refuses TRUNCATE (append-only, SPEC §3.3); the owner lifts that here only.
+    if (journal) await ds.query(`ALTER TABLE "to_ramp_journal" DISABLE TRIGGER USER`);
+    try {
+      const list = rows.map((r) => `"${r.name}"`).join(", ");
+      await ds.query(`TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`);
+    } finally {
+      if (journal) await ds.query(`ALTER TABLE "to_ramp_journal" ENABLE TRIGGER USER`);
+    }
+  } finally {
+    await ds.destroy();
+  }
+}
+
 async function runMigrationsOnce(config: Config): Promise<void> {
   if (migrated) return;
   await ensureDatabase(config.databaseUrl);
@@ -162,6 +222,8 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
   const ledger = new FakeLedgerClient(config.collateralInstrument);
   const wallet = new FakeEnterpriseWallet(ledger, config.treasuryPartyId);
   const stream = new FakeLedgerStream(config.indexerParty);
+  // What the stream carries is on the ledger: the fake ledger's PredictionMarket reads follow it.
+  ledger.stream = stream;
   const registry = new FakeTokenRegistry();
   const tokenApp = new FakeTokenApp();
 
@@ -187,7 +249,13 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
     logger: false,
   });
   setupHttpApp(app, config);
-  await app.init();
+  try {
+    await app.init();
+  } catch (err) {
+    // A refused boot must not keep the database / Redis handles open (Jest would never exit).
+    await app.close().catch(() => undefined);
+    throw err;
+  }
 
   const dataSource = app.get(DataSource);
   const redis = app.get(RedisService);
@@ -216,7 +284,13 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
     csrf: { Origin: TEST_ORIGIN, "Content-Type": "application/json" },
     get: <T>(token: abstract new (...args: never[]) => T): T => app.get(token),
     reset: async () => {
-      await dataSource.query(`TRUNCATE TABLE ${tables} RESTART IDENTITY CASCADE`);
+      // The ramp journal refuses TRUNCATE (append-only, SPEC §3.3); the table owner lifts that for the reset only.
+      await dataSource.query(`ALTER TABLE "to_ramp_journal" DISABLE TRIGGER USER`);
+      try {
+        await dataSource.query(`TRUNCATE TABLE ${tables} RESTART IDENTITY CASCADE`);
+      } finally {
+        await dataSource.query(`ALTER TABLE "to_ramp_journal" ENABLE TRIGGER USER`);
+      }
       // to_settings survives the truncate (boot facts); the operator halt must not leak between specs,
       // and the rewards cursor must restart with the (re-numbered) index tables it points into.
       await dataSource.query(`DELETE FROM to_settings WHERE key = 'exchange_halt'`);
@@ -240,19 +314,25 @@ export async function createTestApp(overrides: TestAppOverrides = {}): Promise<T
 }
 
 /**
- * Registers the Jest lifecycle for a spec: boot once, `reset()` before every test, close after.
- * Returns a handle whose fields are populated after `beforeAll` ran.
+ * Registers the Jest lifecycle for a spec: purge and boot once, `reset()` before every test, reset
+ * and close after (nothing outlives the file: see `purgeTestDatabase`). Returns a handle whose
+ * fields are populated after `beforeAll` ran.
  */
 export function useTestApp(overrides: TestAppOverrides = {}): TestApp {
   const handle = {} as TestApp;
   beforeAll(async () => {
+    await purgeTestDatabase(testEnv(overrides.env).DATABASE_URL);
     Object.assign(handle, await createTestApp(overrides));
   });
   beforeEach(async () => {
     await handle.reset();
   });
   afterAll(async () => {
-    if (handle.close) await handle.close();
+    try {
+      if (handle.reset) await handle.reset();
+    } finally {
+      if (handle.close) await handle.close();
+    }
   });
   return handle;
 }

@@ -6,10 +6,12 @@
  */
 import { AuditEventEntity } from "../src/entities/audit-event.entity";
 import { DepositCreditEntity } from "../src/entities/deposit-credit.entity";
+import { TokenCommandEntity } from "../src/entities/token-command.entity";
 import { WalletCreditEntity } from "../src/entities/wallet-credit.entity";
 import { WalletEntity } from "../src/entities/wallet.entity";
 import { DepositService, mintCreditCommandId } from "../src/services/deposit.service";
 import { IndexerService } from "../src/services/indexer.service";
+import { TokenAppSyncService } from "../src/services/token-app-sync.service";
 import { UserService } from "../src/services/user.service";
 import {
   NatsSubjects,
@@ -145,10 +147,21 @@ describe("admin token operations (docs/TOKENS.md §4.7)", () => {
     expect(await audits("token.mint")).toHaveLength(2);
   });
 
-  it("mint-and-credit: the account's wallet is created first, the mint lands on the treasury, then UserWallet.Deposit { txRef: mint:<commandId> } through the write-ahead row — and the next reconcile sees nothing to credit", async () => {
+  it("mint-and-credit: the account's wallet is created first, the mint lands on the treasury, and only once token-app RECORDED it does the token sync submit UserWallet.Deposit { txRef: mint:<commandId> } through the write-ahead row — the next reconcile sees nothing to credit", async () => {
     const headers = await adminHeaders();
     const alice = makeTestWallet("alice");
     const { user, cookie } = await issueSessionDirect(ctx, alice);
+    // token-app accepted the POST but has not recorded the mint yet (T-D5).
+    ctx.tokenApp.nextPost = {
+      outcome: {
+        outcome: "accepted",
+        httpStatus: 200,
+        status: "submitted",
+        code: null,
+        message: null,
+      },
+      lands: true,
+    };
     const res = bodyOf<ApiTokenMintResult>(
       await ctx.agent
         .post("/api/v1/admin/tokens/mint")
@@ -162,12 +175,32 @@ describe("admin token operations (docs/TOKENS.md §4.7)", () => {
       credit: {
         commandId: mintCreditCommandId(res.commandId),
         txRef: `mint:${res.commandId}`,
-        status: "confirmed",
+        status: "pending",
       },
     });
     expect(ctx.tokenApp.minted).toEqual([
       expect.objectContaining({ partyId: TEST_TREASURY, amount: parseAmount("100") }),
     ]);
+    expect(
+      await ctx.dataSource
+        .getRepository(TokenCommandEntity)
+        .findOneByOrFail({ commandId: res.commandId }),
+    ).toMatchObject({ source: "admin", status: "submitted", ref: `credit:${user.id}` });
+    // Not recorded yet: a sync pass credits nothing.
+    ctx.tokenApp.unrecorded.add(res.commandId);
+    await ctx.get(TokenAppSyncService).syncOnce("test");
+    expect(ctx.ledger.walletOf(alice.partyId, TEST_REWARDS)?.balance ?? 0n).toBe(0n);
+    expect(await ctx.dataSource.getRepository(DepositCreditEntity).count()).toBe(0);
+    // Recorded: the pass records the command and its hook submits the Deposit.
+    ctx.tokenApp.unrecorded.delete(res.commandId);
+    await ctx.get(TokenAppSyncService).syncOnce("test");
+    expect(
+      (
+        await ctx.dataSource
+          .getRepository(TokenCommandEntity)
+          .findOneByOrFail({ commandId: res.commandId })
+      ).status,
+    ).toBe("recorded");
     // Create UserWallet (TRO) BEFORE the mint, Deposit after it.
     expect(ctx.wallet.submits.map((s) => s.commandId)).toEqual([
       ctx.ledger.walletCreateCommandId(alice.partyId, TEST_REWARDS),
@@ -283,26 +316,39 @@ describe("admin token operations (docs/TOKENS.md §4.7)", () => {
     expect(ctx.wallet.submits).toEqual([]);
   });
 
-  it("a credit the ledger has not shown yet is `submitted`, finished by the confirm pass; a repeat for the same mint answers the existing row; a wallet failure leaves the write-ahead row for the pass", async () => {
+  it("the sync's credit that the ledger has not shown yet is `submitted`, finished by the confirm pass; a repeat for the same mint answers the existing row; a wallet failure leaves the write-ahead row; a credit waits while another is in flight", async () => {
     const headers = await adminHeaders();
     const alice = makeTestWallet("alice");
     const { user } = await issueSessionDirect(ctx, alice);
     ctx.ledger.seedUserWallet(alice.partyId, { instrument: TEST_REWARDS });
+    const sync = ctx.get(TokenAppSyncService);
+    const mintAndCredit = async (amount: string, reason: string): Promise<ApiTokenMintResult> => {
+      const res = bodyOf<ApiTokenMintResult>(
+        await ctx.agent
+          .post("/api/v1/admin/tokens/mint")
+          .set(headers)
+          .send({ instrument: TEST_REWARDS, amount, creditUserId: user.id, reason })
+          .expect(200),
+      );
+      expect(res.credit).toMatchObject({ status: "pending", txRef: `mint:${res.commandId}` });
+      return res;
+    };
+    const creditOf = (mintCommandId: string): Promise<DepositCreditEntity | null> =>
+      ctx.dataSource
+        .getRepository(DepositCreditEntity)
+        .findOneBy({ commandId: mintCreditCommandId(mintCommandId) });
+
     // The wallet accepts the Deposit but the ledger has not applied it yet: the credit is `submitted`, not an error.
     ctx.wallet.lagLedger = true;
-    const res = bodyOf<ApiTokenMintResult>(
-      await ctx.agent
-        .post("/api/v1/admin/tokens/mint")
-        .set(headers)
-        .send({
-          instrument: TEST_REWARDS,
-          amount: "5",
-          creditUserId: user.id,
-          reason: "slow ledger",
-        })
-        .expect(200),
-    );
-    expect(res.credit).toMatchObject({ status: "submitted", txRef: `mint:${res.commandId}` });
+    const res = await mintAndCredit("5", "slow ledger");
+    await sync.syncOnce("test");
+    expect(await creditOf(res.commandId)).toMatchObject({
+      status: "submitted",
+      txRef: `mint:${res.commandId}`,
+    });
+    // A later pass does not submit it again while it is in flight.
+    await sync.syncOnce("test");
+    expect(ctx.wallet.submits).toHaveLength(1);
     ctx.wallet.applyPending();
     ctx.wallet.lagLedger = false;
     // The same mint again (a retry of the credit step) is answered by the existing row once confirmed — no second Deposit.
@@ -323,44 +369,24 @@ describe("admin token operations (docs/TOKENS.md §4.7)", () => {
     expect(ctx.ledger.walletOf(alice.partyId, TEST_REWARDS)?.balance).toBe(parseAmount("5"));
 
     // A Deposit submit the wallet refuses: the command may or may not have reached the ledger, so the
-    // row stays `submitted` for the confirm pass (fail closed) and the route reports exactly that.
+    // row stays `submitted` for the confirm pass (fail closed).
     ctx.wallet.failNext = new Error("wallet down");
-    const failed = bodyOf<ApiTokenMintResult>(
-      await ctx.agent
-        .post("/api/v1/admin/tokens/mint")
-        .set(headers)
-        .send({
-          instrument: TEST_REWARDS,
-          amount: "6",
-          creditUserId: user.id,
-          reason: "wallet down",
-        })
-        .expect(200),
-    );
-    expect(failed.credit).toMatchObject({ status: "submitted", txRef: `mint:${failed.commandId}` });
+    const failed = await mintAndCredit("6", "wallet down");
+    await sync.syncOnce("test");
+    expect(await creditOf(failed.commandId)).toMatchObject({ status: "submitted" });
     expect(ctx.tokenApp.minted).toHaveLength(2);
+    // While that credit is in flight the next mint's credit waits (deposit_in_progress) — pass after pass,
+    // until the confirm pass settles the first.
+    const third = await mintAndCredit("1", "again");
+    await sync.syncOnce("test");
+    expect(await creditOf(third.commandId)).toBeNull();
     expect(
-      await ctx.dataSource
-        .getRepository(DepositCreditEntity)
-        .countBy({ userId: user.id, status: "submitted" }),
-    ).toBe(1);
-    // While that credit is in flight a new mint-and-credit for the account is refused — and the
-    // refusal names the mint that already landed.
-    const busy = bodyOf<ErrorBody>(
-      await ctx.agent
-        .post("/api/v1/admin/tokens/mint")
-        .set(headers)
-        .send({ instrument: TEST_REWARDS, amount: "1", creditUserId: user.id, reason: "again" })
-        .expect(409),
-    );
-    expect(busy.error).toBe("deposit_in_progress");
-    expect(busy.details).toMatchObject({
-      mint: {
-        commandId: expect.stringMatching(/^mint-/) as string,
-        amount: dec("1"),
-        party: TEST_TREASURY,
-      },
-    });
+      (
+        await ctx.dataSource
+          .getRepository(TokenCommandEntity)
+          .findOneByOrFail({ commandId: third.commandId })
+      ).status,
+    ).toBe("recorded");
   });
 
   it("burns from any party of a registered instrument; status shows token-app and the index's float per instrument", async () => {
@@ -399,14 +425,17 @@ describe("admin token operations (docs/TOKENS.md §4.7)", () => {
       .send({ instrument: TEST_REWARDS, amount: "4", reason: "no party" })
       .expect(400);
 
-    // Status: the treasury's indexed holdings against the indexed wallet balances, per registered instrument.
+    // Status: the treasury's indexed holdings against the indexed wallet balances + live PendingPayouts, per registered instrument.
     const f = new LedgerFixture(TEST_TREASURY);
     const w = f.createWallet(bob, TEST_REWARDS);
+    const granted = f.grant(w.wallet, "3", "reward:x", "manual");
     ctx.stream.push(
       f.spliceTransferIn(bob, "12"),
       f.tokenTransferIn(bob, "25.5", { instrument: TEST_REWARDS }).tx,
       w.tx,
-      f.grant(w.wallet, "3", "reward:x", "manual").tx,
+      granted.tx,
+      // A withdrawal moves 1 TRO from the wallet into a live PendingPayout: still owed (T-D9).
+      f.withdraw(granted.wallet, "1").tx,
     );
     await ctx.get(IndexerService).runOnce();
     const status = bodyOf<ApiTokenStatus>(
@@ -430,11 +459,13 @@ describe("admin token operations (docs/TOKENS.md §4.7)", () => {
         },
         treasuryHoldings: dec("12"),
         liabilities: dec("0"),
+        pendingPayouts: dec("0"),
       },
       {
         instrument: expect.objectContaining({ id: "TRO" }) as unknown,
         treasuryHoldings: dec("25.5"),
         liabilities: dec("3"),
+        pendingPayouts: dec("1"),
       },
     ]);
     ctx.tokenApp.configured = false;

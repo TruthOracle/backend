@@ -18,6 +18,7 @@ internal surface that other packages call.
 | **P6 — ledger index** (docs/INDEXER.md) | `src/indexer/*` (pure: `events`, `token-standard`, `splice`, `projection`), `src/util/ledger-values.ts`, `src/util/ledger-offset.interceptor.ts`; services `ledger-stream`, `indexer`, `markets`, `portfolio`; processor `ledger-indexer`; controllers `markets`, `ledger`, `portfolio`, `ledger-wallet`, `admin-ledger`; `src/dto/ledger.dto.ts`; 16 entities + migrations `LedgerIndex`, `Instruments`; `test/helpers/ledger-fixtures.ts`, `FakeLedgerStream`; specs + `test/ledger.e2e-spec.ts`, `test/token-standard.e2e-spec.ts` |
 | **P8 — tokens** (docs/TOKENS.md) | services `instruments`, `token-registry`, `token-app`, `treasury-transfer`, `token-operations`, `rewards`; processors `transfer-instruction-acceptor`, `rewards`; controllers `instruments`, `admin-instruments`, `rewards`, `admin-rewards`, `admin-tokens`; `src/dto/{instruments,rewards,tokens}.dto.ts`; entities `InstrumentEntity`, `WalletCreditEntity`, `LedgerHoldingEntity`, `LedgerTransferInstructionEntity`, `RewardRuleEntity`, `RewardGrantEntity`; `FakeTokenRegistry`, `FakeTokenApp`; specs + `test/{token-standard,instruments,rewards,admin-tokens}.e2e-spec.ts` |
 | **P7 — market catalog, candles, quotes / orders, exchange** (docs/MARKETS.md) | `src/amm/*` (pure: `pm-amm` port of PmAmmMath, `market-state`), `src/indexer/candles.ts`; services `catalog`, `candles`, `quote`, `exchange`, `market-operator`; controllers `catalog`, `orders`, `exchange`, `admin-catalog` (+ `markets` gains candlesticks / quote and id-or-ticker params); `src/dto/catalog.dto.ts`, `src/dto/orders.dto.ts`; entities `SeriesEntity` (to_series), `CatalogEventEntity` (to_events), `MarketCandleEntity` (to_market_candles) + the catalog / open-interest columns on `MarketEntity`; migration `MarketCatalog`; fixtures carry the four identity fields and `at:`; specs + `test/{catalog,candles,orders}.e2e-spec.ts` |
+| **P9 — fiat ramp** (docs/RAMP.md) | services `ramp`, `ramp-fulfilment`, `ramp-policy`, `ramp-order-store`, `ramp-journal`, `ramp-provider-mock`; processor `ramp`; controllers `ramp`, `admin-ramp`, `ramp-mock` (not in the barrel), the `webhooks/ramp/:provider` route; `src/dto/ramp.dto.ts`; `src/util/sealed.ts`; entities `RampOrderEntity`, `RampPaymentMethodEntity`, `RampEventEntity`, `RampJournalEntity`; migration `Ramp`; the off-ramp binding / `blocked_ramp_hold` hooks in `payout`; specs + `test/ramp.e2e-spec.ts` |
 
 Nobody edits another package's files. Barrels are written once by F and not touched again
 (F lists every class below; a package that needs an extra injectable keeps it private to its
@@ -55,6 +56,12 @@ src/services/token-app.service.ts           TokenAppService              (P8)  C
 src/services/treasury-transfer.service.ts   TreasuryTransferService      (P8)  wallet / registry transfers out of the treasury, instrument setup, indexedBalances
 src/services/token-operations.service.ts    TokenOperationsService       (P8)  operator mint / burn through token-app, mint-and-credit, GET /admin/tokens/status
 src/services/rewards.service.ts             RewardsService               (P8)  rules, grants, the float rule, the scan the RewardsProcessor drives
+src/services/ramp.service.ts                RampService                  (P9)  overview, quote, open on-/off-ramp (Idempotency-Key), attach, cancel, cards, webhook inbox
+src/services/ramp-fulfilment.service.ts     RampFulfilmentService        (P9)  step engine: acquirer re-reads, mint → credit, MarkPaid → burn → payout → reversal, admin actions, reconciliation
+src/services/ramp-policy.service.ts         RampPolicyService            (P9)  instrument, eligibility, limits, card hold, bindWithdrawal (reads only — PayoutService depends on it)
+src/services/ramp-order-store.service.ts    RampOrderStore               (P9)  RAMP_TRANSITIONS, compare-and-set transition + audit (+ journal) in one transaction, wire mapping
+src/services/ramp-journal.service.ts        RampJournalService           (P9)  double-entry fiat journal (postingFor is pure)
+src/services/ramp-provider-mock.service.ts  RampProviderMockService      (P9)  the mock acquirer: hosted checkout, signed webhooks, payouts (dev / test only)
 
 src/controllers/app.controller.ts           AppController
 src/controllers/auth.controller.ts          AuthController               (P1)  @Controller("auth")
@@ -69,6 +76,9 @@ src/controllers/admin.controller.ts         AdminController              (P5)  @
 src/controllers/rewards.controller.ts       RewardsController            (P8)  @Controller("me/rewards")  GET /
 src/controllers/admin-rewards.controller.ts AdminRewardsController       (P8)  @Controller("admin/rewards")  rules, rules/:id, grant, grants, float
 src/controllers/admin-tokens.controller.ts  AdminTokensController        (P8)  @Controller("admin/tokens")  mint, burn, status
+src/controllers/ramp.controller.ts          RampController               (P9)  @Controller("ramp")  /, quote, onramp, offramp, orders, orders/:id/attach|cancel, payment-methods
+src/controllers/admin-ramp.controller.ts    AdminRampController          (P9)  @Controller("admin/ramp")  orders, orders/:id/retry|refund|fail, reconciliation, provider
+src/controllers/ramp-mock.controller.ts     RampMockController           (P9)  @Controller("ramp/mock") — NOT exported from the barrel; app.module registers it only when config.ramp.provider === "mock"
 
 src/processors/session-cleanup.processor.ts    SessionCleanupProcessor   (F)
 src/processors/deposit-confirm.processor.ts    DepositConfirmProcessor   (P2)
@@ -77,6 +87,7 @@ src/processors/kyc-webhook.processor.ts        KycWebhookProcessor       (P4)
 src/processors/ledger-indexer.processor.ts     LedgerIndexerProcessor    (P6)
 src/processors/transfer-instruction-acceptor.processor.ts  TransferInstructionAcceptorProcessor (P8)
 src/processors/rewards.processor.ts            RewardsProcessor          (P8)  REWARDS_SCAN_MS, lock:rewards → RewardsService.scan()
+src/processors/ramp.processor.ts               RampProcessor             (P9)  consumer ramp-webhook-apply; RAMP_SCAN_MS (0 = off), lock:ramp-scan → RampFulfilmentService.scan() + sweepEvents()
 
 src/entities/*.entity.ts  UserEntity (to_users), AuthIdentityEntity (to_auth_identities), WalletEntity (to_wallets),
   SessionEntity (to_sessions), KycVerificationEntity (to_kyc_verifications), KycPersonEntity (to_kyc_persons),

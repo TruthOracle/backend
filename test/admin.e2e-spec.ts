@@ -911,7 +911,11 @@ describe("Admin API (e2e)", () => {
       const res = await post(`/kyc/persons/${docFp}/transfer`, admin.cookie)
         .send({ toUserId: b.user.id, reason: "account merge ticket 42" })
         .expect(200);
-      expect(res.body).toEqual({ ok: true });
+      // The four-eyes kyc.person_transfer (R2b-1), executed at once with RAMP_DUAL_CONTROL=false.
+      expect(res.body).toMatchObject({
+        ok: true,
+        approval: { action: "kyc.person_transfer", status: "executed" },
+      });
 
       // Both keys (doc + person) moved to B and point at B's now-approved verification.
       const moved = await persons().find({ where: { userId: b.user.id }, order: { kind: "ASC" } });
@@ -1055,13 +1059,21 @@ describe("Admin API (e2e)", () => {
       const forced = await post(`/payouts/${blocked.contractId}/settle`, admin.cookie)
         .send({ force: true, reason: "KYC verified out of band" })
         .expect(200);
-      expect(bodyOf<{ payout: ApiPayout; mode: string }>(forced)).toMatchObject({
-        mode: "external",
-        payout: {
-          pendingPayoutCid: blocked.contractId,
-          status: "settled_external",
-          onLedger: false,
-          attempts: 1,
+      // force is the four-eyes payout.force_settle (S4); tests run single-control, so it executes at once.
+      expect(
+        bodyOf<{ approval: { status: string }; result: { payout: ApiPayout; mode: string } }>(
+          forced,
+        ),
+      ).toMatchObject({
+        approval: { status: "executed" },
+        result: {
+          mode: "external",
+          payout: {
+            pendingPayoutCid: blocked.contractId,
+            status: "settled_external",
+            onLedger: false,
+            attempts: 1,
+          },
         },
       });
       expect(ctx.wallet.transfers).toEqual([

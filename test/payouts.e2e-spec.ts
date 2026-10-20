@@ -19,6 +19,7 @@ import type { SessionEntity } from "../src/entities/session.entity";
 import { UserEntity } from "../src/entities/user.entity";
 import { WalletEntity } from "../src/entities/wallet.entity";
 import { PayoutSettlementProcessor } from "../src/processors/payout-settlement.processor";
+import { ComplianceFreezePort } from "../src/services/compliance-freeze.port";
 import { KycService } from "../src/services/kyc.service";
 import {
   PayoutService,
@@ -27,6 +28,7 @@ import {
 } from "../src/services/payout.service";
 import { SentryService } from "../src/services/sentry.service";
 import { SessionService } from "../src/services/session.service";
+import { UserService } from "../src/services/user.service";
 import { WalletLinkService } from "../src/services/wallet-link.service";
 import {
   type ApiPayout,
@@ -381,9 +383,12 @@ describe("payouts (e2e)", () => {
         force: true,
         reason: "wallet confirmed nothing left the treasury; ticket 77",
       }).expect(200);
-      expect(bodyOf<SettleBody>(forced)).toMatchObject({
-        mode: "external",
-        payout: { status: "settled_external", onLedger: false },
+      // force is the four-eyes payout.force_settle (S4); tests run single-control, so it executes at once.
+      expect(
+        bodyOf<{ approval: { action: string; status: string }; result: SettleBody }>(forced),
+      ).toMatchObject({
+        approval: { action: "payout.force_settle", status: "executed" },
+        result: { mode: "external", payout: { status: "settled_external", onLedger: false } },
       });
       // The identical command id keeps ledger dedup as the backstop; MarkPaid follows.
       expect(ctx.wallet.transfers).toEqual([
@@ -407,6 +412,75 @@ describe("payouts (e2e)", () => {
           }),
         }),
       ]);
+    });
+
+    it("review group A: force never pays a frozen payee (I10) — a suspended payee's forceable blocked_kyc on a frozen account is blocked_compliance; nothing moves", async () => {
+      const s = await seedScenario(ctx);
+      const cid = s.withdraw.contractId;
+      const unbind = ctx
+        .get(ComplianceFreezePort)
+        .bind({ isFrozen: async (id) => id === s.a.user.id });
+      try {
+        const admin = await signInAsAdmin(
+          request.agent(ctx.app.getHttpServer() as Server),
+          operator,
+        );
+        const adminSettle = (body: Record<string, unknown>) =>
+          ctx.agent
+            .post(`/api/v1/admin/payouts/${cid}/settle`)
+            .set("Cookie", admin.cookie)
+            .set(ctx.csrf)
+            .send(body);
+        // Suspension is checked before the freeze: the payee's block alone would be forceable.
+        await ctx.get(UserService).suspend(s.a.user.id, "e2e", { type: "system" });
+        expect((await adminSettle({ reason: "look" })).status).toBe(409);
+        expect(await payoutRow(ctx, cid)).toMatchObject({ status: "blocked_kyc" });
+        expect((await adminSettle({ force: true, reason: "customer called" })).status).not.toBe(
+          200,
+        );
+        expect(await payoutRow(ctx, cid)).toMatchObject({
+          status: "blocked_compliance",
+          lastError: "the payee account is frozen",
+        });
+        expect(ctx.wallet.transfers).toEqual([]);
+        expect(ctx.ledger.payouts.has(cid)).toBe(true);
+        expect(await auditRows(ctx, "payout.admin_override")).toHaveLength(0);
+      } finally {
+        unbind();
+      }
+    });
+
+    it("review group A: an operator's forced re-send of a transfer that died never pays a payee frozen since — the resumed settlement asks the freeze again (I10)", async () => {
+      const s = await seedScenario(ctx);
+      const cid = s.withdraw.contractId;
+      await driveToFailed(ctx, cid, s.a.cookie);
+      await ctx.dataSource
+        .getRepository(PayoutEntity)
+        .update(
+          { pendingPayoutCid: cid },
+          { firstSeenAt: new Date(Date.now() - ctx.config.payoutResendGraceMs - 1000) },
+        );
+      // The payee was frozen after the transfer died (the resumed settlement skips the first checks).
+      const unbind = ctx
+        .get(ComplianceFreezePort)
+        .bind({ isFrozen: async (id) => id === s.a.user.id });
+      try {
+        const admin = await signInAsAdmin(
+          request.agent(ctx.app.getHttpServer() as Server),
+          operator,
+        );
+        const forced = await ctx.agent
+          .post(`/api/v1/admin/payouts/${cid}/settle`)
+          .set("Cookie", admin.cookie)
+          .set(ctx.csrf)
+          .send({ force: true, reason: "wallet confirmed nothing left the treasury" });
+        expect(forced.status).not.toBe(200);
+        expect(await payoutRow(ctx, cid)).toMatchObject({ status: "blocked_compliance" });
+        expect(ctx.wallet.transfers).toEqual([]);
+        expect(ctx.ledger.payouts.has(cid)).toBe(true);
+      } finally {
+        unbind();
+      }
     });
 
     it("a consuming submit the wallet accepted is settled only once the ledger shows the contract gone; a ledger-rejected SettleToWallet is retried under a fresh id", async () => {

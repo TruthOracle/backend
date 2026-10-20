@@ -51,6 +51,11 @@ export class LoginService {
     const userAgent =
       typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null;
 
+    // SPEC §8 (E-D11): an admin session never links an identity. Otherwise an operator could attach
+    // Google / Telegram to the admin user row and hold a user session (KYC, ramp orders) on it.
+    if (currentSession?.kind === "admin" && ctx.kind !== "admin") {
+      throw new ApiError(403, "forbidden", "identities cannot be linked under an admin session");
+    }
     // §6.8 / §7.4: admin sessions come only from an admin-sign-in by an operator wallet, never in link mode.
     if (ctx.kind === "admin") {
       if (currentUser)

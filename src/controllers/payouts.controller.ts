@@ -3,7 +3,7 @@ import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, principalOf } from "../auth/request";
 import { PayoutCidParamDto } from "../dto/payouts.dto";
-import { PayoutService } from "../services/payout.service";
+import { type PayoutMode, PayoutService } from "../services/payout.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import type { ApiPayout } from "../types";
 
@@ -39,7 +39,7 @@ export class PayoutsController {
   async settle(
     @Param() params: PayoutCidParamDto,
     @Req() req: AuthedRequest,
-  ): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
+  ): Promise<{ payout: ApiPayout; mode: PayoutMode }> {
     const { user, session } = principalOf(req);
     await this.rateLimit.enforce("settle", { userId: user.id });
     const result = await this.payouts.settle(params.cid, {
@@ -48,6 +48,7 @@ export class PayoutsController {
       sessionId: session.id,
       ip: req.clientIp ?? null,
     });
-    return { payout: this.payouts.toApi(result.payout, result.onLedger), mode: result.mode };
+    // C11: the payee sees every internal hold as `processing`, never its reason.
+    return { payout: this.payouts.toUserApi(result.payout, result.onLedger), mode: result.mode };
   }
 }

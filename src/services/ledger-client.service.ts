@@ -41,6 +41,8 @@ export interface ReadOptions {
 @Injectable()
 export class LedgerClientService {
   private readonly logger = new Logger(LedgerClientService.name);
+  /** Contract ids already reported by `treasurySigned`, so a planted contract alerts once, not every scan. */
+  private readonly foreignSeen = new Set<string>();
 
   constructor(
     private readonly config: Config,
@@ -198,6 +200,37 @@ export class LedgerClientService {
   }
 
   /**
+   * Active contracts of a template the treasury signs as `admin` (UserWallet, PendingPayout,
+   * PredictionMarket). Review R3-01: the treasury's ACS also holds contracts it only observes, and
+   * any party can create one naming the treasury as an audit observer — a PendingPayout { admin = P,
+   * user = P } would otherwise be paid out of the treasury, and a UserWallet { admin = P, owner =
+   * victim } would block the victim as a duplicate wallet. Only rows whose `admin` is the treasury,
+   * which the treasury had to sign, count; the others are reported once each and never used.
+   */
+  private async treasurySigned(entity: string, opts: ReadOptions): Promise<ActiveContract[]> {
+    const treasury = this.config.treasuryPartyId;
+    const rows = await this.activeContracts(treasury, entity, opts);
+    const foreign = rows.filter((r) => asString(r.payload.admin) !== treasury);
+    for (const row of foreign) {
+      if (this.foreignSeen.has(row.contractId)) continue;
+      this.foreignSeen.add(row.contractId);
+      this.logger.error(
+        `${entity} ${row.contractId} names admin ${asString(row.payload.admin)}, not the treasury: ignored`,
+      );
+      this.sentry.captureMessage(
+        "contract naming the treasury only as an observer ignored",
+        "error",
+        {
+          entity,
+          contractId: row.contractId,
+          admin: asString(row.payload.admin),
+        },
+      );
+    }
+    return foreign.length === 0 ? rows : rows.filter((r) => asString(r.payload.admin) === treasury);
+  }
+
+  /**
    * `creditRefs` and `instrument` are mandatory on the deployed Daml (truthoracle-v17
    * `UserWallet.creditRefs : [Text]`, `UserWallet.instrument : InstrumentId`): the first is THE
    * confirmation rule of the deposit and grant confirm passes, the second decides which balance a
@@ -287,7 +320,7 @@ export class LedgerClientService {
 
   /** Every active UserWallet the treasury signs, one row per contract with its instrument. */
   async fetchAllUserWallets(opts: ReadOptions = {}): Promise<LedgerWallet[]> {
-    const rows = await this.activeContracts(this.config.treasuryPartyId, "UserWallet", opts);
+    const rows = await this.treasurySigned("UserWallet", opts);
     return rows.map((r) => this.walletFrom(r));
   }
 
@@ -331,7 +364,7 @@ export class LedgerClientService {
   }
 
   async fetchPendingPayouts(opts: ReadOptions = {}): Promise<PendingPayoutRecord[]> {
-    const rows = await this.activeContracts(this.config.treasuryPartyId, "PendingPayout", opts);
+    const rows = await this.treasurySigned("PendingPayout", opts);
     return rows.map((r) => this.payoutFrom(r));
   }
 
@@ -340,12 +373,22 @@ export class LedgerClientService {
     cid: string,
     opts: ReadOptions = {},
   ): Promise<PendingPayoutRecord | null> {
-    const rows = await this.activeContracts(this.config.treasuryPartyId, "PendingPayout", opts);
+    const rows = await this.treasurySigned("PendingPayout", opts);
     for (const row of rows) {
       if (row.contractId !== cid) continue;
       return this.payoutFrom(row);
     }
     return null;
+  }
+
+  /**
+   * The contract ids of market `marketId`'s active PredictionMarket as the treasury (its
+   * signatory) sees it at the ledger end — one, unless the market is gone. Review F0: a resolution
+   * exercises what the ledger holds now, never the index's version a trade may have replaced.
+   */
+  async fetchMarketContracts(marketId: string, opts: ReadOptions = {}): Promise<string[]> {
+    const rows = await this.treasurySigned("PredictionMarket", opts);
+    return rows.filter((r) => asString(r.payload.marketId) === marketId).map((r) => r.contractId);
   }
 }
 

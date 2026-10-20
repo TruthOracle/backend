@@ -27,6 +27,7 @@ import type {
 } from "../types";
 import { ApiError } from "../util/errors";
 import { formatAmount, parseAmount } from "../util/money";
+import { ComplianceFreezePort } from "./compliance-freeze.port";
 import { ExchangeService } from "./exchange.service";
 import { IndexerService } from "./indexer.service";
 import { MarketsService } from "./markets.service";
@@ -72,6 +73,7 @@ export class QuoteService {
     private readonly markets: MarketsService,
     private readonly indexer: IndexerService,
     private readonly exchange: ExchangeService,
+    private readonly freeze: ComplianceFreezePort,
   ) {}
 
   // ───────────────────────────────────────────── quotes ─────────────────────────────────────────────
@@ -236,6 +238,10 @@ export class QuoteService {
     market: MarketEntity,
     req: QuoteRequest,
   ): Promise<ApiPreparedOrder> {
+    // SPEC §11.6 (B3, X6): the backend prepares no value movement for a frozen account — the
+    // neutral 403, before anything else is checked. (Its own on-ledger submissions raise
+    // TM-FROZEN-ACTIVITY; an on-ledger freeze is a contracts follow-up.)
+    await this.freeze.assertNotFrozen(user.id);
     const nowSec = Math.floor(Date.now() / 1000);
     const party = user.partyId;
     if (!party) throw new ApiError(409, "no_primary_wallet", "link a wallet before trading");

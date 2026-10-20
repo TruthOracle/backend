@@ -72,7 +72,7 @@ interface Session { id: string; kind: "user" | "admin"; authMethod: IdentityProv
 interface Payout {
   pendingPayoutCid: string; payeeParty: string; walletId: string | null; instrument: InstrumentRef; amount: Money; reason: string;
   status: "queued" | "settling" | "settled_external" | "settled_in_app" | "blocked_kyc" | "blocked_unknown_user" |
-          "blocked_unknown_reason" | "blocked_wallet_revoked" | "failed" | "archived";
+          "blocked_unknown_reason" | "blocked_wallet_revoked" | "blocked_ramp_hold" | "failed" | "archived";
   retryAfterKyc: boolean; attempts: number; lastError: string | null; firstSeenAt: string; settledAt: string | null;
   onLedger: boolean;                         // still an active PendingPayout contract
 }
@@ -144,15 +144,37 @@ credits a `UserWallet` presupposes one exists — i.e. an account that deposited
   | `409 no_primary_wallet` | `409 deposit_in_progress` | `409 deposit_attribution_drift` (`details: { kind: "over_credit" | "ledger_below_expected" | "ledger_above_expected" | "duplicate_user_wallet", instrument, walletId?, amount? }`) | `409 kyc_duplicate_identity` | `409 instrument_disabled` | `404 instrument_unknown` | `503 ledger_stale` (`details: { offset, ledgerEnd, lag, maxLag }` — the ledger index lags the ledger end by more than `LEDGER_FRESH_OFFSETS`, or no participant is configured to check against; retry shortly) | `502 upstream_failed`
   — the received side is the ledger index (`to_ledger_transfers`, docs/TOKENS.md §2 decision 5): what the linked parties sent the treasury in the instrument, token-standard or Canton Coin, as the treasury's own transaction stream showed it
 - `GET /in-app-wallet/payouts` → `200 { payouts: Payout[] }`
-- `POST /in-app-wallet/payouts/:cid/settle` → `200 { payout: Payout, mode: "external" | "in_app" | "already_settled" }` | `404 payout_not_found` | `409 kyc_required` | `409 payout_blocked` (`details.status`)
+- `POST /in-app-wallet/payouts/:cid/settle` → `200 { payout: Payout, mode: "external" | "in_app" | "offramp" | "already_settled" }` | `404 payout_not_found` | `409 kyc_required` | `409 payout_blocked` (`details.status`) | `409 ramp_hold` (card-bought value on hold, docs/RAMP.md §6 — the row is `blocked_ramp_hold` and settles by itself when the hold ends). `offramp` = a withdrawal bound to a card cash-out: MarkPaid only, the fiat follows (docs/RAMP.md §3.2)
 
 ## KYC
 - `GET /kyc` → `200 KycSummary & { history: KycVerification[] }`
 - `POST /kyc/sessions` → `200 { provider: "sumsub", accessToken, expiresAt, levelName, verificationId }` | `200 { provider: "mock", verificationId, levelName }` | `409 kyc_duplicate_identity` | `503 kyc_provider_unavailable`
 - `POST /kyc/mock/submit` `{ verificationId, outcome: "approved" | "rejected_retry" | "rejected_final", person: { firstName, lastName, dob: "YYYY-MM-DD", country: "ISO3" }, documents: { docType: "PASSPORT" | "ID_CARD" | "DRIVERS" | "RESIDENCE_PERMIT", country, number }[] }` → `200 { verification, userKycStatus }` (mock provider only)
 
+## Fiat ramp (session; user sessions only; docs/RAMP.md)
+BYN card on-ramp and off-ramp for the ramp instrument (the default collateral, cBYN). 1 BYN = 1 token; `amount` is the side the user gives (fiat charged on-ramp, tokens withdrawn off-ramp), whole in the fiat's decimals; the fee comes off the other side. KYC is required whatever `KYC_ENFORCE_WITHDRAWALS` says (`RAMP_REQUIRE_KYC`). Order creation needs an `Idempotency-Key` header (8–128 of `[A-Za-z0-9_.:-]`): a retry answers the same order, the key reused for another request is `409 bad_request`. Opening, attaching and cancelling share 10/min/user.
+- `GET /ramp` → `200 RampOverview` — `{ enabled, provider, instrument, fiat: { currency, decimals }, fees: { onramp|offramp: { bps, fixed } }, limits: { onramp|offramp: { min, max, dailyMax, monthlyMax, dailyRemaining, monthlyRemaining } }, holdHours, hold: { locked, until }, capabilities: { cardPayouts }, eligibility: { onramp|offramp: string[] /* empty = allowed */ }, openOrders: RampOrder[] }`
+- `POST /ramp/quote` `{ direction: "onramp" | "offramp", amount }` → `200 { direction, instrument, fiatCurrency, fiatAmount, tokenAmount, fee }` | `400 validation_failed` | `503 ramp_unavailable`
+- `POST /ramp/onramp` `{ amount, expectedTokenAmount? }` → `200 { order: RampOrder, checkoutUrl }` | `503 ramp_unavailable` (`details.reason`) | `403 user_suspended` | `409 no_primary_wallet | kyc_required | kyc_duplicate_identity | ramp_limit_exceeded (details.limit, available) | ramp_quote_changed | ramp_order_open (details.orderId)` | `400 validation_failed` | `502 upstream_failed` (the acquirer refused; the order is `failed`)
+- `POST /ramp/offramp` `{ amount, paymentMethodId, expectedFiatAmount? }` → `200 { order: RampOrder, withdraw: { walletContractId, ownerParty, amount } }` — then sign `UserWallet.Withdraw { amount, nowSeconds }` on `walletContractId` and call attach | the on-ramp's errors plus `403 ramp_not_eligible` (no payout-eligible card) | `409 no_in_app_wallet | insufficient_balance | ramp_hold (details.unlockedAmount, holdUntil)`
+- `POST /ramp/orders/:id/attach` `{ pendingPayoutCid }` → `200 RampOrder` — binds the signed withdrawal and settles it (MarkPaid), then advances the cash-out | `409 ramp_order_state` (not waiting, or the PendingPayout's payee / instrument / amount / reason differ) | `404 not_found`
+- `POST /ramp/orders/:id/cancel` → `200 RampOrder` | `409 ramp_order_state` (paid, signed or closed)
+- `GET /ramp/orders?direction=&page=&limit=` → `{ items: RampOrder[], page, limit, total }` · `GET /ramp/orders/:id` → `RampOrder` | `404 not_found`
+- `GET /ramp/payment-methods` → `RampPaymentMethod[]` · `DELETE /ramp/payment-methods/:id` → `204` | `409 ramp_order_state` (a cash-out to it is in flight)
+- `POST /ramp/mock/payments/:paymentId/complete` `{ outcome: "succeeded" | "declined" | "no_3ds", cardSeed? }` · `POST /ramp/mock/payments/:paymentId/chargeback` → `200 { delivered: true }` (mock acquirer only; route absent otherwise)
+
+```ts
+interface RampOrder { id: string; direction: "onramp" | "offramp"; status: RampOrderStatus /* docs/RAMP.md §4 */; reviewStep: string | null;
+  instrument: InstrumentRef; fiatCurrency: string; fiatAmount: Money; tokenAmount: Money; fee: Money; paymentMethod: RampPaymentMethod | null;
+  checkoutUrl: string | null /* while awaiting_payment */; expiresAt: string | null; holdUntil: string | null; pendingPayoutCid: string | null;
+  failureCode: string | null; createdAt: string; updatedAt: string; completedAt: string | null }
+interface RampPaymentMethod { id: string; brand: string | null; last4: string | null; expMonth: number | null; expYear: number | null;
+  issuerCountry: string | null; status: "active" | "removed" | "blocked"; payoutEligible: boolean; createdAt: string; lastUsedAt: string | null }
+```
+
 ## Webhooks
 - `POST /webhooks/kyc/sumsub` (raw body, `x-payload-digest`, `x-payload-digest-alg`) → `200 { received: true }` | `401`
+- `POST /webhooks/ramp/:provider` (raw body, the provider's signature headers; mock: `x-mock-signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, 5-minute tolerance) → `200 { received: true }` | `401 webhook_rejected` | `404 not_found` (not the configured provider)
 
 ## Admin (admin session only)
 - `GET /admin/users?q=&page=` → `{ items: User[], page, limit, total }`
@@ -357,6 +379,8 @@ interface RewardRule { id: string; kind: "trade_volume_rebate" | "winning_redeem
 - `PATCH /admin/events/:ticker` `{ …, archived? }` → `{ event }`
 - `POST /admin/markets` `{ collateral?: { admin, id }, eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValue, feeBps?, prizeFeeShareBps?, policy? (with `bond`), auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, collateral: InstrumentRef, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars, a `collateral` that is not an enabled collateral instrument) | `409 catalog_conflict` (incl. a collateral other than the event's) | `503 not_ready` (MarketCounter not indexed, or no default collateral configured) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract. `imageUrl` / `description` are backend-owned presentation written to `to_market_metadata` before the submit, never to the ledger (a blank `imageUrl` shows the event's image); the category is the series'.
 - `PATCH /admin/markets/:market/metadata` `{ imageUrl?, description?, reason? }` → `{ market }` | `400 validation_failed` (neither field) | `404 not_found`. Audited `catalog.market_metadata_updated`; publishes `truthoracle.catalog.changed { kind: "market" }`.
+- `GET /admin/markets/:marketId/resolution` (role `ops` or `approver`; `:marketId` = the on-ledger id) → `{ market: { marketId, ticker, question, status, expiresAt, gracePeriodSecs, collateral: InstrumentRef, operatorResolution, sources, outcome }, windows: { resolveT0From, resolveT0To, resolveFrom, voidFrom }, choicesAvailable, pending: Approval | null, asOf }` | `403 role_required` | `404 not_found`. Times are ISO-8601 UTC, bounds inclusive, judged by the backend clock at `asOf`.
+- `POST /admin/markets/:marketId/resolution` `{ choice: ResolveT0 | Resolve | VoidMarket, outcome?: Yes | No | Void, sourceUri?, attestationCids?, reason, signature? }` → four-eyes `market.resolve` (`ops` asks, `approver` approves): `202 { approval }` | `200 { approval, result: { marketId, choice, commandId } }` | `400 validation_failed` (`outcome` + http(s) `sourceUri` ≤ 2048 required by ResolveT0 only; 1–50 distinct `attestationCids` required by Resolve only) | `403 role_required` | `404 not_found` | `409 market_not_resolvable` (`details.reason`: `archived`, `status`, `operator_resolution_off`, `not_expired`, `window_closed`, `grace_not_elapsed`, `source_not_allowed`, `attestation_unknown|archived|other_market|source|window|malformed`, `no_tier`, `attestations_disagree`) | `409 approval_pending` | `503 ledger_stale` | `503 not_ready`. The only way any market is resolved or voided. Execution re-validates on fresh reads, exercises the choice on the market's current contract treasury-signed (command id `market-resolve-<marketId>-<approvalId>`, `nowSeconds` = the backend clock) and audits `market.resolution_submitted`. With `RAMP_DUAL_CONTROL=false` it executes at once, signed by the requester when `RAMP_APPROVAL_SIGNATURES` (C23).
 - `POST /admin/exchange/halt` `{ active: boolean, reason, estimatedResumeAt? }` → `{ halt }`
 
 ### Admin — instruments (admin session; docs/TOKENS.md §4.1)
@@ -389,3 +413,13 @@ Mint and burn go through Cantor8's token-app; without `TOKEN_APP_URL` both answe
 interface TokenOperation { commandId: string /* mint-<24 hex> | burn-<24 hex> */; status: string /* token-app's */; instrument: InstrumentRef; amount: Money;
   party: string /* minted to / burned from */; credit: { commandId: string /* mint-credit-<sha256(commandId)[:40]> */; txRef: string /* mint:<commandId> */; status: "confirmed" | "submitted" } | null }
 ```
+
+### Admin — fiat ramp (admin session; docs/RAMP.md §8, §11)
+Every action needs a `reason` and is audited `ramp.admin_action`.
+- `GET /admin/ramp/orders?status=&direction=&userId=&page=&limit=` → `{ items: AdminRampOrder[], page, limit, total }` — `AdminRampOrder` adds `userId, partyId, provider, idempotencyKey`, the provider ids, every command id, `attempts, lastError, details`
+- `GET /admin/ramp/orders/:id` → `{ order: AdminRampOrder, events: { id, type, kind, objectId, sandbox, receivedAt, processedAt, attempts, error }[], journal: { entryId, orderId, account, currency, amount, memo, createdAt }[], audit: AuditEvent[] }`
+- `POST /admin/ramp/orders/:id/retry` `{ reason }` → `AdminRampOrder` — resumes a `needs_review` order at `reviewStep`; at the payment step it is the approval and needs the acquirer to report the exact amount captured | `409 ramp_order_state`
+- `POST /admin/ramp/orders/:id/refund` `{ reason }` → `AdminRampOrder` — on-ramp: card refund while nothing was minted; cash-out: re-mint and credit back after the burn when the card payout failed | `409 ramp_order_state`
+- `POST /admin/ramp/orders/:id/fail` `{ reason }` → `AdminRampOrder` — closes a reviewed on-ramp whose payment the acquirer does not show as captured | `409 ramp_order_state`
+- `GET /admin/ramp/reconciliation` → `{ checkedAt, ok, checks: { name, ok, detail }[], journal: Record<account, Money>, orders: { byStatus, stuck }, token: { instrument, orderOutstanding, treasuryHoldings, liabilities } }`
+- `GET /admin/ramp/provider` → `{ provider, configured, capabilities: { cardPayouts, refunds }, webhookUrl: string | null, health }` — `webhookUrl` is what the acquirer is told to post to (`RAMP_PUBLIC_API_URL`); never card data

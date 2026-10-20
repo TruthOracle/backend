@@ -1,6 +1,6 @@
 import type { Config } from "../config";
 import { UpstreamError } from "../util/upstream-http";
-import { EnterpriseWalletService } from "./enterprise-wallet.service";
+import { commandOutcome, EnterpriseWalletService } from "./enterprise-wallet.service";
 import type { KeycloakTokenService } from "./keycloak-token.service";
 
 const TREASURY = "treasury::1220" + "a".repeat(64);
@@ -75,6 +75,32 @@ describe("EnterpriseWalletService", () => {
           "deposit-1",
         ),
       ).resolves.toEqual({ known: false, submitted: false, status: null });
+    });
+
+    it("W9g F0: commandStatus carries a failed command's reason and honours a caller's timeout; commandOutcome reads succeeded / failed / pending / unknown", async () => {
+      const svc = service(() =>
+        Promise.resolve({ status: "FAILED", reason: "CONTRACT_NOT_ACTIVE" }),
+      );
+      await expect(
+        svc.commandStatus(TREASURY, "market-resolve-1-a", { timeoutMs: 2_000 }),
+      ).resolves.toEqual({
+        known: true,
+        submitted: false,
+        status: "failed",
+        reason: "CONTRACT_NOT_ACTIVE",
+      });
+      expect((svc as unknown as { wallet: jest.Mock }).wallet).toHaveBeenCalledWith(
+        `/api/v1/command/${encodeURIComponent(TREASURY)}/market-resolve-1-a`,
+        { timeoutMs: 2_000 },
+      );
+      expect(commandOutcome({ known: true, submitted: true, status: "completed" })).toBe(
+        "succeeded",
+      );
+      expect(commandOutcome({ known: true, submitted: true, status: "pending" })).toBe("pending");
+      expect(commandOutcome({ known: true, submitted: false, status: "timeout" })).toBe("failed");
+      expect(commandOutcome({ known: false, submitted: false, status: "not_found" })).toBe(
+        "unknown",
+      );
     });
   });
 });
