@@ -498,14 +498,50 @@ burn with change, frozen party refused, admin burn with reason.
 
 ## 9. Cantor8 handoff — what DevNet needs from them
 
-1. Grant our DevNet Keycloak client access to `token-registry.dev.digik.cantor8.tech` (403 today).
+Status on 2026-10-16 (Niko, Cantor8; each point re-checked against the participant and the registry):
+
+- **Done — cBYN is deployed on DevNet.** `cbyn-rules-v1 0.0.1` =
+  `1fae194ce057b1ebde19c41cf7d800d2984503e89410d7f0c1a1f607af0fff7b` and `cbyn-holding-stable 0.0.1` =
+  `d0f3377f23451abbaa0b0ddefd51e33ffc06ee51b041e08e92c6d3e3102ad91a` resolve through
+  `preferred-packages` for the treasury — the same ids as on zkpc, and not the ids our own build
+  produces: same source, compiled by Cantor8 with SDK 3.4.9 against token-common-v5 0.0.8 /
+  token-business-v2 0.0.10 (cbyn-token README, "Package ids"), so nothing is uploaded from our side.
+  The factory and the `TokenConfig` exist. Parties: transfer agent = instrument admin =
+  `COLLATERAL_INSTRUMENT_ADMIN`
+  `truthoracle-cbyn-transfer-agent::12204e94c0e449c0efcd270dd1e68259c36471cebef132e5c7dfc2750fe8c9eed77f`;
+  issuer (what mint and burn act as)
+  `truthoracle-cbyn-issuer::1220a0a378f5cbd3384225c52d3b50398e13c7f9b07f9220beac1941cc38a7fa7c50`.
+  The treasury sees no cBYN contract yet: no `AutoAccept`, no `MintDelegation`, no `Holding`.
+- **Open — no registry serves cBYN.** The shared DevNet registry answers `404 Unknown instrument
+  'cBYN'. Known: c8ETH, c8BTC, c8TEST, rCC` on `transfer-factory` and on `instruments/cBYN`; cBYN
+  gets its own registry org "like on zkpc", URL pending from Niko this week. Until it arrives nothing
+  that needs a choice context works — `POST /admin/instruments/…/setup` (AutoAccept,
+  MintDelegation), registry-mode payouts, the TransferInstruction acceptor — and the Cantor8 wallet
+  cannot `send` cBYN either. `COLLATERAL_REGISTRY_URL` stays unset for cBYN until then; Canton Coin
+  remains the DevNet collateral.
+- **Open — mint and burn.** The DevNet token-app route and the issuer key in the DevNet Enterprise
+  Wallet are with Alex (Cantor8), plus authorising our Keycloak client `sachin` on
+  `/api/admin/mint|burn`. Order once both land: registry URL → `setup { autoAccept,
+  mintDelegation }` for the treasury → token-app mint to the treasury → cBYN markets (§4.7, §7).
+- **Open — TRO.** Cantor8 builds and deploys TRO from three parameters baked in at build time:
+  ticker, decimals, and transferable between users or issuer-only (§8 decides; the shipped design is
+  `TRO`, 6 decimals, transferable). The backend reads TRO through the token-standard interfaces, so
+  their package names need not match `truthoracle-token`.
+
+The original list, annotated:
+
+1. ~~Grant our DevNet Keycloak client access to the registry (403)~~ — the CIP-56 read paths were
+   public all along; only `/api/c8/admin/v1/*` is restricted, and the backend never calls it.
 2. Deploy `cbyn-holding-stable` / `cbyn-rules-v1` on DevNet, create the factory and TokenConfig,
-   and tell us the instrument admin (transfer agent) party, the issuer party, and the registry URL.
+   and tell us the instrument admin (transfer agent) party, the issuer party — done — and the
+   registry URL — pending.
 3. A DevNet token-app (`token-app.dev.digik.cantor8.tech` has no route yet) with a client that may
-   call `/api/admin/mint|burn` for `cBYN` and `TRO`.
+   call `/api/admin/mint|burn` for `cBYN` and `TRO` — pending (Alex).
 4. Register `cBYN` and `TRO` in the DevNet Cantor8 wallet (popup) and Enterprise Wallet
-   instrument lists so `send(instrumentId)` and `/api/v1/transfer` work.
-5. Deploy `truthoracle-token` (TRO) the same way, or confirm they want us to upload it.
+   instrument lists so `send(instrumentId)` and `/api/v1/transfer` work — pending; to confirm
+   whether the registry org settlement covers it.
+5. ~~Deploy `truthoracle-token` (TRO) the same way, or confirm they want us to upload it~~ — Cantor8
+   builds it from the parameters above once we send them.
 6. Later (MainNet): the same on zkpc, plus the card on-ramp design (CIP-56 exchange).
 
 ## 10. Implementation notes (backend, 2026-10-15)
