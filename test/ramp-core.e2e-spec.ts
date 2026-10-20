@@ -1054,9 +1054,15 @@ describe("review group A: settled orders, never-sent commands, the webhook inbox
   });
 
   it("C43: the closed-order poll and no_stuck_orders read through their partial indexes, not the whole order history", async () => {
+    // What is checked: each query CAN read through its partial index and takes its order from it.
+    // Which usable index the planner prefers depends on the table's statistics (CI, after other
+    // suites' orders were analysed, took ix_to_ramp_orders_status + Sort), so plans that need a
+    // bitmap or a sort are switched off and only an index that serves the ORDER BY remains.
     const plan = async (sql: string, params: unknown[]): Promise<string> =>
       ctx.dataSource.transaction(async (m) => {
         await m.query(`SET LOCAL enable_seqscan = off`);
+        await m.query(`SET LOCAL enable_bitmapscan = off`);
+        await m.query(`SET LOCAL enable_sort = off`);
         const rows = await m.query<{ "QUERY PLAN": string }[]>(`EXPLAIN ${sql}`, params);
         return rows.map((r) => r["QUERY PLAN"]).join("\n");
       });
