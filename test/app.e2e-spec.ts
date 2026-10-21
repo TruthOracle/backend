@@ -84,7 +84,7 @@ describe("App (e2e)", () => {
     expect(rows).toEqual([
       { key: "app_network", value: "devnet" },
       { key: "kyc_pepper_hash", value: ctx.config.kycPepperHash },
-      // seeded by the Instruments migration: where the RewardsProcessor starts reading the index (docs/TOKENS.md §4.6)
+      // seeded by the Init migration: where the RewardsProcessor starts reading the index (docs/TOKENS.md §4.6)
       { key: "rewards_cursor", value: "0" },
     ]);
   });

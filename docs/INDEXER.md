@@ -101,7 +101,7 @@ two transactions loses nothing, a crash inside one rolls back. `INDEXER_ENABLED=
 read API on whatever was indexed and runs no loop (what the e2e suite does; specs drive
 `IndexerService` against `FakeLedgerStream`).
 
-## 3. Tables (`src/entities/*`, migration `LedgerIndex`)
+## 3. Tables (`src/entities/*`, the `Init` migration)
 
 No foreign keys to the account tables: rows are keyed by Canton party and contract id, and an
 account's view is resolved at read time through `to_users.party_id` and `to_wallets.party_id`
