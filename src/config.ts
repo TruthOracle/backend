@@ -2207,7 +2207,12 @@ function complianceIssues(config: Config, env: NodeJS.ProcessEnv): string[] {
 
 /** `RAMP_BANK_*` keys of SPEC §13 S6. Amounts in 1e-10 units of the fiat (whole kopecks). */
 export interface RampBankConfig {
-  /** `RAMP_BANK_ACCOUNT_IBAN`: the CLIENT-MONEY account — the only account whose statements are imported, the payer of every payout. */
+  /**
+   * `RAMP_BANK_ACCOUNT_IBAN`: the CLIENT-MONEY account — the only account whose statements are
+   * imported, the payer of every payout. The operator's own money may sit in it too (operator_money:
+   * the opening balance, top-ups, fee revenue); its own payments out of it are classified
+   * `operator_sweep` four-eyes, never past the client liabilities (X7).
+   */
   accountIban: string;
   /** `RAMP_BANK_BIC`, `RAMP_BANK_NAME`: its bank. */
   bic: string;
@@ -2215,8 +2220,6 @@ export interface RampBankConfig {
   /** `RAMP_BANK_HOLDER_NAME`, `RAMP_BANK_HOLDER_UNP`: its holder (= the operator of record, Decree 367). */
   holderName: string;
   holderUnp: string;
-  /** `RAMP_OPERATOR_ACCOUNT_IBANS`: the operator's OWN accounts (top-ups in, sweeps out; never imported). */
-  operatorAccountIbans: string[];
   /** `RAMP_PSP_SETTLEMENT_IBANS`: accounts the acquirer settles from / is prefunded to. */
   pspSettlementIbans: string[];
   /** `RAMP_BANK_PAYOUT_PURPOSE_CODE` (КНП, 40109 — to confirm with the bank). */
@@ -2259,7 +2262,6 @@ function rampBankFrom(env: NodeJS.ProcessEnv): RampBankConfig {
     bankName: str(env.RAMP_BANK_NAME),
     holderName: str(env.RAMP_BANK_HOLDER_NAME),
     holderUnp: str(env.RAMP_BANK_HOLDER_UNP),
-    operatorAccountIbans: ibanListFrom(env.RAMP_OPERATOR_ACCOUNT_IBANS),
     pspSettlementIbans: ibanListFrom(env.RAMP_PSP_SETTLEMENT_IBANS),
     payoutPurposeCode: str(env.RAMP_BANK_PAYOUT_PURPOSE_CODE) || "40109",
     payoutPurposeText: str(env.RAMP_BANK_PAYOUT_PURPOSE_TEXT) || "Выплата по заказу {ref}",
@@ -2283,11 +2285,11 @@ const BANK_TEXT_RE = /^[\p{L}\p{N} .,'"№#()/:{}-]{1,200}$/u;
 
 /**
  * Boot refusals of SPEC §10.1 / §13 S6. Always: well-formed IBANs (mod-97), BIC, UNP, purpose code
- * and texts, sane numbers and whole-kopeck amounts, the client account apart from the operator and
- * PSP accounts (B2). Prod-like with the ramp on (the reserve gate needs statements, S4): the
- * client-money account in full, held by the operator of record (RAMP_BANK_HOLDER_UNP =
- * RAMP_OPERATOR_UNP — Decree 367, B4), an operator account for the daily top-up; with the bank rail
- * offered, an IBAN ownership proof the bank or operators provide (X10).
+ * and texts, sane numbers and whole-kopeck amounts, the client account apart from the PSP accounts.
+ * Prod-like with the ramp on (the reserve gate needs statements, S4): the client-money account in
+ * full, held by the operator of record (RAMP_BANK_HOLDER_UNP = RAMP_OPERATOR_UNP — Decree 367, B4);
+ * with the bank rail offered, an IBAN ownership proof the bank or operators provide (X10). One
+ * account serves the operator too: fees are paid from the operator money held in it.
  */
 function rampBankIssues(config: Config): string[] {
   const b = config.rampBank;
@@ -2298,7 +2300,6 @@ function rampBankIssues(config: Config): string[] {
     if (!p.ok) issues.push(`${name} is not a valid Belarusian IBAN (${p.problem})`);
   };
   if (b.accountIban) iban("RAMP_BANK_ACCOUNT_IBAN", b.accountIban);
-  for (const v of b.operatorAccountIbans) iban("a RAMP_OPERATOR_ACCOUNT_IBANS entry", v);
   for (const v of b.pspSettlementIbans) iban("a RAMP_PSP_SETTLEMENT_IBANS entry", v);
   if (b.bic && !normalizeBic(b.bic)) issues.push("RAMP_BANK_BIC is not a BIC");
   if (b.bic && b.accountIban && b.bic.slice(0, 4) !== b.accountIban.slice(4, 8))
@@ -2307,14 +2308,8 @@ function rampBankIssues(config: Config): string[] {
     );
   if (b.holderUnp && !UNP_RE.test(b.holderUnp))
     issues.push("RAMP_BANK_HOLDER_UNP must be 9 digits");
-  if (b.accountIban && b.operatorAccountIbans.includes(b.accountIban))
-    issues.push(
-      "RAMP_BANK_ACCOUNT_IBAN (client money) must not be one of RAMP_OPERATOR_ACCOUNT_IBANS",
-    );
   if (b.accountIban && b.pspSettlementIbans.includes(b.accountIban))
     issues.push("RAMP_BANK_ACCOUNT_IBAN must not be one of RAMP_PSP_SETTLEMENT_IBANS");
-  if (b.operatorAccountIbans.some((v) => b.pspSettlementIbans.includes(v)))
-    issues.push("an IBAN is both an operator account and a PSP settlement account");
   if (!/^\d{5}$/.test(b.payoutPurposeCode))
     issues.push("RAMP_BANK_PAYOUT_PURPOSE_CODE must be a 5-digit КНП code");
   for (const [name, text] of [
@@ -2365,10 +2360,6 @@ function rampBankIssues(config: Config): string[] {
   else if (b.holderUnp !== config.ramp.operator.unp)
     issues.push(
       `RAMP_BANK_HOLDER_UNP must equal RAMP_OPERATOR_UNP: the operator of record holds the client money (Decree 367) ${why}`,
-    );
-  if (b.operatorAccountIbans.length === 0)
-    issues.push(
-      `RAMP_OPERATOR_ACCOUNT_IBANS is required ${why}: PSP and bank fees are topped up from the operator's own account (B2)`,
     );
   if (bankRail && !b.nameChecked && !b.manualProof)
     issues.push(

@@ -1245,7 +1245,6 @@ describe("config: methods, rails, exposure, operator of record (SPEC §9, §13 S
       RAMP_BANK_NAME: "Alfa-Bank",
       RAMP_BANK_HOLDER_NAME: "TruthOracle LLC",
       RAMP_BANK_HOLDER_UNP: "193456789",
-      RAMP_OPERATOR_ACCOUNT_IBANS: "BY18PJCB30140000000000000002",
       RAMP_BANK_MANUAL_PROOF: "true",
     });
     expect(complete).not.toMatch(
@@ -1278,7 +1277,6 @@ describe("config: screening and freezes (SPEC §11.6, §13 S7b)", () => {
 
 describe("config: bank rail (SPEC §10, §13 S6)", () => {
   const CLIENT = "BY57ALFA30140000000000000001";
-  const OPERATOR_ACCOUNT = "BY18PJCB30140000000000000002";
   const PSP = "BY11MTBK30140000000000000003";
   const BANK = {
     RAMP_BANK_ACCOUNT_IBAN: CLIENT,
@@ -1286,7 +1284,6 @@ describe("config: bank rail (SPEC §10, §13 S6)", () => {
     RAMP_BANK_NAME: "Alfa-Bank",
     RAMP_BANK_HOLDER_NAME: "TruthOracle LLC",
     RAMP_BANK_HOLDER_UNP: "193456789",
-    RAMP_OPERATOR_ACCOUNT_IBANS: OPERATOR_ACCOUNT,
     RAMP_PSP_SETTLEMENT_IBANS: PSP,
   };
   const PROD = {
@@ -1311,7 +1308,6 @@ describe("config: bank rail (SPEC §10, §13 S6)", () => {
       bankName: "",
       holderName: "",
       holderUnp: "",
-      operatorAccountIbans: [],
       pspSettlementIbans: [],
       payoutPurposeCode: "40109",
       payoutPurposeText: "Выплата по заказу {ref}",
@@ -1341,9 +1337,9 @@ describe("config: bank rail (SPEC §10, §13 S6)", () => {
       /RAMP_BANK_ACCOUNT_IBAN is not a valid Belarusian IBAN \(checksum\)/,
     ],
     [
-      "a non-BY operator account",
-      { RAMP_OPERATOR_ACCOUNT_IBANS: "DE89370400440532013000" },
-      /RAMP_OPERATOR_ACCOUNT_IBANS entry is not a valid/,
+      "a non-BY PSP settlement account",
+      { RAMP_PSP_SETTLEMENT_IBANS: "DE89370400440532013000" },
+      /RAMP_PSP_SETTLEMENT_IBANS entry is not a valid/,
     ],
     [
       "a BIC of another bank",
@@ -1351,14 +1347,9 @@ describe("config: bank rail (SPEC §10, §13 S6)", () => {
       /not the bank of RAMP_BANK_ACCOUNT_IBAN/,
     ],
     [
-      "the client account among the operator accounts",
-      { ...BANK, RAMP_OPERATOR_ACCOUNT_IBANS: CLIENT },
-      /must not be one of RAMP_OPERATOR_ACCOUNT_IBANS/,
-    ],
-    [
-      "an IBAN both operator and PSP",
-      { ...BANK, RAMP_PSP_SETTLEMENT_IBANS: OPERATOR_ACCOUNT },
-      /both an operator account and a PSP/,
+      "the client account among the PSP settlement accounts",
+      { ...BANK, RAMP_PSP_SETTLEMENT_IBANS: CLIENT },
+      /must not be one of RAMP_PSP_SETTLEMENT_IBANS/,
     ],
     [
       "an 8-digit UNP",
@@ -1398,18 +1389,18 @@ describe("config: bank rail (SPEC §10, §13 S6)", () => {
     expect(() => cfg(extra)).toThrow(pattern);
   });
 
-  it("prod-like with the ramp on: the client-money account in full, held by the operator of record; an operator account (B2)", () => {
+  it("prod-like with the ramp on: the client-money account in full, held by the operator of record — and nothing else (one account)", () => {
     const blank = issues(PROD);
     expect(blank).toMatch(/RAMP_BANK_ACCOUNT_IBAN is required/);
     expect(blank).toMatch(/RAMP_BANK_BIC is required/);
     expect(blank).toMatch(/RAMP_BANK_NAME and RAMP_BANK_HOLDER_NAME are required/);
     expect(blank).toMatch(/RAMP_BANK_HOLDER_UNP \(9 digits\) is required/);
-    expect(blank).toMatch(/RAMP_OPERATOR_ACCOUNT_IBANS is required/);
     expect(issues({ ...PROD, ...BANK, RAMP_BANK_HOLDER_UNP: "191234567" })).toMatch(
       /RAMP_BANK_HOLDER_UNP must equal RAMP_OPERATOR_UNP/,
     );
-    const complete = issues({ ...PROD, ...BANK });
-    expect(complete).not.toMatch(/RAMP_BANK_|RAMP_OPERATOR_ACCOUNT/);
+    // The client-money account alone is complete: the operator's own money sits in it (no second account).
+    const complete = issues({ ...PROD, ...BANK, RAMP_PSP_SETTLEMENT_IBANS: "" });
+    expect(complete).not.toMatch(/RAMP_BANK_|operator account/);
     // Off-prod nothing is required (dev runs without a bank).
     expect(
       cfg({ RAMP_ENABLED: "true", RAMP_PUBLIC_APP_URL: "http://localhost:5173" }).rampBank

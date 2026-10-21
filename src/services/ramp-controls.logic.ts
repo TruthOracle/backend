@@ -116,6 +116,15 @@ export function clientLiabilities(f: ReserveFigures): bigint {
 }
 
 /**
+ * The operator's own money in the client account: A − L (the opening balance, top-ups and fee
+ * revenue net of fees and earlier sweeps). An `operator_sweep` never books more than this (X7):
+ * what is left after it still covers the client liabilities.
+ */
+export function operatorHeadroom(f: ReserveFigures): bigint {
+  return f.assets - clientLiabilities(f);
+}
+
+/**
  * The reserve gate's (d) inequality (#6, X5): `L_after ≤ A + tolerance` with
  * `L_after = S + IP + PO + max(0, suspense) + U + Δ` — S the recorded net issuance of the
  * instrument (every source; it replaces CL so non-ramp issuance is covered too), U the unresolved

@@ -75,7 +75,6 @@ export interface MatchFacts {
   txMismatch: readonly string[];
   /** R2a-6: what an entry naming no single order names that was already paid (null = nothing). */
   duplicate: string | null;
-  operatorKeys: ReadonlySet<string>;
   pspKeys: ReadonlySet<string>;
   /** RAMP_BANK_FEE_MAX (null = never a bank fee) and RAMP_BANK_RETURN_FEE_MAX. */
   feeMax: bigint | null;
@@ -140,11 +139,10 @@ export function returnAmountOk(r: bigint, p: bigint, returnFeeMax: bigint): bool
 export function decideLine(line: LineView, f: MatchFacts): MatchDecision {
   const debit = line.amount < 0n;
   const abs = debit ? -line.amount : line.amount;
-  // Our own operator / PSP accounts first: whatever the text says, that money stays ours.
+  // The PSP's accounts first: whatever the text says, that money stays ours. The operator's own
+  // money in and out of this (single) account is never auto-booked: it is classified four-eyes.
   if (intersects(line.counterpartyKeys, f.pspKeys))
     return { kind: debit ? "psp_funding" : "psp_settlement" };
-  if (intersects(line.counterpartyKeys, f.operatorKeys))
-    return { kind: debit ? "operator_sweep" : "operator_topup" };
   return debit ? decideDebit(line, abs, f) : decideCredit(line, abs, f);
 }
 

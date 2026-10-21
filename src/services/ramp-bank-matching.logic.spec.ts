@@ -53,7 +53,6 @@ function facts(over: Partial<MatchFacts> = {}): MatchFacts {
     namedItems: null,
     txMismatch: [],
     duplicate: null,
-    operatorKeys: new Set(["k1:op"]),
     pspKeys: new Set(["k1:psp"]),
     feeMax: A("5"),
     returnFeeMax: A("0"),
@@ -286,7 +285,7 @@ describe("statement matching rules (SPEC §10.4)", () => {
     });
   });
 
-  it("our own operator and PSP accounts come first, whatever the text says", () => {
+  it("the PSP's accounts come first, whatever the text says; the operator's own money is never auto-booked", () => {
     expect(
       decideLine(line({ counterpartyKeys: new Set(["k1:psp"]), amount: A("98.50") }), facts()),
     ).toEqual({
@@ -295,14 +294,12 @@ describe("statement matching rules (SPEC §10.4)", () => {
     expect(decideLine(line({ counterpartyKeys: new Set(["k1:psp"]) }), facts())).toEqual({
       kind: "psp_funding",
     });
+    // One account: a transfer from / to the operator's own counterparty is classified four-eyes.
+    const own = { counterpartyKeys: new Set(["k1:op"]) };
     expect(
-      decideLine(line({ counterpartyKeys: new Set(["k1:op"]), amount: A("10") }), facts()),
-    ).toEqual({
-      kind: "operator_topup",
-    });
-    expect(decideLine(line({ counterpartyKeys: new Set(["k1:op"]) }), facts())).toEqual({
-      kind: "operator_sweep",
-    });
+      decideLine(line({ ...own, amount: A("10") }), facts({ referenced: null })),
+    ).toMatchObject({ kind: null });
+    expect(decideLine(line(own), facts({ referenced: null }))).toMatchObject({ kind: null });
   });
 
   it("trues PSP fees up only within the fees accrued since the last settlement", () => {

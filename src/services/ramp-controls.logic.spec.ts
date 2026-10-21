@@ -4,6 +4,7 @@ import {
   escalateUnknown,
   haltScopesOf,
   mintsHaltHolds,
+  operatorHeadroom,
   PAYOUT_GATE_CHECKS,
   RESERVE_GATE_CHECKS,
   reserveAfter,
@@ -94,6 +95,37 @@ describe("ramp controls logic (SPEC §6)", () => {
       });
       expect(clientLiabilities(f)).toBe(a("216"));
       expect(f.assets).toBe(a("97.6"));
+    });
+
+    it("operator headroom (what a sweep may take, X7): A − L, fee revenue net of fees included", () => {
+      // One account: opening 1 000 (operator money), a 100 on-ramp with a fee of 2 (CL 98), a bank fee of 1.
+      const f = reserveFigures({
+        safeguard_bank: a("1099"),
+        operator_money: -a("1000"),
+        customer_liability: -a("98"),
+        fee_revenue: -a("2"),
+        bank_fees: a("1"),
+      });
+      expect(operatorHeadroom(f)).toBe(a("1001"));
+      // Client money is never headroom; a debit suspense (money gone, unknown why) shrinks it.
+      expect(
+        operatorHeadroom(reserveFigures({ safeguard_bank: a("98"), customer_liability: -a("98") })),
+      ).toBe(0n);
+      expect(
+        operatorHeadroom(
+          reserveFigures({
+            safeguard_bank: a("990"),
+            bank_suspense: a("10"),
+            operator_money: -a("1000"),
+          }),
+        ),
+      ).toBe(a("990"));
+      // Already short: negative, so no sweep at all.
+      expect(
+        operatorHeadroom(
+          reserveFigures({ safeguard_bank: a("90"), customer_liability: -a("100") }),
+        ),
+      ).toBe(-a("10"));
     });
   });
 
