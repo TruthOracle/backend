@@ -10,13 +10,15 @@
  * wrote into a choice argument / a child exercise (the UserWallet Debit / Credit amount).
  */
 import { Logger } from "@nestjs/common";
-import type { EntityManager } from "typeorm";
+import { In, type EntityManager } from "typeorm";
 import type { QueryDeepPartialEntity } from "typeorm/query-builder/QueryPartialEntity";
 
 import { AttestationEntity } from "../entities/attestation.entity";
 import { INDEXER_STATE_KEY, IndexerStateEntity } from "../entities/indexer-state.entity";
 import { LedgerEventEntity } from "../entities/ledger-event.entity";
+import { LedgerHoldingEntity } from "../entities/ledger-holding.entity";
 import { LedgerPayoutEntity } from "../entities/ledger-payout.entity";
+import { LedgerTransferInstructionEntity } from "../entities/ledger-transfer-instruction.entity";
 import { LedgerTransferEntity } from "../entities/ledger-transfer.entity";
 import { LedgerWalletEntity } from "../entities/ledger-wallet.entity";
 import { LiquidityPositionEntity } from "../entities/liquidity-position.entity";
@@ -32,12 +34,16 @@ import { PositionEntity } from "../entities/position.entity";
 import { PredictionModelEntity } from "../entities/prediction-model.entity";
 import { WalletEntryEntity } from "../entities/wallet-entry.entity";
 import {
+  instrumentKey,
   TICKER_PATTERN,
   TRADE_KINDS,
+  type InstrumentId,
+  type LedgerTransferRecord,
   type MarketEventKind,
   type MarketOutcome,
   type MarketStatus,
   type TradeSide,
+  type TransferKind,
   type WalletEntryKind,
 } from "../types";
 import {
@@ -54,7 +60,7 @@ import {
   asText,
   asTextList,
 } from "../util/ledger-values";
-import { formatCC } from "../util/money";
+import { formatAmount } from "../util/money";
 import {
   CANDLE_PERIOD_SECS,
   CANDLE_TRADE_CHOICES,
@@ -76,13 +82,28 @@ import {
   type LedgerTransaction,
 } from "./events";
 import { extractTreasuryTransfers } from "./splice";
+import {
+  extractTokenStandard,
+  holdingViewOf,
+  transferInstructionViewOf,
+  type HoldingView,
+  type TransferInstructionView,
+} from "./token-standard";
+
+/** Templates whose only signatory is `admin` (truthoracle-v17): projected only when `admin` is the treasury. */
+const ADMIN_SIGNED = new Set([
+  "Truthoracle:PredictionMarket",
+  "Truthoracle:UserWallet",
+  "Truthoracle:PendingPayout",
+  "Truthoracle:MarketCounter",
+]);
 
 export interface ProjectionConfig {
-  /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v16`). */
+  /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v17`). */
   packageName: string;
+  /** `packageName` the participant reports for Splice Amulet events (Canton Coin transfers are always indexed). */
   splicePackageName: string;
   treasury: string;
-  trackTransfers: boolean;
 }
 
 /** What one applied transaction changed — the NATS fan-out is built from this after commit. */
@@ -94,7 +115,17 @@ export interface ApplySummary {
   marketEvents: { kind: MarketEventKind; marketId: number; actor: string; eventId: string }[];
   walletEntries: { owner: string; kind: WalletEntryKind; eventId: string }[];
   payouts: { contractId: string; change: "created" | "settled" }[];
-  transfers: { direction: "in" | "out"; counterparty: string; eventId: string }[];
+  transfers: {
+    direction: "in" | "out";
+    counterparty: string;
+    instrument: InstrumentId;
+    kind: TransferKind;
+    nodeId: number;
+  }[];
+  /** Two-step offers addressed to the treasury that were accepted in this transaction (`truthoracle.transfer.instruction_accepted`). */
+  instructionsAccepted: { contractId: string; instrument: InstrumentId }[];
+  /** Every collateral / wallet instrument this transaction named — the indexer registers unknown ones (docs/TOKENS.md §4.1). */
+  instrumentsSeen: InstrumentId[];
 }
 
 export interface ApplyResult {
@@ -103,11 +134,7 @@ export interface ApplyResult {
   summary: ApplySummary;
 }
 
-const TRUTHORACLE_MODULES: ReadonlySet<string> = new Set([
-  "Truthoracle",
-  "Marketplace",
-  "Incentives",
-]);
+const TRUTHORACLE_MODULES: ReadonlySet<string> = new Set(["Truthoracle", "Marketplace"]);
 
 /** Market choices → activity kinds (docs/INDEXER.md §5). */
 const MARKET_CHOICE_KINDS: Record<string, MarketEventKind> = {
@@ -146,6 +173,24 @@ function statusOf(value: unknown): MarketStatus {
   return tag === "Proposed" || tag === "Resolved" || tag === "Voided" ? tag : "Trading";
 }
 
+/**
+ * `InstrumentId { admin, id }` from a v17 payload. Mandatory on every PredictionMarket, UserWallet
+ * and PendingPayout, so a missing value is not tolerated into "" — an amount without its
+ * instrument would be read as some default token. The error stops the index at this transaction
+ * (recorded in `to_indexer_state.last_error`), which is right: a payload without the field is a
+ * package the index was not built for.
+ */
+function instrumentOf(value: unknown, what: string): InstrumentId {
+  const r = asRecord(value);
+  const admin = asText(r.admin).trim();
+  const id = asText(r.id).trim();
+  if (!admin || !id)
+    throw new Error(
+      `${what} carries no instrument (admin / id): is TRUTHORACLE_PACKAGE_NAME the deployed truthoracle-v17?`,
+    );
+  return { admin, id };
+}
+
 function policyOf(value: unknown): StoredResolutionPolicy {
   const p = asRecord(value);
   return {
@@ -158,7 +203,7 @@ function policyOf(value: unknown): StoredResolutionPolicy {
     reporters: asTextList(p.reporters),
     quorum: asInt(p.quorum),
     challengeSecs: asInt(p.challengeSecs),
-    bondCC: formatCC(asDecimal(p.bondCC)),
+    bond: formatAmount(asDecimal(p.bond)),
   };
 }
 
@@ -172,7 +217,7 @@ function proposalOf(value: unknown): StoredProposal | null {
     proposer: asText(p.proposer),
     proposedOutcome,
     proposedAtSec: asInt(p.proposedAt),
-    bondCC: formatCC(asDecimal(p.bondCC)),
+    bond: formatAmount(asDecimal(p.bond)),
     challenger: asOptionalText(p.challenger),
     challengerOutcome: outcomeOf(p.challengerOutcome),
   };
@@ -223,6 +268,8 @@ export class LedgerProjection {
       walletEntries: [],
       payouts: [],
       transfers: [],
+      instructionsAccepted: [],
+      instrumentsSeen: [],
     };
     const ours = tx.events.filter((e) => this.isOurs(e));
     summary.events = ours.length;
@@ -260,37 +307,188 @@ export class LedgerProjection {
       // 4. candles: every market version of this transaction, with the open interest as it
       //    stands now that every Position of the transaction is applied (docs/MARKETS.md §5)
       await this.flushCandles(ctx);
+      summary.instrumentsSeen = [...ctx.instrumentsSeen.values()];
     }
 
-    if (this.cfg.trackTransfers) {
-      for (const t of extractTreasuryTransfers(tx, this.cfg.treasury, this.cfg.splicePackageName)) {
-        const eventId = eventIdOf(tx.updateId, asInt(t.details.nodeId));
-        const res = await manager
-          .createQueryBuilder()
-          .insert()
-          .into(LedgerTransferEntity)
-          .updateEntity(false)
-          .values({
-            eventId,
-            updateId: t.updateId,
-            offset: t.offset,
-            direction: t.direction,
-            counterparty: t.counterparty,
-            amountCC: t.amountCC,
-            choice: t.choice,
-            recordTime: t.recordTime,
-            effectiveAt: t.effectiveAt,
-            details: jsonSafe(t.details),
-          })
-          .orIgnore()
-          .returning("id")
-          .execute();
-        if ((res.raw as unknown[]).length > 0)
-          summary.transfers.push({ direction: t.direction, counterparty: t.counterparty, eventId });
-      }
-    }
+    // Treasury transfers, always on, in any instrument (docs/INDEXER.md §6): first the token
+    // standard (holdings, two-step instructions and the TransferFactory_Transfer /
+    // TransferInstruction_Accept exercises over the interface views), then Canton Coin from the
+    // Splice Amulet events for whatever the first derivation did not claim.
+    const claimed = await this.applyTokenStandard(manager, tx, summary);
+    for (const t of extractTreasuryTransfers(
+      tx,
+      this.cfg.treasury,
+      this.cfg.splicePackageName,
+      claimed,
+    ))
+      await this.insertTransfer(manager, t, summary);
 
     return { applied: true, summary };
+  }
+
+  // ───────────────────────────────────────────── token standard ─────────────────────────────────────────────
+
+  /**
+   * Holdings, two-step instructions and transfers of every CIP-56 token in the transaction
+   * (docs/TOKENS.md §4.2 step 1). The pure derivation needs to know the contracts the transaction
+   * consumes — the index's own rows for the treasury's holdings and the instructions it is party
+   * to — so those are read first by contract id. Returns the node ids the derivation claimed.
+   */
+  private async applyTokenStandard(
+    manager: EntityManager,
+    tx: LedgerTransaction,
+    summary: ApplySummary,
+  ): Promise<Set<number>> {
+    const treasury = this.cfg.treasury;
+    const consumed = [
+      ...new Set(
+        tx.events
+          .filter((e): e is ExercisedLedgerEvent => e.kind === "exercised" && e.consuming)
+          .map((e) => e.contractId),
+      ),
+    ];
+    const holdings = new Map<string, HoldingView>();
+    const instructions = new Map<string, TransferInstructionView>();
+    if (consumed.length > 0) {
+      for (const h of await manager
+        .getRepository(LedgerHoldingEntity)
+        .find({ where: { contractId: In(consumed) } }))
+        holdings.set(h.contractId, holdingOfRow(h));
+      for (const i of await manager
+        .getRepository(LedgerTransferInstructionEntity)
+        .find({ where: { contractId: In(consumed) } }))
+        instructions.set(i.contractId, instructionOfRow(i));
+    }
+    const derived = extractTokenStandard(tx, treasury, { holdings, instructions });
+
+    // 1. state: the treasury's new holdings and the offers it is party to, then what was consumed
+    for (const h of derived.holdingsCreated) {
+      if (h.owner !== treasury) continue;
+      await this.insertHolding(manager, h, tx.offset);
+    }
+    for (const i of derived.instructionsCreated) {
+      if (i.sender !== treasury && i.receiver !== treasury) continue;
+      await this.insertInstruction(manager, i, tx.offset);
+    }
+    for (const c of derived.holdingsConsumed) {
+      await manager
+        .createQueryBuilder()
+        .update(LedgerHoldingEntity)
+        .set({ archivedOffset: tx.offset })
+        .where("contract_id = :cid AND archived_offset IS NULL", { cid: c.contractId })
+        .execute();
+    }
+    for (const o of derived.instructionOutcomes) {
+      const res = await manager
+        .createQueryBuilder()
+        .update(LedgerTransferInstructionEntity)
+        .set({ status: o.status, archivedOffset: tx.offset })
+        .where("contract_id = :cid AND archived_offset IS NULL", { cid: o.contractId })
+        .execute();
+      const known = instructions.get(o.contractId);
+      if ((res.affected ?? 0) > 0 && o.status === "completed" && known?.receiver === treasury)
+        summary.instructionsAccepted.push({
+          contractId: o.contractId,
+          instrument: known.instrument,
+        });
+    }
+    for (const u of derived.unattributed)
+      this.logger.warn(
+        `${u.choice} on TransferInstruction ${u.contractId} (update ${tx.updateId}, node ${u.nodeId}): the index never saw the offer, nothing attributed`,
+      );
+    // 2. activity
+    for (const t of derived.transfers) await this.insertTransfer(manager, t, summary);
+    return derived.claimedNodeIds;
+  }
+
+  private async insertHolding(
+    manager: EntityManager,
+    h: HoldingView,
+    createdOffset: number,
+  ): Promise<void> {
+    await manager
+      .createQueryBuilder()
+      .insert()
+      .into(LedgerHoldingEntity)
+      .updateEntity(false)
+      .values({
+        contractId: h.contractId,
+        owner: h.owner,
+        instrumentAdmin: h.instrument.admin,
+        instrumentId: h.instrument.id,
+        amount: h.amount,
+        locked: h.locked,
+        lockExpiresAt: h.lockExpiresAt,
+        createdOffset,
+        archivedOffset: null,
+      })
+      .orIgnore()
+      .execute();
+  }
+
+  private async insertInstruction(
+    manager: EntityManager,
+    i: TransferInstructionView,
+    createdOffset: number,
+  ): Promise<void> {
+    await manager
+      .createQueryBuilder()
+      .insert()
+      .into(LedgerTransferInstructionEntity)
+      .updateEntity(false)
+      .values({
+        contractId: i.contractId,
+        instrumentAdmin: i.instrument.admin,
+        instrumentId: i.instrument.id,
+        sender: i.sender,
+        receiver: i.receiver,
+        amount: i.amount,
+        executeBefore: i.executeBefore,
+        status: "pending",
+        createdOffset,
+        archivedOffset: null,
+      })
+      .orIgnore()
+      .execute();
+  }
+
+  /** One `to_ledger_transfers` row (unique per update and node; a replay is ignored) and its NATS announcement. */
+  private async insertTransfer(
+    manager: EntityManager,
+    t: LedgerTransferRecord,
+    summary: ApplySummary,
+  ): Promise<void> {
+    const res = await manager
+      .createQueryBuilder()
+      .insert()
+      .into(LedgerTransferEntity)
+      .updateEntity(false)
+      .values({
+        updateId: t.updateId,
+        nodeId: t.nodeId,
+        offset: t.offset,
+        direction: t.direction,
+        counterparty: t.counterparty,
+        instrumentAdmin: t.instrument.admin,
+        instrumentId: t.instrument.id,
+        amount: t.amount,
+        kind: t.kind,
+        choice: t.choice,
+        recordTime: t.recordTime,
+        effectiveAt: t.effectiveAt,
+        details: jsonSafe(t.details),
+      })
+      .orIgnore()
+      .returning("id")
+      .execute();
+    if ((res.raw as unknown[]).length > 0)
+      summary.transfers.push({
+        direction: t.direction,
+        counterparty: t.counterparty,
+        instrument: t.instrument,
+        kind: t.kind,
+        nodeId: t.nodeId,
+      });
   }
 
   /** Raw rows for every TruthOracle event; returns how many were new (0 = the whole transaction is a replay). */
@@ -375,16 +573,36 @@ export class LedgerProjection {
     entries: ActiveContractEntry[],
     atOffset: number,
     mode: "bootstrap" | "resync",
-  ): Promise<{ inserted: number; archived: number }> {
+  ): Promise<{ inserted: number; archived: number; holdings: number; instructions: number }> {
     let inserted = 0;
+    let holdings = 0;
+    let instructions = 0;
     const seen = new Set<string>();
     const seeds: CandleContribution[] = [];
     // A snapshot entry normally carries the contract's ledger time; one that does not is dated at
     // the snapshot itself, never at the epoch: a candle seeded there would drag a flat line across
     // decades of empty periods.
     const snapshotTime = new Date();
+    const tokenContracts = new Set<string>();
     for (const entry of entries) {
       const e = entry.created;
+      // Token-standard contracts come from any package: the treasury's holdings and the offers it
+      // is party to are state the snapshot carries (docs/TOKENS.md §4.2).
+      const holding = holdingViewOf(e);
+      if (holding && holding.owner === this.cfg.treasury) {
+        await this.insertHolding(manager, holding, e.offset);
+        tokenContracts.add(e.contractId);
+        holdings += 1;
+      }
+      const instruction = transferInstructionViewOf(e);
+      if (
+        instruction &&
+        (instruction.sender === this.cfg.treasury || instruction.receiver === this.cfg.treasury)
+      ) {
+        await this.insertInstruction(manager, instruction, e.offset);
+        tokenContracts.add(e.contractId);
+        instructions += 1;
+      }
       if (!this.isOurs(e)) continue;
       seen.add(e.contractId);
       const res = await manager
@@ -477,6 +695,29 @@ export class LedgerProjection {
           .where("archived = false AND NOT (contract_id = ANY(:cids::text[]))", { cids }),
       ];
       for (const statement of statements) archived += (await statement.execute()).affected ?? 0;
+      // A holding or an offer the snapshot no longer lists was consumed inside the range the
+      // index never saw; the offer's outcome is unknown, so its status is left as it was and only
+      // `archived_offset` says it is gone.
+      const tokenCids = [...tokenContracts];
+      const goneToken = "archived_offset IS NULL AND NOT (contract_id = ANY(:cids::text[]))";
+      archived +=
+        (
+          await manager
+            .createQueryBuilder()
+            .update(LedgerHoldingEntity)
+            .set({ archivedOffset: atOffset })
+            .where(goneToken, { cids: tokenCids })
+            .execute()
+        ).affected ?? 0;
+      archived +=
+        (
+          await manager
+            .createQueryBuilder()
+            .update(LedgerTransferInstructionEntity)
+            .set({ archivedOffset: atOffset })
+            .where(goneToken, { cids: tokenCids })
+            .execute()
+        ).affected ?? 0;
     }
     // Snapshot rows carry no history: open interest is recomputed from the active positions and
     // every market gets one candle at its snapshot price, so a chart starts where the index does.
@@ -489,7 +730,7 @@ export class LedgerProjection {
         await manager.query(sql, params);
       }
     }
-    return { inserted, archived };
+    return { inserted, archived, holdings, instructions };
   }
 
   /** Step 4 of a transaction: fold the market versions into their candles (docs/MARKETS.md §5). */
@@ -523,7 +764,7 @@ export class LedgerProjection {
 
   /**
    * A market's identity is the contract's own (`ticker`, `eventTicker`, `yesSubTitle`,
-   * `noSubTitle` — mandatory Text on truthoracle-v16, docs/MARKETS.md §2), normalised the way
+   * `noSubTitle` — mandatory Text on truthoracle-v17, docs/MARKETS.md §2), normalised the way
    * every ticker input is (trimmed, upper-cased). The index takes it as it is and only protects
    * itself: a ticker another market already holds is stored as `<ticker>~<marketId>` because
    * the column is unique and the index must never stall on operator data, and a malformed
@@ -536,7 +777,9 @@ export class LedgerProjection {
   ): Promise<{ ticker: string; eventTicker: string; yesSubTitle: string; noSubTitle: string }> {
     let ticker = asText(p.ticker).trim().toUpperCase();
     if (!TICKER_PATTERN.test(ticker))
-      this.logger.warn(`market ${marketId}: on-ledger ticker "${asText(p.ticker)}" is not a valid ticker; kept as-is`);
+      this.logger.warn(
+        `market ${marketId}: on-ledger ticker "${asText(p.ticker)}" is not a valid ticker; kept as-is`,
+      );
     const taken = await m.query<{ market_id: string }[]>(
       `SELECT market_id FROM to_markets WHERE ticker = $1 AND market_id <> $2`,
       [ticker, String(marketId)],
@@ -552,7 +795,12 @@ export class LedgerProjection {
       this.logger.warn(
         `market ${marketId}: on-ledger eventTicker "${asText(p.eventTicker)}" is not a valid ticker; kept as-is`,
       );
-    return { ticker, eventTicker, yesSubTitle: asText(p.yesSubTitle), noSubTitle: asText(p.noSubTitle) };
+    return {
+      ticker,
+      eventTicker,
+      yesSubTitle: asText(p.yesSubTitle),
+      noSubTitle: asText(p.noSubTitle),
+    };
   }
 
   /**
@@ -561,27 +809,43 @@ export class LedgerProjection {
    * projection creates a placeholder event — and a placeholder series named after the event
    * ticker's first segment — in the same transaction; an operator then edits them through
    * `/admin/events` and `/admin/series` (docs/MARKETS.md §2). The contract carries no
-   * presentation (v16), so the placeholders have no image and no category until the operator
-   * sets them. Ledger-derived rows are not audited.
+   * presentation, so the placeholders have no image and no category until the operator sets
+   * them. Either way the first market fixes the event's collateral (docs/TOKENS.md §2 decision
+   * 9): an event row without one takes this market's. Ledger-derived rows are not audited.
    */
   private async ensureCatalogEvent(
     m: EntityManager,
     marketId: number,
     eventTicker: string,
-    market: { expiresAtSec: number },
+    market: { expiresAtSec: number; collateral: InstrumentId },
   ): Promise<void> {
-    const exists = await m.query<unknown[]>(`SELECT 1 FROM to_events WHERE ticker = $1`, [eventTicker]);
-    if (exists.length > 0) return;
+    const exists = await m.query<unknown[]>(`SELECT 1 FROM to_events WHERE ticker = $1`, [
+      eventTicker,
+    ]);
+    if (exists.length > 0) {
+      await m.query(
+        `UPDATE to_events SET collateral_admin = $2, collateral_id = $3, updated_at = now()
+          WHERE ticker = $1 AND collateral_admin IS NULL`,
+        [eventTicker, market.collateral.admin, market.collateral.id],
+      );
+      return;
+    }
     const seriesTicker = placeholderSeriesTickerOf(eventTicker);
     await m.query(
       `INSERT INTO to_series (ticker, title) VALUES ($1, $1) ON CONFLICT (ticker) DO NOTHING`,
       [seriesTicker],
     );
     await m.query(
-      `INSERT INTO to_events (ticker, series_ticker, title, strike_date)
-         VALUES ($1, $2, $1, to_timestamp($3))
+      `INSERT INTO to_events (ticker, series_ticker, title, strike_date, collateral_admin, collateral_id)
+         VALUES ($1, $2, $1, to_timestamp($3), $4, $5)
        ON CONFLICT (ticker) DO NOTHING`,
-      [eventTicker, seriesTicker, market.expiresAtSec],
+      [
+        eventTicker,
+        seriesTicker,
+        market.expiresAtSec,
+        market.collateral.admin,
+        market.collateral.id,
+      ],
     );
     this.logger.log(
       `market ${marketId}: event ${eventTicker} was not in the catalog — placeholder event (series ${seriesTicker}) created; edit it through /admin/events`,
@@ -610,6 +874,15 @@ export class LedgerProjection {
       archivedAtLedger: null,
     };
 
+    // Review R3-01: these templates are signed by `admin`, but the treasury also observes contracts any
+    // party can create naming it as an audit observer. Only the ones the treasury signed are projected.
+    if (ADMIN_SIGNED.has(`${e.module}:${e.entity}`) && asText(p.admin) !== this.cfg.treasury) {
+      this.logger.error(
+        `${e.module}:${e.entity} ${e.contractId} names admin ${asText(p.admin)}, not the treasury: not projected`,
+      );
+      return;
+    }
+
     switch (`${e.module}:${e.entity}`) {
       case "Truthoracle:PredictionMarket": {
         const marketId = asInt(p.marketId);
@@ -618,18 +891,22 @@ export class LedgerProjection {
         const before = predecessorCid ? await ctx.payloadOf(predecessorCid) : null;
         // the contract's identity, re-read on every version (successors copy it, the ledger owns it)
         const identity = await this.marketIdentityOf(m, marketId, p);
+        const collateral = instrumentOf(p.collateral, `PredictionMarket ${e.contractId}`);
+        ctx.instrumentsSeen.set(instrumentKey(collateral), collateral);
         const row: Partial<MarketEntity> = {
           marketId,
           contractId: e.contractId,
           templateId: e.templateId,
           ...identity,
+          collateralAdmin: collateral.admin,
+          collateralId: collateral.id,
           // open interest is maintained per Position event (bumpOpenInterest); a successor
           // version must not reset it, so both columns are excluded from the overwrite list too
           openInterestYes: 0n,
           openInterestNo: 0n,
           admin: asText(p.admin),
           question: asText(p.question),
-          // no presentation here: v16 contracts carry none (to_market_metadata is backend-owned)
+          // no presentation here: v17 contracts carry none (to_market_metadata is backend-owned)
           resolutionDescription: asText(p.resolutionDescription),
           createdAtSec: asInt(p.createdAt),
           expiresAtSec: asInt(p.expiresAt),
@@ -643,9 +920,9 @@ export class LedgerProjection {
           currentPrice: asDecimal(p.currentPrice),
           feeBps: asInt(p.feeBps),
           prizeFeeShareBps: asInt(p.prizeFeeShareBps),
-          accumulatedFeesCC: asDecimal(p.accumulatedFeesCC),
-          prizePoolCC: asDecimal(p.prizePoolCC),
-          totalVolumeCC: asDecimal(p.totalVolumeCC),
+          accumulatedFees: asDecimal(p.accumulatedFees),
+          prizePool: asDecimal(p.prizePool),
+          totalVolume: asDecimal(p.totalVolume),
           status: statusOf(p.status),
           outcome: outcomeOf(p.outcome),
           resolvedAtSec: asOptionalInt(asOptional(p.resolvedAt)),
@@ -667,7 +944,13 @@ export class LedgerProjection {
         const overwrite = Object.keys(row)
           .filter(
             (k) =>
-              !["marketId", "createdOffset", "createdAtLedger", "openInterestYes", "openInterestNo"].includes(k),
+              ![
+                "marketId",
+                "createdOffset",
+                "createdAtLedger",
+                "openInterestYes",
+                "openInterestNo",
+              ].includes(k),
           )
           .map((k) => meta.findColumnWithPropertyName(k)?.databaseName ?? k);
         await m
@@ -696,9 +979,9 @@ export class LedgerProjection {
             reserveNo: row.reserveNo,
             liquidityL: row.liquidityL,
             lpTokenSupply: row.lpTokenSupply,
-            totalVolumeCC: row.totalVolumeCC,
-            accumulatedFeesCC: row.accumulatedFeesCC,
-            prizePoolCC: row.prizePoolCC,
+            totalVolume: row.totalVolume,
+            accumulatedFees: row.accumulatedFees,
+            prizePool: row.prizePool,
             status: row.status,
             cause,
           })
@@ -706,6 +989,7 @@ export class LedgerProjection {
           .execute();
         await this.ensureCatalogEvent(m, marketId, identity.eventTicker, {
           expiresAtSec: row.expiresAtSec ?? 0,
+          collateral,
         });
         const atLedger = e.createdAt ?? ctx.tx.effectiveAt;
         ctx.marketVersions.push({
@@ -718,8 +1002,8 @@ export class LedgerProjection {
           volumeDelta: !node
             ? 0n
             : before
-              ? (row.totalVolumeCC ?? 0n) - asDecimal(before.totalVolumeCC)
-              : (row.totalVolumeCC ?? 0n),
+              ? (row.totalVolume ?? 0n) - asDecimal(before.totalVolume)
+              : (row.totalVolume ?? 0n),
           trades: node && cause && CANDLE_TRADE_CHOICES.has(cause) ? 1 : 0,
           openInterest: 0n,
           offset: ctx.tx.offset,
@@ -742,7 +1026,7 @@ export class LedgerProjection {
             marketId: asInt(p.marketId),
             yesShares: asDecimal(p.yesShares),
             noShares: asDecimal(p.noShares),
-            costBasisCC: asDecimal(p.costBasisCC),
+            costBasis: asDecimal(p.costBasis),
             auditObservers: asTextList(p.auditObservers),
             ...common,
           })
@@ -750,7 +1034,12 @@ export class LedgerProjection {
           .returning("contract_id")
           .execute();
         if ((res.raw as unknown[]).length > 0)
-          await bumpOpenInterest(m, asInt(p.marketId), asDecimal(p.yesShares), asDecimal(p.noShares));
+          await bumpOpenInterest(
+            m,
+            asInt(p.marketId),
+            asDecimal(p.yesShares),
+            asDecimal(p.noShares),
+          );
         return;
       }
       case "Truthoracle:LiquidityPosition":
@@ -765,14 +1054,16 @@ export class LedgerProjection {
             admin: asText(p.admin),
             marketId: asInt(p.marketId),
             lpTokens: asDecimal(p.lpTokens),
-            depositedCC: asDecimal(p.depositedCC),
+            deposited: asDecimal(p.deposited),
             auditObservers: asTextList(p.auditObservers),
             ...common,
           })
           .orIgnore()
           .execute();
         return;
-      case "Truthoracle:UserWallet":
+      case "Truthoracle:UserWallet": {
+        const instrument = instrumentOf(p.instrument, `UserWallet ${e.contractId}`);
+        ctx.instrumentsSeen.set(instrumentKey(instrument), instrument);
         await m
           .createQueryBuilder()
           .insert()
@@ -782,16 +1073,21 @@ export class LedgerProjection {
             contractId: e.contractId,
             owner: asText(p.owner),
             admin: asText(p.admin),
-            balanceCC: asDecimal(p.balanceCC),
-            depositedCC: asDecimal(p.depositedCC),
-            withdrawnCC: asDecimal(p.withdrawnCC),
-            depositRefs: asTextList(p.depositRefs),
+            instrumentAdmin: instrument.admin,
+            instrumentId: instrument.id,
+            balance: asDecimal(p.balance),
+            deposited: asDecimal(p.deposited),
+            withdrawn: asDecimal(p.withdrawn),
+            creditRefs: asTextList(p.creditRefs),
+            auditObservers: asTextList(p.auditObservers),
             ...common,
           })
           .orIgnore()
           .execute();
         return;
+      }
       case "Truthoracle:PendingPayout": {
+        const instrument = instrumentOf(p.instrument, `PendingPayout ${e.contractId}`);
         const res = await m
           .createQueryBuilder()
           .insert()
@@ -802,8 +1098,11 @@ export class LedgerProjection {
             admin: asText(p.admin),
             userParty: asText(p.user),
             marketId: asInt(p.marketId),
-            amountCC: asDecimal(p.amountCC),
+            instrumentAdmin: instrument.admin,
+            instrumentId: instrument.id,
+            amount: asDecimal(p.amount),
             reason: asText(p.reason),
+            auditObservers: asTextList(p.auditObservers),
             createdAtSec: asInt(p.createdAt),
             active: true,
             createdOffset: ctx.tx.offset,
@@ -901,8 +1200,7 @@ export class LedgerProjection {
           .execute();
         return;
       default:
-        // Incentives templates (UserRewardsSummary, ClaimedReward) are user-signed with no admin
-        // observer: the treasury never sees them. Anything else of ours is kept raw only.
+        // Anything else of ours is kept raw only.
         return;
     }
   }
@@ -1050,6 +1348,7 @@ export class LedgerProjection {
   ): Promise<void> {
     const kinds: Record<string, WalletEntryKind> = {
       Deposit: "deposit",
+      Grant: "grant",
       Credit: "credit",
       Debit: "debit",
       Withdraw: "withdraw",
@@ -1061,6 +1360,11 @@ export class LedgerProjection {
     const successor = createdUnder(node, "Truthoracle", "UserWallet")[0] ?? null;
     const owner =
       asText(before?.owner) || asText(successor?.createArgument.owner) || e.actingParties[0] || "";
+    // The wallet's instrument: from the consumed version, else the successor (every version copies it).
+    const instrument = instrumentOf(
+      before?.instrument ?? successor?.createArgument.instrument,
+      `UserWallet ${e.contractId} (${e.choice})`,
+    );
     const root = node.root.event;
     const rootExercise = root.kind === "exercised" && root !== e ? root : null;
     const rootMarketId = rootExercise ? await ctx.marketIdOfRoot(rootExercise) : null;
@@ -1075,12 +1379,20 @@ export class LedgerProjection {
         owner,
         walletCid: e.contractId,
         newWalletCid: successor?.contractId ?? null,
+        instrumentAdmin: instrument.admin,
+        instrumentId: instrument.id,
         kind,
-        amountCC: asDecimal(a.amountCC),
+        amount: asDecimal(a.amount),
+        // Grant { amount, ref, reason }: the ref lands in `tx_ref` like a deposit's, the reason names the rule.
         reason:
           kind === "withdraw" ? "withdraw" : kind === "deposit" ? null : asOptionalText(a.reason),
-        txRef: kind === "deposit" ? asOptionalText(a.txRef) : null,
-        balanceAfter: successor ? asDecimal(successor.createArgument.balanceCC) : null,
+        txRef:
+          kind === "deposit"
+            ? asOptionalText(a.txRef)
+            : kind === "grant"
+              ? asOptionalText(a.ref)
+              : null,
+        balanceAfter: successor ? asDecimal(successor.createArgument.balance) : null,
         marketId: rootMarketId,
         rootChoice: rootExercise ? rootExercise.choice : null,
         rootTemplate: rootExercise ? `${rootExercise.module}:${rootExercise.entity}` : null,
@@ -1116,14 +1428,14 @@ export class LedgerProjection {
       kind: "market_created",
       actor: asText(p.admin) || e.actingParties[0] || "",
       priceAfter: asDecimal(p.currentPrice),
-      amountCC: asOptionalDecimal(a.initialValueCC),
+      amount: asOptionalDecimal(a.initialValue),
       lpTokens: asDecimal(p.lpTokenSupply),
       details: {
-        initialProbability: formatCC(asDecimal(a.initialProbability)),
-        initialValueCC: formatCC(asDecimal(a.initialValueCC)),
-        liquidityL: formatCC(asDecimal(p.liquidityL)),
-        reserveYes: formatCC(asDecimal(p.reserveYes)),
-        reserveNo: formatCC(asDecimal(p.reserveNo)),
+        initialProbability: formatAmount(asDecimal(a.initialProbability)),
+        initialValue: formatAmount(asDecimal(a.initialValue)),
+        liquidityL: formatAmount(asDecimal(p.liquidityL)),
+        reserveYes: formatAmount(asDecimal(p.reserveYes)),
+        reserveNo: formatAmount(asDecimal(p.reserveNo)),
         marketContractId: market.contractId,
       },
       node: e,
@@ -1147,14 +1459,14 @@ export class LedgerProjection {
     const priceBefore = before ? asDecimal(before.currentPrice) : null;
     const priceAfter = after ? asDecimal(after.currentPrice) : null;
     const feePot = (p: Record<string, unknown> | null): bigint =>
-      p ? asDecimal(p.accumulatedFeesCC) + asDecimal(p.prizePoolCC) : 0n;
-    const feeCC = before && after ? feePot(after) - feePot(before) : null;
+      p ? asDecimal(p.accumulatedFees) + asDecimal(p.prizePool) : 0n;
+    const fee = before && after ? feePot(after) - feePot(before) : null;
     const volumeDelta =
-      before && after ? asDecimal(after.totalVolumeCC) - asDecimal(before.totalVolumeCC) : null;
+      before && after ? asDecimal(after.totalVolume) - asDecimal(before.totalVolume) : null;
     const debit = exercisedUnder(node, "Truthoracle", "UserWallet", "Debit")[0] ?? null;
     const credit = exercisedUnder(node, "Truthoracle", "UserWallet", "Credit")[0] ?? null;
-    const debitCC = debit ? asDecimal(debit.choiceArgument.amountCC) : null;
-    const creditCC = credit ? asDecimal(credit.choiceArgument.amountCC) : null;
+    const debitAmount = debit ? asDecimal(debit.choiceArgument.amount) : null;
+    const creditAmount = credit ? asDecimal(credit.choiceArgument.amount) : null;
     const actorArg = asText(
       a.buyer ??
         a.seller ??
@@ -1176,7 +1488,7 @@ export class LedgerProjection {
       actor,
       priceBefore,
       priceAfter,
-      feeCC,
+      fee,
       details: { choice: e.choice, args: jsonSafe(stripCids(a)) },
       node: e,
     };
@@ -1186,19 +1498,19 @@ export class LedgerProjection {
         const side = sideOf(a.side);
         const delta = await positionDelta(ctx, node, cidOf(a.existingPosition), actor);
         row.side = side;
-        row.amountCC = asDecimal(a.collateralCC);
-        row.netCC = feeCC !== null ? asDecimal(a.collateralCC) - feeCC : null;
+        row.amount = asDecimal(a.amount);
+        row.net = fee !== null ? asDecimal(a.amount) - fee : null;
         row.shares = delta ? (side === "No" ? delta.no : delta.yes) : null;
-        row.details.minSharesOut = formatCC(asDecimal(a.minSharesOut));
+        row.details.minSharesOut = formatAmount(asDecimal(a.minSharesOut));
         break;
       }
       case "sell": {
         const side = sideOf(a.side);
         row.side = side;
         row.shares = asDecimal(a.sharesIn);
-        row.amountCC = volumeDelta;
-        row.netCC = creditCC;
-        row.details.minProceedsCC = formatCC(asDecimal(a.minProceedsCC));
+        row.amount = volumeDelta;
+        row.net = creditAmount;
+        row.details.minProceeds = formatAmount(asDecimal(a.minProceeds));
         break;
       }
       case "swap": {
@@ -1207,30 +1519,30 @@ export class LedgerProjection {
         row.side = side;
         row.shares = asDecimal(a.sharesIn);
         row.sharesOut = delta ? (side === "Yes" ? delta.no : delta.yes) : null;
-        row.amountCC = volumeDelta;
-        row.feeCC = null;
-        row.details.feeShares = formatCC(
+        row.amount = volumeDelta;
+        row.fee = null;
+        row.details.feeShares = formatAmount(
           (asDecimal(a.sharesIn) * BigInt(asInt(before?.feeBps))) / 10_000n,
         );
         break;
       }
       case "split":
       case "merge":
-        row.amountCC = asDecimal(a.amount);
+        row.amount = asDecimal(a.amount);
         row.shares = asDecimal(a.amount);
-        row.netCC = kind === "split" ? debitCC : creditCC;
+        row.net = kind === "split" ? debitAmount : creditAmount;
         break;
       case "provide_liquidity":
-        row.amountCC = asDecimal(a.valueIncreaseCC);
-        row.netCC = debitCC;
+        row.amount = asDecimal(a.valueIncrease);
+        row.net = debitAmount;
         row.lpTokens =
           before && after ? asDecimal(after.lpTokenSupply) - asDecimal(before.lpTokenSupply) : null;
-        row.details.maxCostCC = formatCC(asDecimal(a.maxCostCC));
+        row.details.maxCost = formatAmount(asDecimal(a.maxCost));
         break;
       case "withdraw_liquidity": {
         row.lpTokens = asDecimal(a.lpTokensToBurn);
-        row.netCC = creditCC;
-        row.amountCC = creditCC;
+        row.net = creditAmount;
+        row.amount = creditAmount;
         const delta = await positionDelta(ctx, node, cidOf(a.existingPosition), actor);
         if (delta) {
           row.shares = delta.yes;
@@ -1241,7 +1553,7 @@ export class LedgerProjection {
       case "propose":
       case "challenge":
         row.outcome = outcomeOf(a.proposedOutcome ?? a.challengerOutcome);
-        row.amountCC = debitCC;
+        row.amount = debitAmount;
         break;
       case "resolve_t0":
       case "resolve":
@@ -1255,40 +1567,40 @@ export class LedgerProjection {
         row.details.bondPayouts = createdUnder(node, "Truthoracle", "PendingPayout").map((c) => ({
           contractId: c.contractId,
           user: asText(c.createArgument.user),
-          amountCC: formatCC(asDecimal(c.createArgument.amountCC)),
+          amount: formatAmount(asDecimal(c.createArgument.amount)),
           reason: asText(c.createArgument.reason),
         }));
         break;
       }
       case "redeem": {
         const pos = await ctx.payloadOf(cidOf(a.positionCid));
-        row.amountCC = creditCC;
-        row.netCC = creditCC;
+        row.amount = creditAmount;
+        row.net = creditAmount;
         row.shares = pos ? maxBig(asDecimal(pos.yesShares), asDecimal(pos.noShares)) : null;
         row.outcome = before ? outcomeOf(before.outcome) : null;
-        row.details.yesShares = pos ? formatCC(asDecimal(pos.yesShares)) : null;
-        row.details.noShares = pos ? formatCC(asDecimal(pos.noShares)) : null;
-        row.details.costBasisCC = pos ? formatCC(asDecimal(pos.costBasisCC)) : null;
+        row.details.yesShares = pos ? formatAmount(asDecimal(pos.yesShares)) : null;
+        row.details.noShares = pos ? formatAmount(asDecimal(pos.noShares)) : null;
+        row.details.costBasis = pos ? formatAmount(asDecimal(pos.costBasis)) : null;
         row.details.reason = credit ? asOptionalText(credit.choiceArgument.reason) : null;
         break;
       }
       case "commit_forecast": {
         const forecast = createdUnder(node, "Truthoracle", "ModelForecast")[0] ?? null;
         row.details.modelId = asText(a.modelId);
-        row.details.probabilityYes = formatCC(asDecimal(a.probabilityYes));
+        row.details.probabilityYes = formatAmount(asDecimal(a.probabilityYes));
         row.details.marketPriceAtCommit = forecast
-          ? formatCC(asDecimal(forecast.createArgument.marketPriceAtCommit))
+          ? formatAmount(asDecimal(forecast.createArgument.marketPriceAtCommit))
           : null;
         row.details.forecastContractId = forecast?.contractId ?? null;
         break;
       }
       case "score_and_distribute": {
-        row.amountCC =
-          before && after ? asDecimal(before.prizePoolCC) - asDecimal(after.prizePoolCC) : null;
+        row.amount =
+          before && after ? asDecimal(before.prizePool) - asDecimal(after.prizePool) : null;
         row.details.payouts = createdUnder(node, "Truthoracle", "PendingPayout").map((c) => ({
           contractId: c.contractId,
           user: asText(c.createArgument.user),
-          amountCC: formatCC(asDecimal(c.createArgument.amountCC)),
+          amount: formatAmount(asDecimal(c.createArgument.amount)),
         }));
         break;
       }
@@ -1318,11 +1630,11 @@ export class LedgerProjection {
         kind: input.kind,
         actor: input.actor,
         side: input.side ?? null,
-        amountCC: input.amountCC ?? null,
-        netCC: input.netCC ?? null,
+        amount: input.amount ?? null,
+        net: input.net ?? null,
         shares: input.shares ?? null,
         sharesOut: input.sharesOut ?? null,
-        feeCC: input.feeCC ?? null,
+        fee: input.fee ?? null,
         priceBefore: input.priceBefore ?? null,
         priceAfter: input.priceAfter ?? null,
         lpTokens: input.lpTokens ?? null,
@@ -1366,11 +1678,11 @@ interface MarketEventInput {
   kind: MarketEventKind;
   actor: string;
   side?: TradeSide | null;
-  amountCC?: bigint | null;
-  netCC?: bigint | null;
+  amount?: bigint | null;
+  net?: bigint | null;
   shares?: bigint | null;
   sharesOut?: bigint | null;
-  feeCC?: bigint | null;
+  fee?: bigint | null;
   priceBefore?: bigint | null;
   priceAfter?: bigint | null;
   lpTokens?: bigint | null;
@@ -1389,6 +1701,8 @@ class TxContext {
   readonly settledPayouts: string[] = [];
   /** Market versions created in this transaction, folded into the candles once every Position is applied. */
   readonly marketVersions: CandleContribution[] = [];
+  /** Collateral / wallet instruments this transaction named, by key. */
+  readonly instrumentsSeen = new Map<string, InstrumentId>();
   private readonly payloadCache = new Map<string, Record<string, unknown> | null>();
 
   constructor(
@@ -1473,7 +1787,7 @@ async function bumpOpenInterest(
   if (yes === 0n && no === 0n) return;
   await manager.query(
     `UPDATE to_markets SET open_interest_yes = open_interest_yes + $1, open_interest_no = open_interest_no + $2 WHERE market_id = $3`,
-    [formatCC(yes), formatCC(no), String(marketId)],
+    [formatAmount(yes), formatAmount(no), String(marketId)],
   );
 }
 
@@ -1504,7 +1818,7 @@ async function positionDelta(
   return {
     yes: asDecimal(a.yesShares) - (before ? asDecimal(before.yesShares) : 0n),
     no: asDecimal(a.noShares) - (before ? asDecimal(before.noShares) : 0n),
-    cost: asDecimal(a.costBasisCC) - (before ? asDecimal(before.costBasisCC) : 0n),
+    cost: asDecimal(a.costBasis) - (before ? asDecimal(before.costBasis) : 0n),
   };
 }
 
@@ -1515,6 +1829,31 @@ function maxBig(a: bigint, b: bigint): bigint {
 /** Choice arguments for `details`: contract ids are kept (they are ids), everything else verbatim. */
 function stripCids(args: Record<string, unknown>): Record<string, unknown> {
   return args;
+}
+
+/** A `to_ledger_holdings` row as the pure derivation wants to see it. */
+function holdingOfRow(h: LedgerHoldingEntity): HoldingView {
+  return {
+    contractId: h.contractId,
+    owner: h.owner,
+    instrument: { admin: h.instrumentAdmin, id: h.instrumentId },
+    amount: h.amount,
+    locked: h.locked,
+    lockExpiresAt: h.lockExpiresAt,
+  };
+}
+
+function instructionOfRow(i: LedgerTransferInstructionEntity): TransferInstructionView {
+  return {
+    contractId: i.contractId,
+    sender: i.sender,
+    receiver: i.receiver,
+    instrument: { admin: i.instrumentAdmin, id: i.instrumentId },
+    amount: i.amount,
+    requestedAt: null,
+    executeBefore: i.executeBefore,
+    originalInstructionCid: null,
+  };
 }
 
 /**

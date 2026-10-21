@@ -46,12 +46,15 @@ export function natsConnectOptions(natsUrl: string): NatsConnectOptions {
     }
     const user = decodeURIComponent(url.username);
     const pass = decodeURIComponent(url.password);
-    if (!user && pass) throw new Error(`NATS_URL entry has a password but no user: ${maskCredentials(entry)}`);
+    if (!user && pass)
+      throw new Error(`NATS_URL entry has a password but no user: ${maskCredentials(entry)}`);
     // NATS convention: a lone value before `@` is a token; `user:pass` is user / password.
     const credentials: Credentials = !user ? {} : pass ? { user, pass } : { token: user };
     if (shared === undefined) shared = credentials;
     else if (JSON.stringify(shared) !== JSON.stringify(credentials)) {
-      throw new Error("NATS_URL servers carry different credentials; one connection can only present one set");
+      throw new Error(
+        "NATS_URL servers carry different credentials; one connection can only present one set",
+      );
     }
     return `${url.protocol}//${url.host}`;
   });

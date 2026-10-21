@@ -4,21 +4,50 @@ import { Redis } from "ioredis";
 
 import { Config } from "../config";
 
-/** `defineCommand` adds methods at runtime; this is the one script the service registers. */
+/** `defineCommand` adds methods at runtime; these are the scripts the service registers. */
 interface RedisWithScripts extends Redis {
   releaseLock(key: string, token: string): Promise<number>;
+  renewLock(key: string, token: string, ttlMs: number): Promise<number>;
+  setUnlessNewer(
+    key: string,
+    raw: string,
+    ttlMs: number,
+    field: string,
+    value: string,
+  ): Promise<number>;
 }
 
 /** Holder-safe release: delete only while the key still carries this holder's token — one round trip, no window. */
 const RELEASE_LOCK_LUA = `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`;
+/** Holder-safe renewal: a plain PEXPIRE would extend a lock the TTL already handed to someone else. */
+const RENEW_LOCK_LUA = `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end`;
+/**
+ * SET unless the stored JSON's ARGV[3] field (an ISO-8601 UTC timestamp: string order = time
+ * order) is newer than ARGV[4]. Unparseable or missing → overwrite.
+ */
+const SET_UNLESS_NEWER_LUA = `local cur = redis.call('get', KEYS[1])
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if ok and type(obj) == 'table' and type(obj[ARGV[3]]) == 'string' and obj[ARGV[3]] > ARGV[4] then return 0 end
+end
+redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return 1`;
+
+/** What `acquireLock` hands out. */
+export interface RedisLock {
+  acquired: boolean;
+  release(): Promise<void>;
+  /** Extend to `ttlMs` while this holder still owns the key; false = lost (or never held). Throws when Redis does. */
+  renew(ttlMs: number): Promise<boolean>;
+}
 
 /**
  * Cross-instance state (docs/ARCHITECTURE.md §10): single-use claims, fixed-window rate
  * limits, short locks, JSON cache and small sets. Port of the Redis-backed half of
- * truthoracle-canton/api/_lib/sharedStore.mjs — without the in-memory fallback: here Redis is
+ * pm-frontend/api/_lib/sharedStore.mjs — without the in-memory fallback: here Redis is
  * REQUIRED at boot, so an outage is an error, never a silent downgrade. Only `SET NX PX`,
- * `INCR`, `PEXPIRE`, `PTTL`, `DEL`, `GET`, `GETDEL`, `SET EX/PX`, `SADD/SREM/SMEMBERS` and one
- * `EVALSHA` (the lock release script) are used.
+ * `INCR`, `PEXPIRE`, `PTTL`, `DEL`, `GET`, `GETDEL`, `SET EX/PX`, `SADD/SREM/SMEMBERS` and three
+ * `EVALSHA` scripts (lock release, lock renewal, set-unless-newer) are used.
  *
  * Every key is prefixed `truthoracle:<APP_NETWORK>:` inside this service — callers pass bare
  * keys (`sess:<hash>`, `lock:deposit:<userId>`, …).
@@ -42,6 +71,8 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
       connectionName: "truthoracle-backend",
     });
     this.client.defineCommand("releaseLock", { numberOfKeys: 1, lua: RELEASE_LOCK_LUA });
+    this.client.defineCommand("renewLock", { numberOfKeys: 1, lua: RENEW_LOCK_LUA });
+    this.client.defineCommand("setUnlessNewer", { numberOfKeys: 1, lua: SET_UNLESS_NEWER_LUA });
     this.client.on("error", (err: Error) => this.logger.warn(`redis error: ${err.message}`));
   }
 
@@ -70,7 +101,13 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
 
   /** Claim `key` exactly once for `ttlMs`. True when this caller won (SET NX PX). */
   async claimOnce(key: string, ttlMs: number): Promise<boolean> {
-    const result = await this.client.set(this.key(key), "1", "PX", Math.max(1, Math.round(ttlMs)), "NX");
+    const result = await this.client.set(
+      this.key(key),
+      "1",
+      "PX",
+      Math.max(1, Math.round(ttlMs)),
+      "NX",
+    );
     return result === "OK";
   }
 
@@ -100,11 +137,12 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
    * cannot release a lock the TTL already handed to someone else — a plain GET-then-DEL would
    * leave exactly that window open.
    */
-  async acquireLock(key: string, ttlMs: number): Promise<{ acquired: boolean; release(): Promise<void> }> {
+  async acquireLock(key: string, ttlMs: number): Promise<RedisLock> {
     const k = this.key(key);
     const token = randomBytes(12).toString("base64url");
     const result = await this.client.set(k, token, "PX", Math.max(1, Math.round(ttlMs)), "NX");
-    if (result !== "OK") return { acquired: false, release: async () => {} };
+    if (result !== "OK")
+      return { acquired: false, release: async () => {}, renew: async () => false };
     return {
       acquired: true,
       release: async () => {
@@ -115,7 +153,35 @@ export class RedisService implements OnModuleInit, OnApplicationShutdown {
           this.logger.warn(`lock release failed for ${key}: ${(err as Error).message}`);
         }
       },
+      renew: async (renewMs: number) =>
+        (await (this.client as RedisWithScripts).renewLock(
+          k,
+          token,
+          Math.max(1, Math.round(renewMs)),
+        )) === 1,
     };
+  }
+
+  /**
+   * `setJson`, unless the stored value's `field` (an ISO timestamp) is newer than `value[field]`:
+   * one script, so a slow writer can never overwrite a newer writer's value. True when written.
+   */
+  async setJsonUnlessNewer(
+    key: string,
+    value: Record<string, unknown>,
+    field: string,
+    ttlMs: number,
+  ): Promise<boolean> {
+    const order = value[field];
+    if (typeof order !== "string") throw new Error(`setJsonUnlessNewer: ${field} must be a string`);
+    const written = await (this.client as RedisWithScripts).setUnlessNewer(
+      this.key(key),
+      JSON.stringify(value),
+      Math.max(1, Math.round(ttlMs)),
+      field,
+      order,
+    );
+    return written === 1;
   }
 
   async getJson<T>(key: string): Promise<T | null> {

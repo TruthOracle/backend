@@ -1,7 +1,9 @@
 import { Injectable } from "@nestjs/common";
 import { DataSource } from "typeorm";
 
+import { LedgerHoldingEntity } from "../entities/ledger-holding.entity";
 import { LedgerPayoutEntity } from "../entities/ledger-payout.entity";
+import { LedgerTransferInstructionEntity } from "../entities/ledger-transfer-instruction.entity";
 import { LedgerTransferEntity } from "../entities/ledger-transfer.entity";
 import { LedgerWalletEntity } from "../entities/ledger-wallet.entity";
 import { LiquidityPositionEntity } from "../entities/liquidity-position.entity";
@@ -11,17 +13,20 @@ import { WalletEntryEntity } from "../entities/wallet-entry.entity";
 import type { UserEntity } from "../entities/user.entity";
 import type {
   ApiIndexedWallet,
+  ApiLedgerHolding,
   ApiLedgerPayout,
   ApiLedgerTransfer,
   ApiLiquidityPosition,
   ApiMarketEvent,
   ApiPage,
   ApiPosition,
+  ApiTransferInstruction,
   ApiWalletEntry,
+  InstrumentId,
   MarketEventKind,
   WalletEntryKind,
 } from "../types";
-import { formatCC } from "../util/money";
+import { formatAmount } from "../util/money";
 import { MarketsService, whereParties } from "./markets.service";
 import { WalletLinkService } from "./wallet-link.service";
 
@@ -153,7 +158,7 @@ export class PortfolioService {
 
   async transfers(
     parties: string[],
-    query: { direction?: "in" | "out"; page: number; limit: number },
+    query: { direction?: "in" | "out"; instrument?: InstrumentId; page: number; limit: number },
   ): Promise<ApiPage<ApiLedgerTransfer>> {
     if (parties.length === 0) return { items: [], page: query.page, limit: query.limit, total: 0 };
     const qb = this.dataSource
@@ -161,6 +166,11 @@ export class PortfolioService {
       .createQueryBuilder("t")
       .where("t.counterparty IN (:...parties)", { parties });
     if (query.direction) qb.andWhere("t.direction = :direction", { direction: query.direction });
+    if (query.instrument)
+      qb.andWhere("t.instrument_admin = :admin AND t.instrument_id = :id", {
+        admin: query.instrument.admin,
+        id: query.instrument.id,
+      });
     const [rows, total] = await qb
       .orderBy("t.offset", "DESC")
       .skip((query.page - 1) * query.limit)
@@ -197,10 +207,11 @@ export class PortfolioService {
     return {
       contractId: w.contractId,
       owner: w.owner,
-      balanceCC: formatCC(w.balanceCC),
-      depositedCC: formatCC(w.depositedCC),
-      withdrawnCC: formatCC(w.withdrawnCC),
-      depositRefs: w.depositRefs ?? [],
+      instrument: this.markets.instrumentRef(w.instrumentAdmin, w.instrumentId),
+      balance: formatAmount(w.balance),
+      deposited: formatAmount(w.deposited),
+      withdrawn: formatAmount(w.withdrawn),
+      creditRefs: w.creditRefs ?? [],
       updatedOffset: w.createdOffset,
       updatedAt: (w.createdAtLedger ?? w.createdAt).toISOString(),
     };
@@ -211,11 +222,12 @@ export class PortfolioService {
       id: String(e.id),
       eventId: e.eventId,
       owner: e.owner,
+      instrument: this.markets.instrumentRef(e.instrumentAdmin, e.instrumentId),
       kind: e.kind,
-      amountCC: formatCC(e.amountCC),
+      amount: formatAmount(e.amount),
       reason: e.reason,
       txRef: e.txRef,
-      balanceAfter: e.balanceAfter === null ? null : formatCC(e.balanceAfter),
+      balanceAfter: e.balanceAfter === null ? null : formatAmount(e.balanceAfter),
       marketId: e.marketId,
       rootChoice: e.rootChoice,
       walletContractId: e.walletCid,
@@ -228,12 +240,41 @@ export class PortfolioService {
   toApiTransfer(t: LedgerTransferEntity): ApiLedgerTransfer {
     return {
       updateId: t.updateId,
+      nodeId: t.nodeId,
       offset: t.offset,
       direction: t.direction,
       counterparty: t.counterparty,
-      amountCC: formatCC(t.amountCC),
+      instrument: this.markets.instrumentRef(t.instrumentAdmin, t.instrumentId),
+      amount: formatAmount(t.amount),
+      kind: t.kind,
       choice: t.choice,
       recordTime: (t.recordTime ?? t.effectiveAt).toISOString(),
+    };
+  }
+
+  toApiHolding(h: LedgerHoldingEntity): ApiLedgerHolding {
+    return {
+      contractId: h.contractId,
+      owner: h.owner,
+      instrument: this.markets.instrumentRef(h.instrumentAdmin, h.instrumentId),
+      amount: formatAmount(h.amount),
+      locked: h.locked,
+      lockExpiresAt: h.lockExpiresAt ? h.lockExpiresAt.toISOString() : null,
+      createdOffset: h.createdOffset,
+      active: h.archivedOffset === null,
+    };
+  }
+
+  toApiInstruction(i: LedgerTransferInstructionEntity): ApiTransferInstruction {
+    return {
+      contractId: i.contractId,
+      instrument: this.markets.instrumentRef(i.instrumentAdmin, i.instrumentId),
+      sender: i.sender,
+      receiver: i.receiver,
+      amount: formatAmount(i.amount),
+      executeBefore: i.executeBefore ? i.executeBefore.toISOString() : null,
+      status: i.status,
+      createdOffset: i.createdOffset,
     };
   }
 
@@ -242,7 +283,8 @@ export class PortfolioService {
       contractId: p.contractId,
       user: p.userParty,
       marketId: p.marketId,
-      amountCC: formatCC(p.amountCC),
+      instrument: this.markets.instrumentRef(p.instrumentAdmin, p.instrumentId),
+      amount: formatAmount(p.amount),
       reason: p.reason,
       createdAt:
         p.createdAtSec > 0

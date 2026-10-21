@@ -38,7 +38,7 @@ const exercised = (
   templateId: "pkg:Truthoracle:PredictionMarket",
   packageName: "truthoracle-v16",
   choice: "Buy",
-  choiceArgument: { buyer: "alice::1220aa", side: "Yes", collateralCC: "10.0000000000" },
+  choiceArgument: { buyer: "alice::1220aa", side: "Yes", amount: "10.0000000000" },
   actingParties: ["alice::1220aa"],
   consuming: true,
   witnessParties: ["treasury::1220ff"],
@@ -113,26 +113,68 @@ describe("parseUpdateItem", () => {
     expect(parseUpdateItem(item)?.events).toHaveLength(3);
   });
 
-  it("reads the deprecated /v2/updates/trees shape (eventsById, *TreeEvent wrappers)", () => {
+  it("reads the interface views a created event carries (token standard), keeping a failed view's id with a null view", () => {
     const item = {
       update: {
-        TransactionTree: {
-          value: {
-            updateId: "u2",
-            offset: 43,
-            effectiveAt: "2026-01-01T00:00:00Z",
-            recordTime: "2026-01-01T00:00:01Z",
-            synchronizerId: "sync::1",
-            eventsById: {
-              "1": { CreatedTreeEvent: { value: created(1) } },
-              "0": { ExercisedTreeEvent: { value: exercised(0, 1) } },
+        Transaction: {
+          updateId: "u2",
+          offset: 43,
+          effectiveAt: "2026-01-01T00:00:00Z",
+          events: [
+            {
+              CreatedEvent: created(0, {
+                templateId: "cbynpkg:TruthOracle.CBYN.Holding:Holding",
+                packageName: "cbyn-holding-stable",
+                interfaceViews: [
+                  {
+                    interfaceId: "holdingpkg:Splice.Api.Token.HoldingV1:Holding",
+                    viewStatus: { code: 0, message: "", details: [] },
+                    viewValue: {
+                      owner: "treasury::1220ff",
+                      instrument: { admin: "agent::1220aa", id: "cBYN" },
+                      amount: "12.5000000000",
+                      lock: null,
+                      meta: { values: {} },
+                    },
+                  },
+                  {
+                    interfaceId: "otherpkg:Some.Other.Interface:Thing",
+                    viewStatus: { code: 13, message: "view failed", details: [] },
+                  },
+                ],
+              }),
             },
-          },
+            { CreatedEvent: created(1) },
+          ],
         },
       },
     };
     const tx = parseUpdateItem(item);
-    expect(tx?.events.map((e) => `${e.kind}:${e.nodeId}`)).toEqual(["exercised:0", "created:1"]);
+    const [holding, plain] = tx!.events;
+    expect(holding.kind).toBe("created");
+    if (holding.kind === "created") {
+      expect(holding.interfaceViews).toHaveLength(2);
+      expect(holding.interfaceViews[0]).toMatchObject({
+        interfaceId: "holdingpkg:Splice.Api.Token.HoldingV1:Holding",
+        module: "Splice.Api.Token.HoldingV1",
+        entity: "Holding",
+      });
+      expect(holding.interfaceViews[0].view).toMatchObject({ amount: "12.5000000000" });
+      expect(holding.interfaceViews[1].view).toBeNull();
+    }
+    if (plain.kind === "created") expect(plain.interfaceViews).toEqual([]);
+  });
+
+  it("the TransactionTree shape of the removed /v2/updates/trees endpoint is not read", () => {
+    expect(
+      parseUpdateItem({
+        update: {
+          TransactionTree: {
+            value: { updateId: "u2", offset: 43, eventsById: { "0": { CreatedTreeEvent: {} } } },
+          },
+        },
+      }),
+    ).toBeNull();
   });
 
   it("ignores checkpoints, reassignments and unreadable items", () => {
@@ -204,6 +246,7 @@ describe("buildEventTree", () => {
           entity: "E",
           createArgument: {},
           createdEventBlob: null,
+          interfaceViews: [],
           signatories: [],
           observers: [],
           witnessParties: [],

@@ -1,9 +1,11 @@
 /**
  * The indexer's view of a ledger transaction (docs/INDEXER.md §2): one normalised shape for what
- * the JSON Ledger API v2 serves as `POST /v2/updates` (LEDGER_EFFECTS, `events[]`) and as the
- * deprecated `POST /v2/updates/trees` (`eventsById`). Both carry the same `CreatedEvent` /
- * `ExercisedEvent` objects — the tree form wraps each in `{ CreatedTreeEvent: { value } }`, the
- * flat form in `{ CreatedEvent: {...} }`; one-of members are read with and without `.value`.
+ * the JSON Ledger API v2 serves as `POST /v2/updates` (`TRANSACTION_SHAPE_LEDGER_EFFECTS`,
+ * `events[]`). The one-of members (`{ CreatedEvent }`, `{ ExercisedEvent }`, `{ Transaction }`)
+ * are read with and without the `{ value }` wrapper some participant versions add. A created
+ * event carries the interface views the request's `InterfaceFilter`s asked for (the token
+ * standard's `Holding` / `TransferInstruction` views, docs/TOKENS.md §4.2), each with the
+ * interface id it was computed for.
  *
  * Pure: no I/O, so the parsers and the tree builder are unit-tested on fixtures.
  */
@@ -25,6 +27,18 @@ export interface TemplateRef {
   entity: string;
 }
 
+/**
+ * One `JsInterfaceView` of a created event: the view the participant computed for an interface the
+ * stream filter named. `view` is null when the participant reported a non-OK `viewStatus` (the
+ * contract's view function failed) — the contract still implements the interface, but nothing
+ * can be read from it.
+ */
+export interface InterfaceView extends TemplateRef {
+  /** `pkgId:Module:Entity` of the interface as the participant reports it. */
+  interfaceId: string;
+  view: Record<string, unknown> | null;
+}
+
 export interface CreatedLedgerEvent extends TemplateRef {
   kind: "created";
   offset: number;
@@ -32,6 +46,8 @@ export interface CreatedLedgerEvent extends TemplateRef {
   contractId: string;
   createArgument: Record<string, unknown>;
   createdEventBlob: string | null;
+  /** Interface views requested through `InterfaceFilter { includeInterfaceView }`; empty without one. */
+  interfaceViews: InterfaceView[];
   signatories: string[];
   observers: string[];
   witnessParties: string[];
@@ -116,6 +132,32 @@ function templateRefOf(raw: Record<string, unknown>): TemplateRef {
   return { templateId, packageName: asText(raw.packageName), module, entity };
 }
 
+/** `interfaceViews[]` of a created event → the readable views (a non-OK `viewStatus` keeps the id and nulls the view). */
+export function parseInterfaceViews(raw: unknown): InterfaceView[] {
+  if (!Array.isArray(raw)) return [];
+  const out: InterfaceView[] = [];
+  for (const item of raw) {
+    const v = asRecord(item);
+    const interfaceId = asText(v.interfaceId);
+    if (!interfaceId) continue;
+    const status = asRecord(v.viewStatus);
+    const ok = status.code === undefined || asInt(status.code) === 0;
+    const { module, entity } = splitTemplateId(interfaceId);
+    out.push({
+      interfaceId,
+      templateId: interfaceId,
+      packageName: "",
+      module,
+      entity,
+      view:
+        ok && v.viewValue && typeof v.viewValue === "object" && !Array.isArray(v.viewValue)
+          ? (v.viewValue as Record<string, unknown>)
+          : null,
+    });
+  }
+  return out;
+}
+
 export function parseCreatedEvent(raw: Record<string, unknown>): CreatedLedgerEvent | null {
   const contractId = asText(raw.contractId);
   if (!contractId) return null;
@@ -130,6 +172,7 @@ export function parseCreatedEvent(raw: Record<string, unknown>): CreatedLedgerEv
       typeof raw.createdEventBlob === "string" && raw.createdEventBlob
         ? raw.createdEventBlob
         : null,
+    interfaceViews: parseInterfaceViews(raw.interfaceViews),
     signatories: asTextList(raw.signatories),
     observers: asTextList(raw.observers),
     witnessParties: asTextList(raw.witnessParties),
@@ -160,13 +203,13 @@ export function parseExercisedEvent(raw: Record<string, unknown>): ExercisedLedg
   };
 }
 
-/** One `Event` / `TreeEvent` one-of → a normalised event (ArchivedEvents are ignored: LEDGER_EFFECTS never carries them). */
+/** One `Event` one-of → a normalised event (ArchivedEvents are ignored: LEDGER_EFFECTS never carries them). */
 export function parseEvent(raw: unknown): LedgerEvent | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  const created = unwrap(r.CreatedEvent ?? r.CreatedTreeEvent);
+  const created = unwrap(r.CreatedEvent);
   if (created) return parseCreatedEvent(created);
-  const exercised = unwrap(r.ExercisedEvent ?? r.ExercisedTreeEvent);
+  const exercised = unwrap(r.ExercisedEvent);
   if (exercised) return parseExercisedEvent(exercised);
   return null;
 }
@@ -197,31 +240,21 @@ function transactionFrom(
 }
 
 /**
- * One item of a `/v2/updates` or `/v2/updates/trees` response → a transaction, or null for the
- * other update kinds (OffsetCheckpoint, Reassignment, TopologyTransaction) and unreadable items.
+ * One item of a `/v2/updates` response → a transaction, or null for the other update kinds
+ * (OffsetCheckpoint, Reassignment, TopologyTransaction) and unreadable items.
  */
 export function parseUpdateItem(item: unknown): LedgerTransaction | null {
   if (!item || typeof item !== "object") return null;
   const update = (item as { update?: unknown }).update;
   if (!update || typeof update !== "object") return null;
   const u = update as Record<string, unknown>;
-
-  const flat = unwrap(u.Transaction);
-  if (flat && Array.isArray(flat.events)) {
-    const events = flat.events.map(parseEvent).filter((e): e is LedgerEvent => e !== null);
-    return transactionFrom(flat, events);
-  }
-  const tree = unwrap(u.TransactionTree) ?? (flat && flat.eventsById ? flat : null);
-  if (tree && tree.eventsById && typeof tree.eventsById === "object") {
-    const events = Object.values(tree.eventsById as Record<string, unknown>)
-      .map(parseEvent)
-      .filter((e): e is LedgerEvent => e !== null);
-    return transactionFrom(tree, events);
-  }
-  return null;
+  const tx = unwrap(u.Transaction);
+  if (!tx || !Array.isArray(tx.events)) return null;
+  const events = tx.events.map(parseEvent).filter((e): e is LedgerEvent => e !== null);
+  return transactionFrom(tx, events);
 }
 
-/** A whole `/v2/updates[/trees]` page → transactions in ledger order. */
+/** A whole `/v2/updates` page → transactions in ledger order. */
 export function parseUpdatesPage(page: unknown): LedgerTransaction[] {
   const items = Array.isArray(page) ? page : [];
   const out: LedgerTransaction[] = [];

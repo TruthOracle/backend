@@ -1,9 +1,16 @@
-import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn } from "typeorm";
+import {
+  Column,
+  CreateDateColumn,
+  Entity,
+  Index,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from "typeorm";
 
 import type { PayoutStatus } from "../types";
 import { moneyTransformer } from "../util/money";
 
-/** Durable arbiter for settlement (ARCHITECTURE §9.4 `to_payouts`). */
+/** Durable arbiter for settlement (ARCHITECTURE §9.4 `to_payouts`); the amount is in the PendingPayout's instrument (docs/TOKENS.md §4.3). */
 @Entity({ name: "to_payouts" })
 export class PayoutEntity {
   @PrimaryGeneratedColumn("uuid")
@@ -23,11 +30,21 @@ export class PayoutEntity {
   @Column({ name: "payee_wallet_id", type: "uuid", nullable: true })
   payeeWalletId!: string | null;
 
-  @Column({ name: "amount_cc", type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
-  amountCC!: bigint;
+  @Column({ name: "instrument_admin", type: "text" })
+  instrumentAdmin!: string;
+
+  @Column({ name: "instrument_id", type: "text" })
+  instrumentId!: string;
+
+  @Column({ type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
+  amount!: bigint;
 
   @Column({ type: "text" })
   reason!: string;
+
+  /** Settlement facts worth keeping: `dust` (what quantisation to the instrument's decimals left in-app), `transferMode`. */
+  @Column({ type: "jsonb", default: () => "'{}'::jsonb" })
+  details!: Record<string, unknown>;
 
   @Index("ix_to_payouts_status")
   @Column({ type: "text", default: "queued" })

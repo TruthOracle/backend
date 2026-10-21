@@ -30,15 +30,9 @@ export class LiquidityPositionEntity {
   })
   lpTokens!: bigint;
 
-  @Column({
-    name: "deposited_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
-  depositedCC!: bigint;
+  /** Collateral the provider put in (`LiquidityPosition.deposited`), in the market's collateral. */
+  @Column({ type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
+  deposited!: bigint;
 
   @Column({ name: "audit_observers", type: "jsonb", default: () => "'[]'::jsonb" })
   auditObservers!: string[];

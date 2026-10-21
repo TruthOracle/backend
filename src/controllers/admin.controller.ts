@@ -1,8 +1,22 @@
-import { Body, Controller, Get, HttpCode, Inject, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  Inject,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+  Req,
+  Res,
+  UseGuards,
+} from "@nestjs/common";
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
+import type { Response } from "express";
 
 import { AdminGuard } from "../auth/admin.guard";
-import { AllowAdminSession } from "../auth/decorators";
+import { AllowAdminSession, RequireRoles } from "../auth/decorators";
 import { type AuthedRequest, actorOf } from "../auth/request";
 import {
   AdminAuditQueryDto,
@@ -15,6 +29,7 @@ import {
   FingerprintParamDto,
   WebhookEventParamDto,
 } from "../dto/admin.dto";
+import { PayoutMarkPaidDto } from "../dto/admin-controls.dto";
 import { DEFAULT_PAGE_LIMIT } from "../dto/common.dto";
 import { PayoutCidParamDto } from "../dto/payouts.dto";
 import {
@@ -25,7 +40,11 @@ import {
   type AdminUserDetail,
 } from "../services/admin.service";
 import { Config } from "../config";
+import { AdminApprovalService, type ApprovalOutcome } from "../services/admin-approval.service";
+import type { PayoutMode } from "../services/payout.service";
+import { RampApprovalActions } from "../services/ramp-approval-actions.service";
 import {
+  type ApiAdminSession,
   type ApiAuditEvent,
   type ApiIdentity,
   type ApiKycProviderStatus,
@@ -37,14 +56,29 @@ import {
   type KycProvider,
 } from "../types";
 import { ApiError } from "../util/errors";
+import { answerApproval } from "./admin-approvals.controller";
 
-/** The operator behind an admin request: `actorOf` narrowed to the admin session AdminGuard guarantees. */
+/**
+ * The operator behind an admin request: `actorOf` narrowed to the admin session AdminGuard
+ * guarantees, with the party, person and roles AdminGuard recorded (SPEC §6.5).
+ */
 export function adminActorOf(req: AuthedRequest): AdminActor {
   const actor = actorOf(req);
   if (actor.type !== "admin" || !actor.userId || !actor.sessionId) {
     throw new ApiError(403, "forbidden", "an admin session is required");
   }
-  return { type: "admin", userId: actor.userId, sessionId: actor.sessionId, ip: actor.ip ?? null };
+  const op = req.adminOperator;
+  if (!op) throw new ApiError(403, "forbidden", "the operator was not resolved (AdminGuard)");
+  return {
+    type: "admin",
+    userId: actor.userId,
+    sessionId: actor.sessionId,
+    ip: actor.ip ?? null,
+    operatorParty: op.party,
+    personId: op.personId,
+    roles: [...op.roles],
+    publicKey: op.publicKey,
+  };
 }
 
 /**
@@ -64,7 +98,22 @@ export class AdminController {
     private readonly admin: AdminService,
     private readonly config: Config,
     @Inject(KYC_PROVIDER) private readonly kycProvider: KycProvider,
+    private readonly approvals: AdminApprovalService,
+    private readonly rampApprovals: RampApprovalActions,
   ) {}
+
+  /** `GET /admin/session` (SPEC §12.2): the operator's party, person, roles and how decisions are made. */
+  @Get("session")
+  session(@Req() req: AuthedRequest): ApiAdminSession {
+    const actor = adminActorOf(req);
+    return {
+      party: actor.operatorParty,
+      personId: actor.personId,
+      roles: actor.roles,
+      approvalSignatures: this.config.rampControls.approvalSignatures,
+      dualControl: this.config.rampControls.dualControl,
+    };
+  }
 
   /** The KYC provider's wiring plus a live credential probe (docs/KYC.md §6) — never applicant data. */
   @Get("kyc/provider")
@@ -101,14 +150,27 @@ export class AdminController {
     return this.admin.suspend(id, body.reason, adminActorOf(req));
   }
 
+  /**
+   * `{ ok: true }` — or, when the account has a chargeback, a blocked card or a ramp order in review
+   * (X12 c), the four-eyes `user.reinstate`: 202 `{approval}` / 200 `{approval, result}`.
+   */
   @Post("users/:id/reinstate")
   @HttpCode(200)
-  reinstate(
+  async reinstate(
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: AdminReasonDto,
     @Req() req: AuthedRequest,
-  ): Promise<{ ok: true }> {
-    return this.admin.reinstate(id, body.reason, adminActorOf(req));
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true } | ApprovalOutcome> {
+    const actor = adminActorOf(req);
+    const flags = await this.rampApprovals.reinstateFlags(id);
+    if (flags.chargebacks + flags.blockedCards + flags.ordersInReview === 0)
+      return this.admin.reinstate(id, body.reason, actor);
+    const outcome = await this.approvals.request(
+      { action: "user.reinstate", subjectId: id, reason: body.reason },
+      actor,
+    );
+    return answerApproval(res, outcome);
   }
 
   @Post("users/:id/sessions/revoke")
@@ -147,14 +209,36 @@ export class AdminController {
 
   // ───────────────────────────────────────────── KYC ───────────────────────────────────────────
 
+  /**
+   * Role `aml` (C22). Approving by hand opens the KYC-gated fiat ramp, so `approved` is the
+   * four-eyes `kyc.override` (another person with `approver`; nobody linked to the account): 202
+   * `{approval}` pending, 200 `{verification, approval}` once executed. Closing the gate
+   * (`rejected`, `expired`) is one aml decision: 200 `{verification}`.
+   */
   @Post("users/:id/kyc/override")
   @HttpCode(200)
-  kycOverride(
+  @RequireRoles("aml")
+  async kycOverride(
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: AdminKycOverrideDto,
     @Req() req: AuthedRequest,
-  ): Promise<{ verification: ApiKycVerification }> {
-    return this.admin.kycOverride(id, body.status, body.reason, adminActorOf(req));
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ verification: ApiKycVerification } | ApprovalOutcome> {
+    const actor = adminActorOf(req);
+    if (body.status !== "approved")
+      return this.admin.kycOverride(id, body.status, body.reason, actor);
+    const outcome = await this.approvals.request(
+      {
+        action: "kyc.override",
+        subjectId: id,
+        params: { status: "approved" },
+        reason: body.reason,
+      },
+      actor,
+    );
+    const answered = answerApproval(res, outcome);
+    const result = outcome.result as { verification: ApiKycVerification } | undefined;
+    return result ? { ...result, approval: answered.approval } : answered;
   }
 
   @Get("kyc/duplicates")
@@ -167,14 +251,32 @@ export class AdminController {
     return this.admin.kycNeedsReview();
   }
 
+  /**
+   * Role `aml`: moving a verified person approves the receiving account's KYC, so it is the
+   * four-eyes `kyc.person_transfer` (another person with `approver`; nobody linked to either
+   * account): 202 `{approval}` pending, 200 `{ok, approval}` once executed.
+   */
   @Post("kyc/persons/:fingerprint/transfer")
   @HttpCode(200)
-  transferPerson(
+  @RequireRoles("aml")
+  async transferPerson(
     @Param() params: FingerprintParamDto,
     @Body() body: AdminPersonTransferDto,
     @Req() req: AuthedRequest,
-  ): Promise<{ ok: true }> {
-    return this.admin.transferPerson(params.fingerprint, body.toUserId, body.reason, adminActorOf(req));
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true } | ApprovalOutcome> {
+    const outcome = await this.approvals.request(
+      {
+        action: "kyc.person_transfer",
+        subjectId: params.fingerprint,
+        params: { toUserId: body.toUserId },
+        reason: body.reason,
+      },
+      adminActorOf(req),
+    );
+    const answered = answerApproval(res, outcome);
+    const result = outcome.result as { ok: true } | undefined;
+    return result ? { ...result, approval: answered.approval } : answered;
   }
 
   /** Operator escape hatch for a stored webhook the durable consumer gave up on (RUNBOOK §4). */
@@ -195,14 +297,49 @@ export class AdminController {
     return this.admin.listPayouts(query.status);
   }
 
+  /**
+   * The processor's settle on demand (`{payout, mode}`); with `force` it is the four-eyes
+   * `payout.force_settle` (SPEC §6.5): 202 `{approval}` / 200 `{approval, result: {payout, mode}}`.
+   */
   @Post("payouts/:cid/settle")
   @HttpCode(200)
-  settlePayout(
+  async settlePayout(
     @Param() params: PayoutCidParamDto,
     @Body() body: AdminPayoutSettleDto,
     @Req() req: AuthedRequest,
-  ): Promise<{ payout: ApiPayout; mode: "external" | "in_app" | "already_settled" }> {
-    return this.admin.settlePayout(params.cid, { force: body.force === true, reason: body.reason }, adminActorOf(req));
+    @Res({ passthrough: true }) res?: Response,
+  ): Promise<{ payout: ApiPayout; mode: PayoutMode } | ApprovalOutcome> {
+    const actor = adminActorOf(req);
+    if (body.force !== true)
+      return this.admin.settlePayout(params.cid, { force: false, reason: body.reason }, actor);
+    const outcome = await this.approvals.request(
+      { action: "payout.force_settle", subjectId: params.cid, reason: body.reason },
+      actor,
+    );
+    return res ? answerApproval(res, outcome) : outcome;
+  }
+
+  /**
+   * `payout.mark_paid` (SPEC §6.5, X1): record that a PendingPayout was paid outside the platform —
+   * never one bound to (or bindable by) a ramp cash-out. 202 `{approval}` / 200 `{approval, result}`.
+   */
+  @Post("payouts/:cid/mark-paid")
+  async markPaid(
+    @Param() params: PayoutCidParamDto,
+    @Body() body: PayoutMarkPaidDto,
+    @Req() req: AuthedRequest,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApprovalOutcome> {
+    const outcome = await this.approvals.request(
+      {
+        action: "payout.mark_paid",
+        subjectId: params.cid,
+        params: { txHash: body.txHash },
+        reason: body.reason,
+      },
+      adminActorOf(req),
+    );
+    return answerApproval(res, outcome);
   }
 
   // ──────────────────────────────────────────── audit ──────────────────────────────────────────

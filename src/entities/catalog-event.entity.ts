@@ -51,6 +51,13 @@ export class CatalogEventEntity {
   @Column({ type: "boolean", default: false })
   archived!: boolean;
 
+  /** The event's one collateral, fixed by its first market (docs/TOKENS.md §2 decision 9); null until then. */
+  @Column({ name: "collateral_admin", type: "text", nullable: true })
+  collateralAdmin!: string | null;
+
+  @Column({ name: "collateral_id", type: "text", nullable: true })
+  collateralId!: string | null;
+
   @Column({ name: "created_by_user_id", type: "uuid", nullable: true })
   createdByUserId!: string | null;
 

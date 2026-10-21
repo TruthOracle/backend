@@ -5,13 +5,25 @@ import type { Response } from "express";
 import { AllowAdminSession, Public } from "../auth/decorators";
 import { type AuthedRequest, optionalPrincipalOf } from "../auth/request";
 import { Config } from "../config";
-import { AdminChallengeDto, AdminLoginDto, GoogleLoginDto, TelegramMiniAppDto, TelegramWidgetDto } from "../dto/auth.dto";
+import {
+  AdminChallengeDto,
+  AdminLoginDto,
+  GoogleLoginDto,
+  TelegramMiniAppDto,
+  TelegramWidgetDto,
+} from "../dto/auth.dto";
 import { AuditService } from "../services/audit.service";
 import { GoogleAuthService } from "../services/google-auth.service";
 import { LoginService } from "../services/login.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import { SessionService } from "../services/session.service";
-import { OidcCallbackError, type OidcMode, type OidcRedirectTarget, TelegramAuthService, withAuthResult } from "../services/telegram-auth.service";
+import {
+  OidcCallbackError,
+  type OidcMode,
+  type OidcRedirectTarget,
+  TelegramAuthService,
+  withAuthResult,
+} from "../services/telegram-auth.service";
 import { UserService } from "../services/user.service";
 import { WalletChallengeService } from "../services/wallet-challenge.service";
 import type { ApiChallenge, ApiLoginResult, ApiSessionState, IdentityClaim } from "../types";
@@ -76,11 +88,19 @@ export class AuthController {
   @Public()
   @Post("google")
   @HttpCode(200)
-  async google(@Body() body: GoogleLoginDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
+  async google(
+    @Body() body: GoogleLoginDto,
+    @Req() req: AuthedRequest,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiLoginResult> {
     await this.rateLimit.enforce("login", { ip: req.clientIp });
     const claim = await this.googleAuth.verifyCredential(body.credential, body.nonce);
     await this.rateLimit.enforce("login", { subject: `google:${claim.subject}` });
-    return this.login.completeLogin(res, claim, { req, kind: "user", client: body.client ?? "web" });
+    return this.login.completeLogin(res, claim, {
+      req,
+      kind: "user",
+      client: body.client ?? "web",
+    });
   }
 
   // ── Telegram ───────────────────────────────────────────────────────────────
@@ -88,7 +108,11 @@ export class AuthController {
   @Public()
   @Post("telegram/widget")
   @HttpCode(200)
-  async telegramWidget(@Body() body: TelegramWidgetDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
+  async telegramWidget(
+    @Body() body: TelegramWidgetDto,
+    @Req() req: AuthedRequest,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiLoginResult> {
     await this.rateLimit.enforce("telegram", { ip: req.clientIp });
     await this.rateLimit.enforce("login", { ip: req.clientIp });
     const { client, ...payload } = body;
@@ -100,12 +124,20 @@ export class AuthController {
   @Public()
   @Post("telegram/miniapp")
   @HttpCode(200)
-  async telegramMiniApp(@Body() body: TelegramMiniAppDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
+  async telegramMiniApp(
+    @Body() body: TelegramMiniAppDto,
+    @Req() req: AuthedRequest,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiLoginResult> {
     await this.rateLimit.enforce("telegram", { ip: req.clientIp });
     await this.rateLimit.enforce("login", { ip: req.clientIp });
     const claim = await this.telegram.verifyMiniApp(body.initData);
     await this.rateLimit.enforce("login", { subject: `telegram:${claim.subject}` });
-    return this.login.completeLogin(res, claim, { req, kind: "user", client: body.client ?? "web" });
+    return this.login.completeLogin(res, claim, {
+      req,
+      kind: "user",
+      client: body.client ?? "web",
+    });
   }
 
   /**
@@ -177,7 +209,10 @@ export class AuthController {
       const known = err instanceof OidcCallbackError ? err.target : target;
       if (known && err instanceof ApiError) {
         res.append("Set-Cookie", clearedOidcCookie(this.config));
-        res.redirect(302, `${known.proto}://${known.host}${withAuthResult(known.returnTo, "error", err.code)}`);
+        res.redirect(
+          302,
+          `${known.proto}://${known.host}${withAuthResult(known.returnTo, "error", err.code)}`,
+        );
         return;
       }
       throw err;
@@ -196,9 +231,15 @@ export class AuthController {
   @Public()
   @Post("admin/challenge")
   @HttpCode(200)
-  async adminChallenge(@Body() body: AdminChallengeDto, @Req() req: AuthedRequest): Promise<ApiChallenge> {
+  async adminChallenge(
+    @Body() body: AdminChallengeDto,
+    @Req() req: AuthedRequest,
+  ): Promise<ApiChallenge> {
     // The party dimension is keyed together with the IP: a stranger cannot spend the owner's quota.
-    await this.rateLimit.enforce("challenge", { ip: req.clientIp, subject: `${req.clientIp ?? "unknown"}:${body.partyId}` });
+    await this.rateLimit.enforce("challenge", {
+      ip: req.clientIp,
+      subject: `${req.clientIp ?? "unknown"}:${body.partyId}`,
+    });
     return this.challenges.issue({
       partyId: body.partyId,
       purpose: "admin-sign-in",
@@ -218,9 +259,14 @@ export class AuthController {
   @Public()
   @Post("admin")
   @HttpCode(200)
-  async admin(@Body() body: AdminLoginDto, @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<ApiLoginResult> {
+  async admin(
+    @Body() body: AdminLoginDto,
+    @Req() req: AuthedRequest,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiLoginResult> {
     await this.rateLimit.enforce("login", { ip: req.clientIp });
-    if (optionalPrincipalOf(req)) throw new ApiError(403, "forbidden", "admin sign-in cannot run in link mode");
+    if (optionalPrincipalOf(req))
+      throw new ApiError(403, "forbidden", "admin sign-in cannot run in link mode");
 
     const verified = await this.challenges.verify({
       challengeId: body.challengeId,
@@ -246,7 +292,10 @@ export class AuthController {
   @AllowAdminSession()
   @Post("logout")
   @HttpCode(200)
-  async logout(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response): Promise<{ ok: true }> {
+  async logout(
+    @Req() req: AuthedRequest,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true }> {
     const principal = optionalPrincipalOf(req);
     if (principal) {
       const { session, user } = principal;

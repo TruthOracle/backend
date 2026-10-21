@@ -12,11 +12,16 @@ import {
   verifyPartySignature,
 } from "./canton-crypto";
 
-/** The real TruthOracle operator party and its pinned key (truthoracle-canton/.env, public data). */
-const OPERATOR_PARTY = "20a2514bea1b4dd382f116c1e580197d::12205811d9301bcc2456567f882baceb8e083483c8be3f2631aedc2ce1806c424393";
+/** The real TruthOracle operator party and its pinned key (pm-frontend/.env, public data). */
+const OPERATOR_PARTY =
+  "20a2514bea1b4dd382f116c1e580197d::12205811d9301bcc2456567f882baceb8e083483c8be3f2631aedc2ce1806c424393";
 const OPERATOR_KEY_HEX = "e47140308293759b1e20d90348c2455e2cddfbf43667b196dfa166e6c0a6fcd1";
 
-function freshKeypair(): { raw: Buffer; privateKey: import("node:crypto").KeyObject; partyId: string } {
+function freshKeypair(): {
+  raw: Buffer;
+  privateKey: import("node:crypto").KeyObject;
+  partyId: string;
+} {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const spki = publicKey.export({ type: "spki", format: "der" });
   const raw = spki.subarray(spki.length - 32);
@@ -45,7 +50,11 @@ describe("util/canton-crypto", () => {
     it("is the documented formula", () => {
       const raw = Buffer.alloc(32, 7);
       const purpose = Buffer.from([0, 0, 0, 12]);
-      const expected = "1220" + createHash("sha256").update(Buffer.concat([purpose, raw])).digest("hex");
+      const expected =
+        "1220" +
+        createHash("sha256")
+          .update(Buffer.concat([purpose, raw]))
+          .digest("hex");
       expect(partyFingerprintFromPublicKey(raw)).toBe(expected);
     });
   });
@@ -100,27 +109,74 @@ describe("util/canton-crypto", () => {
     it("accepts a raw-UTF-8 Ed25519 signature in any encoding", () => {
       const kp = freshKeypair();
       const sig = cryptoSign(null, Buffer.from(message, "utf8"), kp.privateKey);
-      expect(verifyPartySignature({ message, signature: sig.toString("base64"), publicKey: kp.raw.toString("base64") })).toEqual({ ok: true, form: "utf8" });
-      expect(verifyPartySignature({ message, signature: sig.toString("hex"), publicKey: kp.raw.toString("hex") })).toEqual({ ok: true, form: "utf8" });
-      expect(verifyPartySignature({ message, signature: sig.toString("base64url"), publicKey: kp.raw.toString("base64url") })).toEqual({ ok: true, form: "utf8" });
+      expect(
+        verifyPartySignature({
+          message,
+          signature: sig.toString("base64"),
+          publicKey: kp.raw.toString("base64"),
+        }),
+      ).toEqual({ ok: true, form: "utf8" });
+      expect(
+        verifyPartySignature({
+          message,
+          signature: sig.toString("hex"),
+          publicKey: kp.raw.toString("hex"),
+        }),
+      ).toEqual({ ok: true, form: "utf8" });
+      expect(
+        verifyPartySignature({
+          message,
+          signature: sig.toString("base64url"),
+          publicKey: kp.raw.toString("base64url"),
+        }),
+      ).toEqual({ ok: true, form: "utf8" });
     });
 
     it("falls back to the sha256(utf8) preimage", () => {
       const kp = freshKeypair();
       const digest = createHash("sha256").update(Buffer.from(message, "utf8")).digest();
       const sig = cryptoSign(null, digest, kp.privateKey);
-      expect(verifyPartySignature({ message, signature: sig.toString("base64"), publicKey: kp.raw.toString("base64") })).toEqual({ ok: true, form: "sha256(utf8)" });
+      expect(
+        verifyPartySignature({
+          message,
+          signature: sig.toString("base64"),
+          publicKey: kp.raw.toString("base64"),
+        }),
+      ).toEqual({ ok: true, form: "sha256(utf8)" });
     });
 
     it("rejects a wrong key, a tampered message, and malformed input", () => {
       const kp = freshKeypair();
       const other = freshKeypair();
       const sig = cryptoSign(null, Buffer.from(message, "utf8"), kp.privateKey);
-      expect(verifyPartySignature({ message, signature: sig.toString("base64"), publicKey: other.raw.toString("base64") }).ok).toBe(false);
-      expect(verifyPartySignature({ message: message + "!", signature: sig.toString("base64"), publicKey: kp.raw.toString("base64") }).ok).toBe(false);
-      expect(verifyPartySignature({ message: "", signature: sig.toString("base64"), publicKey: kp.raw.toString("base64") })).toEqual({ ok: false, reason: "missing message" });
-      expect(verifyPartySignature({ message, signature: "nope", publicKey: kp.raw.toString("base64") }).ok).toBe(false);
-      expect(verifyPartySignature({ message, signature: sig.toString("base64"), publicKey: "nope" }).ok).toBe(false);
+      expect(
+        verifyPartySignature({
+          message,
+          signature: sig.toString("base64"),
+          publicKey: other.raw.toString("base64"),
+        }).ok,
+      ).toBe(false);
+      expect(
+        verifyPartySignature({
+          message: message + "!",
+          signature: sig.toString("base64"),
+          publicKey: kp.raw.toString("base64"),
+        }).ok,
+      ).toBe(false);
+      expect(
+        verifyPartySignature({
+          message: "",
+          signature: sig.toString("base64"),
+          publicKey: kp.raw.toString("base64"),
+        }),
+      ).toEqual({ ok: false, reason: "missing message" });
+      expect(
+        verifyPartySignature({ message, signature: "nope", publicKey: kp.raw.toString("base64") })
+          .ok,
+      ).toBe(false);
+      expect(
+        verifyPartySignature({ message, signature: sig.toString("base64"), publicKey: "nope" }).ok,
+      ).toBe(false);
     });
 
     it("describes attempts by shape only", () => {

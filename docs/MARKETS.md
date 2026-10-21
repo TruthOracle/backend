@@ -13,8 +13,10 @@ The rule: **on the ledger only what a trader signs for, what a choice reads, or 
 resolution is judged against; everything else is the backend's.** Presentation is mutable and
 unsigned — a broken image link must not need a new market, and every successor version of a
 contract copies its fields into every trade transaction, so bytes nobody signs for are pure
-cost there. truthoracle-v16 applies that rule: `PredictionMarket` carries no `imageUrl`,
-`description` or `category` any more (v15 did; no choice ever read them).
+cost there. truthoracle-v16 applied that rule and v17 keeps it: `PredictionMarket` carries no
+`imageUrl`, `description` or `category` (v15 did; no choice ever read them). What v17 adds to the
+contract is `collateral : InstrumentId` — the token every amount of the market is in
+(docs/TOKENS.md §2), fixed at creation and served as `Market.collateral`.
 
 | What | Lives | Owner | Why |
 |---|---|---|---|
@@ -35,12 +37,12 @@ Kalshi-style tickers (`^[A-Z0-9][A-Z0-9._-]{1,63}$`, upper case): a series `FED`
 `FED-26MAR`, its markets `FED-26MAR-CUT25`, `FED-26MAR-CUT50`, `FED-26MAR-HOLD`. Every
 `/markets/:market` route accepts a ticker or the numeric `marketId`.
 
-A market's identity is **the contract's, and only the contract's**. truthoracle-v16 carries
+A market's identity is **the contract's, and only the contract's**. truthoracle-v17 carries
 `ticker`, `eventTicker`, `yesSubTitle` and `noSubTitle` as mandatory `Text` on
 `PredictionMarket` and on `MarketCounter.CreateMarket` (the contract refuses an empty one); the
 indexer writes them on every version, normalised the way every ticker input is (trimmed,
 upper-cased), and there is no operator route that edits them — what a trader signs is what the
-catalog shows. Nothing is synthesised and nothing is filled in off-ledger: a from-scratch v16
+catalog shows. Nothing is synthesised and nothing is filled in off-ledger: a from-scratch v17
 deployment never has a market without its identity.
 
 The index only protects itself, never the data:
@@ -70,12 +72,25 @@ with the ledger:
 | Field | Derivation |
 |---|---|
 | `status` | `settled` when every market is resolved / voided; else `open` when any market's phase is `trading`; else `unopened` when any is still in its liquidity period (or there are no markets); else `closed` (expired / proposed, awaiting resolution) — Kalshi's `unopened / open / closed / settled` |
-| `marketCount`, `volumeCC` | count and Σ `totalVolumeCC` of the members |
-| `volume24hCC`, `openInterestCC`, `liquidityCC` | Σ over the members of the last 24 h of hourly-candle volume, the outstanding shares, the pool value V(P) at the current effective liquidity — the figures an event card and an event header show |
+| `marketCount`, `volume` | count and Σ `totalVolume` of the members |
+| `volume24h`, `openInterest`, `liquidity` | Σ over the members of the last 24 h of hourly-candle volume, the outstanding shares, the pool value V(P) at the current effective liquidity — the figures an event card and an event header show |
 | `topMarket` | the member with the highest YES price (nested `markets` are ordered the same way, likeliest first) — what a binary-event card shows |
 | `closeTime` | the latest `expiresAt` among the members |
 | `category` | the series' |
 | `settlementSources` | the event's own sources when set, else the series' |
+
+**Every figure is a sum in one instrument** (docs/TOKENS.md §2 decision 9, §4.5). An event is
+denominated in the collateral its first market fixed (`to_events.collateral_*`, written by the
+projection when it indexes the market and by `POST /admin/markets` the moment the submission is
+accepted); its members are the unarchived markets in that instrument — a market in another token
+that reached the ledger past the backend's check is neither summed nor nested (it stays
+addressable through `GET /markets?event=`). The listings take `?instrument=<admin>:<id>`
+(default: the default collateral): `GET /events` returns the events in that instrument plus the
+ones no market has fixed yet (`instrument: null`, zero figures — they belong to no instrument and
+appear under every one), the `sort=` subqueries rank over the members in the event's instrument,
+and `GET /series` / `GET /series/:ticker` report `instrument`, `eventCount` (events in it, the
+market-less ones included), `marketCount` and `volume` for that instrument. A platform without a
+configured collateral lists the whole catalog unfiltered (`instrument: null`).
 
 `mutuallyExclusive` is **informational**: each market is its own pm-AMM pool with independent
 collateral, so nothing on-ledger nets positions across the legs (Kalshi's `MECNET`). The resolver
@@ -101,6 +116,15 @@ catalog and submits it treasury-signed through the Enterprise Wallet (`/api/v1/e
   valid tickers (`400 validation_failed`), the ticker unused by any indexed market
   (`409 catalog_conflict`); `yesSubTitle` / `noSubTitle` are trimmed, at most 80 characters and
   default to `Yes` / `No` — the contract refuses an empty label;
+- `collateral?: { admin, id }` names the instrument the market is denominated in (default: the
+  default collateral); it must be an enabled `collateral` instrument (`400 validation_failed`)
+  and equal the event's once the event has one (`409 catalog_conflict` with
+  `details.eventCollateral` / `details.requested` — an event's aggregates are sums in one
+  instrument, docs/TOKENS.md §2 decision 9). An accepted submission fixes the event's collateral
+  right away (`to_events.collateral_*`, the pair the projection writes too), so a second market in
+  another instrument is refused from that moment, not only once the first one is indexed.
+  `initialValue` and `policy.bond` are in it. The `CreateMarket` argument carries `collateral`
+  and `auditObservers` = the configured regulator parties plus whatever the request adds;
 - the `MarketCounter` contract id comes from the index (`to_indexer_state.market_counter_cid`;
   `503 not_ready` before the indexer has seen it);
 - the command id is `create-market-<sha256(ticker)[:40]>`, so a retried request collides on
@@ -123,8 +147,20 @@ an unknown market) upserts the row, audits `catalog.market_metadata_updated` and
 row (or null), so a UI can tell an operator's image from the event fallback.
 
 A `CreateMarket` submitted by any other client (a script, another wallet) must send the four
-identity fields itself — the contract requires them — and gets no presentation until an operator
-writes some.
+identity fields and the collateral itself — the contract requires them — and gets no
+presentation until an operator writes some; an instrument the platform does not know is
+registered as disabled by the indexer so the market still renders (docs/TOKENS.md §4.1).
+
+Resolving and voiding: `POST /admin/markets/:marketId/resolution` is the four-eyes
+`market.resolve` and the only way any market, of any collateral, is resolved (the frontend's
+wallet relay no longer submits ResolveT0 / Resolve / VoidMarket). The subject is the market id,
+not the contract id, so a trade while the request waits changes nothing; the snapshot holds the
+decision fields only. Request and execution need a fresh index and check the choice's own asserts
+by the backend clock: ResolveT0 in [expiresAt, expiresAt + grace] on a Trading market with
+`operatorResolution` and an allowlisted source (any http(s) source when `sources` is empty);
+Resolve from expiresAt on a Trading or Proposed market, each attestation active, of this market,
+allowlisted and read inside the window, with a T1 signature or the T2 quorum and one outcome;
+VoidMarket after expiresAt + grace. The submission carries the backend's clock as `nowSeconds`.
 
 ## 5. Candles and open interest
 
@@ -136,7 +172,7 @@ and open interest. A pm-AMM has one price, so ours is:
 GET /markets/:market/candlesticks?startTs=&endTs=&periodInterval=1|60|1440
 → { marketId, ticker, periodInterval, startTs, endTs,
     candlesticks: [{ startTs, endTs, price: { open, high, low, close, mean, previous },
-                     volumeCC, trades, openInterest, liquidityL, empty }] }
+                     volume, trades, openInterest, liquidityL, empty }] }
 ```
 
 **How the rows are produced — no separate aggregation worker.** Every `PredictionMarket` version
@@ -146,9 +182,9 @@ the cursor (`src/indexer/candles.ts`):
 
 - `open` is written on insert only; `high` / `low` fold; `close`, `liquidity_l` and
   `open_interest` follow the newest version by (offset, node id);
-- `volume_cc` accumulates Δ `totalVolumeCC` against the consumed predecessor (Buy = collateral,
+- `volume` accumulates Δ `totalVolume` against the consumed predecessor (Buy = collateral,
   Sell = gross proceeds, SwapShares = shares × side price — the market's own volume measure);
-- `notional_cc` accumulates `price_after × Δvolume`, so `mean = notional / volume` is the
+- `notional` accumulates `price_after × Δvolume`, so `mean = notional / volume` is the
   volume-weighted post-trade price (`close` when nothing traded);
 - `trades` counts Buy / Sell / SwapShares versions (Split / Merge / Redeem create no market
   version and move no price).
@@ -183,8 +219,8 @@ the tables above; nothing is pre-aggregated:
 | Event page chart, one line per outcome | `GET /events/:ticker/candlesticks?periodInterval=&startTs=&endTs=` | every member market (every status), one shared window, busiest first; the series align by construction |
 | Market page chart | `GET /markets/:market/candlesticks?…` | same candle shape |
 | Card sparkline | `GET /markets?withSparkline=true` (and the `markets` nested by `GET /events?withNestedMarkets=true`) | the last 24 hourly closes per market, one query per page |
-| Activity feed | `GET /events/:ticker/trades?cursor=` · `GET /markets/:market/trades?cursor=` | keyset pages (`nextCursor`), masked takers, `yesPrice` / `noPrice` / `notionalCC` |
-| Headline figures | `Market.previousPrice / priceChange24h / volume24hCC / openInterest / liquidityCC`, `Event.volume24hCC / openInterestCC / liquidityCC / topMarket` | from the hourly candles and the market rows |
+| Activity feed | `GET /events/:ticker/trades?cursor=` · `GET /markets/:market/trades?cursor=` | keyset pages (`nextCursor`), masked takers, `yesPrice` / `noPrice` / `notional` |
+| Headline figures | `Market.previousPrice / priceChange24h / volume24h / openInterest / liquidity`, `Event.volume24h / openInterest / liquidity / topMarket` | from the hourly candles and the market rows |
 
 Timeframe tabs map to periods and windows like this — the cap of 5 000 candles per series is
 never hit: **1H** and **6H** → `periodInterval=1` (60 / 360 candles); **1D** → `1` (1 440) or
@@ -199,8 +235,8 @@ job system is NATS JetStream (`src/processors/*`) — a second queue would be a 
 truth for numbers the index already holds. If a list page ever gets slow, the scaling step is a
 `to_market_stats` row refreshed from the same transaction, not a worker that re-aggregates trades.
 
-**24 h figures on every market** (`previousPrice`, `priceChange24h`, `volume24hCC`) are read from
-the hourly candles in two set queries per list page: `volume24hCC` = Σ hourly volume since
+**24 h figures on every market** (`previousPrice`, `priceChange24h`, `volume24h`) are read from
+the hourly candles in two set queries per list page: `volume24h` = Σ hourly volume since
 now − 24 h; `previousPrice` = the last hourly close before now − 24 h, else the market's first
 price (a market younger than a day shows its change since open). If list pages ever get slow,
 the scaling step is a `to_market_stats` row refreshed by a processor — not a change of the data.
@@ -212,21 +248,22 @@ market is a Paradigm dynamic pm-AMM pool (`truthoracle-contracts/daml/daml/PmAmm
 price is `Φ((y − x) / L_eff)` over the virtual reserves of the cached price, and a trade's fill is
 the solution of the pool invariant. So:
 
-- `GET /markets/:market/quote?action=buy|sell|swap|provide_liquidity&side=&amountCC=&shares=&slippageBps=`
+- `GET /markets/:market/quote?action=buy|sell|swap|provide_liquidity&side=&amount=&shares=&slippageBps=`
   runs the same formulas (`src/amm/pm-amm.ts`, a port of PmAmmMath with the market-level
   wrappers of `Buy` / `Sell` / `SwapShares` / `ProvideLiquidity`) over the **indexed market
   version** at server time, and answers the fill, the fee, the average price, the price after,
   the price impact and the pool's effective liquidity — plus the **bounds** the choice argument
-  must carry for the requested slippage: `minSharesOut` (buy, swap), `minProceedsCC` (sell),
-  `maxCostCC` (provide). Default slippage 100 bps, max 2 000.
+  must carry for the requested slippage: `minSharesOut` (buy, swap), `minProceeds` (sell),
+  `maxCost` (provide). Default slippage 100 bps, max 2 000.
 - The quote names the `contractId` and `updatedOffset` it was computed against; a trade must
   exercise that contract (every trade consumes the market version, so a quote against a stale
   version means a `CONTRACT_NOT_ACTIVE` at submission — the client re-quotes).
 - Daml runs in `Decimal` (10 dp fixed point) and the port in doubles, so a fill can differ in
   the last decimals; the slippage bound absorbs it. Quotes are advisory; the ledger executes.
 - `ApiMarket.book` (`yesBid / yesAsk / noBid / noAsk`) is the implied one-share price of a
-  reference 1 CC buy / mirrored sell — Kalshi's bid / ask fields for a pool that has none.
-  `liquidityCC` is the pool value `V(P) = L·φ(Φ⁻¹(P))` at the current effective liquidity.
+  reference buy of one unit of collateral / mirrored sell — Kalshi's bid / ask fields for a pool
+  that has none.
+  `liquidity` is the pool value `V(P) = L·φ(Φ⁻¹(P))` at the current effective liquidity.
 - Quotes refuse with `409 market_not_tradable` (`details.phase`, `details.reason`) whenever the
   Daml choice would abort: not `Trading`, before the liquidity period ends, after expiry.
 
@@ -241,7 +278,7 @@ Cantor8 party on mainnet (`docs/INDEXER.md` §1), and the index has them:
 ```
 POST /markets/:market/orders/prepare   (user session; the account's primary wallet signs)
 { action: buy|sell|swap|split|merge|provide_liquidity|withdraw_liquidity|redeem,
-  side?, amountCC?, shares?, lpTokens?, slippageBps? }
+  side?, amount?, shares?, lpTokens?, slippageBps? }
 → { action, marketId, ticker, actAs, command: { ExerciseCommand }, disclosedContracts: [market],
     quote | null, inputs: { marketContractId, walletContractId, positionContractId, lpPositionContractId },
     ledgerOffset, nowSeconds, expiresAt }
@@ -251,7 +288,9 @@ The frontend passes `command` and `disclosedContracts` to the Cantor8 SDK's `sig
 (the party is the account's primary wallet, ARCHITECTURE §8.2), then waits on
 `GET /ledger/wait?offset=` above `ledgerOffset` and reloads. Before answering, the route
 pre-checks every rule the Daml choice asserts and answers a stable reason instead of a rejected
-transaction: `409 no_primary_wallet`, `409 no_in_app_wallet` (deposit first), `409 no_position`,
+transaction: `409 no_primary_wallet`, `409 no_in_app_wallet` (deposit the market's collateral
+first — `walletContractId` is the account's wallet in `market.collateral`, `details.instrument`
+names it), `409 no_position`,
 `409 insufficient_balance` / `insufficient_shares` (with the held and requested amounts),
 `409 market_not_tradable`, `409 trading_halted` (§8; `redeem` is never halted),
 `409 quote_unavailable` (the pool cannot fill it, or the market's blob is not indexed).
@@ -298,8 +337,8 @@ stop a party that crafts its own command. The ledger-level lever remains the mar
 | `GET /events/{ticker}` | `GET /events/:ticker` | markets always nested |
 | `GET /markets?event_ticker&series_ticker&tickers&status` | `GET /markets?event&series&tickers&status` | plus this platform's `category`, `q`, `sort` |
 | `GET /markets/{ticker}` | `GET /markets/:market` | id or ticker; `phase` is Kalshi's status: `initialized`≈`liquidity`, `active`≈`trading`, `closed`≈`expired`/`proposed`, `settled`≈`resolved`/`voided` |
-| market `yes_bid/ask`, `last_price`, `previous_price`, `volume_24h`, `open_interest`, `liquidity`, `result` | `book`, `currentPrice`, `previousPrice`, `volume24hCC`, `openInterest`, `liquidityCC`, `outcome` | AMM-implied book; CC not dollars |
-| `GET /series/{s}/markets/{t}/candlesticks?period_interval` | `GET /markets/:market/candlesticks?periodInterval` | one price series (the pool's), volume in CC, dense |
+| market `yes_bid/ask`, `last_price`, `previous_price`, `volume_24h`, `open_interest`, `liquidity`, `result` | `book`, `currentPrice`, `previousPrice`, `volume24h`, `openInterest`, `liquidity`, `outcome` | AMM-implied book; collateral units, not dollars |
+| `GET /series/{s}/markets/{t}/candlesticks?period_interval` | `GET /markets/:market/candlesticks?periodInterval` | one price series (the pool's), volume in the collateral, dense |
 | `GET /markets/trades` | `GET /markets/:market/trades`, `GET /me/trades` | fills are derived from ledger effects |
 | `POST /portfolio/orders`, order book, `GET /portfolio/orders` | `GET /markets/:market/quote` + `POST /markets/:market/orders/prepare`, user-signed submission | no book, no resting orders (§7) |
 | `GET /portfolio/positions`, `/balance`, `/settlements` | `GET /me/positions`, `GET /in-app-wallet`, `GET /in-app-wallet/{ledger,history}` | unchanged |

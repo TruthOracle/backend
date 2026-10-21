@@ -26,7 +26,8 @@ import type {
   TradeSide,
 } from "../types";
 import { ApiError } from "../util/errors";
-import { formatCC } from "../util/money";
+import { formatAmount, parseAmount } from "../util/money";
+import { ComplianceFreezePort } from "./compliance-freeze.port";
 import { ExchangeService } from "./exchange.service";
 import { IndexerService } from "./indexer.service";
 import { MarketsService } from "./markets.service";
@@ -38,7 +39,7 @@ export interface QuoteRequest {
   action: OrderAction;
   side?: TradeSide;
   /** buy: collateral · provide_liquidity: value increase · split / merge: pairs. */
-  amountCC?: bigint;
+  amount?: bigint;
   /** sell / swap: shares in. */
   shares?: bigint;
   /** withdraw_liquidity: LP tokens to burn. */
@@ -72,6 +73,7 @@ export class QuoteService {
     private readonly markets: MarketsService,
     private readonly indexer: IndexerService,
     private readonly exchange: ExchangeService,
+    private readonly freeze: ComplianceFreezePort,
   ) {}
 
   // ───────────────────────────────────────────── quotes ─────────────────────────────────────────────
@@ -85,11 +87,12 @@ export class QuoteService {
     return {
       marketId: market.marketId,
       ticker: market.ticker,
+      instrument: this.markets.collateralOf(market),
       contractId: market.contractId,
       updatedOffset: market.updatedOffset,
       nowSeconds: nowSec,
       phase,
-      effectiveL: formatCC(numberToDecimal(marketEffectiveL(state, nowSec))),
+      effectiveL: formatAmount(numberToDecimal(marketEffectiveL(state, nowSec))),
       quote: body,
       bounds,
     };
@@ -104,28 +107,28 @@ export class QuoteService {
     const state = ammStateOf(market);
     const down = (n: number): bigint => numberToDecimal(n * (1 - slippageBps / 10_000));
     const up = (n: number): bigint => numberToDecimal(n * (1 + slippageBps / 10_000));
-    const dec = (n: number): string => formatCC(numberToDecimal(n));
+    const dec = (n: number): string => formatAmount(numberToDecimal(n));
     switch (req.action) {
       case "buy": {
         const side = requireSide(req.side);
-        const collateral = requirePositive(req.amountCC, "amountCC");
+        const collateral = requirePositive(req.amount, "amount");
         const q = quoteBuy(state, side, decimalToNumber(collateral), nowSec);
         if (!q) throw new ApiError(409, "quote_unavailable", "the pool cannot fill this order");
         return {
           body: {
             action: "buy",
             side,
-            collateralCC: formatCC(collateral),
-            feeCC: dec(q.feeCC),
-            netCC: dec(q.netCC),
+            amount: formatAmount(collateral),
+            fee: dec(q.fee),
+            net: dec(q.net),
             sharesOut: dec(q.sharesOut),
             avgPrice: dec(q.avgPrice),
             priceBefore: dec(q.priceBefore),
             priceAfter: dec(q.priceAfter),
             priceImpact: dec(q.priceImpact),
-            maxPayoutCC: dec(q.sharesOut),
+            maxPayout: dec(q.sharesOut),
           },
-          bounds: { slippageBps, minSharesOut: formatCC(down(q.sharesOut)) },
+          bounds: { slippageBps, minSharesOut: formatAmount(down(q.sharesOut)) },
         };
       }
       case "sell": {
@@ -137,16 +140,16 @@ export class QuoteService {
           body: {
             action: "sell",
             side,
-            sharesIn: formatCC(shares),
-            grossCC: dec(q.grossCC),
-            feeCC: dec(q.feeCC),
-            netCC: dec(q.netCC),
+            sharesIn: formatAmount(shares),
+            gross: dec(q.gross),
+            fee: dec(q.fee),
+            net: dec(q.net),
             avgPrice: dec(q.avgPrice),
             priceBefore: dec(q.priceBefore),
             priceAfter: dec(q.priceAfter),
             priceImpact: dec(q.priceImpact),
           },
-          bounds: { slippageBps, minProceedsCC: formatCC(down(q.netCC)) },
+          bounds: { slippageBps, minProceeds: formatAmount(down(q.net)) },
         };
       }
       case "swap": {
@@ -158,30 +161,30 @@ export class QuoteService {
           body: {
             action: "swap",
             fromSide,
-            sharesIn: formatCC(shares),
+            sharesIn: formatAmount(shares),
             feeShares: dec(q.feeShares),
             sharesOut: dec(q.sharesOut),
             priceBefore: dec(q.priceBefore),
             priceAfter: dec(q.priceAfter),
             priceImpact: dec(q.priceImpact),
           },
-          bounds: { slippageBps, minSharesOut: formatCC(down(q.sharesOut)) },
+          bounds: { slippageBps, minSharesOut: formatAmount(down(q.sharesOut)) },
         };
       }
       case "provide_liquidity": {
-        const value = requirePositive(req.amountCC, "amountCC");
+        const value = requirePositive(req.amount, "amount");
         const q = quoteProvideLiquidity(state, decimalToNumber(value), nowSec);
         if (!q) throw new ApiError(409, "quote_unavailable", "the pool cannot take this deposit");
         return {
           body: {
             action: "provide_liquidity",
-            valueIncreaseCC: formatCC(value),
-            costCC: dec(q.costCC),
+            valueIncrease: formatAmount(value),
+            cost: dec(q.cost),
             lpMinted: dec(q.lpMinted),
             poolShare: dec(q.poolShare),
             newL: dec(q.newL),
           },
-          bounds: { slippageBps, maxCostCC: formatCC(up(q.costCC)) },
+          bounds: { slippageBps, maxCost: formatAmount(up(q.cost)) },
         };
       }
       default:
@@ -190,7 +193,12 @@ export class QuoteService {
   }
 
   /** Mirrors the asserts of the Daml choices so a user learns why before signing (docs/MARKETS.md §7). */
-  assertTradable(market: MarketEntity, action: OrderAction, phase: MarketPhase, nowSec: number): void {
+  assertTradable(
+    market: MarketEntity,
+    action: OrderAction,
+    phase: MarketPhase,
+    nowSec: number,
+  ): void {
     const refuse = (reason: string): never => {
       throw new ApiError(409, "market_not_tradable", reason, { phase, action });
     };
@@ -217,14 +225,23 @@ export class QuoteService {
           refuse("dynamic-pool liquidity is locked until resolution");
         return;
       case "redeem":
-        if (market.status !== "Resolved" && market.status !== "Voided") refuse("market not settled");
+        if (market.status !== "Resolved" && market.status !== "Voided")
+          refuse("market not settled");
         return;
     }
   }
 
   // ───────────────────────────────────────────── orders ─────────────────────────────────────────────
 
-  async prepare(user: UserEntity, market: MarketEntity, req: QuoteRequest): Promise<ApiPreparedOrder> {
+  async prepare(
+    user: UserEntity,
+    market: MarketEntity,
+    req: QuoteRequest,
+  ): Promise<ApiPreparedOrder> {
+    // SPEC §11.6 (B3, X6): the backend prepares no value movement for a frozen account — the
+    // neutral 403, before anything else is checked. (Its own on-ledger submissions raise
+    // TM-FROZEN-ACTIVITY; an on-ledger freeze is a contracts follow-up.)
+    await this.freeze.assertNotFrozen(user.id);
     const nowSec = Math.floor(Date.now() / 1000);
     const party = user.partyId;
     if (!party) throw new ApiError(409, "no_primary_wallet", "link a wallet before trading");
@@ -238,21 +255,44 @@ export class QuoteService {
     const phase = this.markets.phaseOf(market, nowSec);
     this.assertTradable(market, req.action, phase, nowSec);
     if (!market.createdEventBlob)
-      throw new ApiError(409, "quote_unavailable", "the market's disclosed-contract blob is not indexed yet");
+      throw new ApiError(
+        409,
+        "quote_unavailable",
+        "the market's disclosed-contract blob is not indexed yet",
+      );
 
+    // The wallet that pays is the one in the market's collateral (docs/TOKENS.md §4.5): a party's
+    // TRO balance can never fund a cBYN market, and the Daml choice asserts the same.
     const [wallet, position, lpPosition] = await Promise.all([
-      this.dataSource
-        .getRepository(LedgerWalletEntity)
-        .findOne({ where: { owner: party, active: true }, order: { createdOffset: "DESC" } }),
-      this.dataSource
-        .getRepository(PositionEntity)
-        .findOne({ where: { holder: party, marketId: market.marketId, active: true }, order: { createdOffset: "DESC" } }),
-      this.dataSource
-        .getRepository(LiquidityPositionEntity)
-        .findOne({ where: { provider: party, marketId: market.marketId, active: true }, order: { createdOffset: "DESC" } }),
+      this.dataSource.getRepository(LedgerWalletEntity).findOne({
+        where: {
+          owner: party,
+          instrumentAdmin: market.collateralAdmin,
+          instrumentId: market.collateralId,
+          active: true,
+        },
+        order: { createdOffset: "DESC" },
+      }),
+      this.dataSource.getRepository(PositionEntity).findOne({
+        where: { holder: party, marketId: market.marketId, active: true },
+        order: { createdOffset: "DESC" },
+      }),
+      this.dataSource.getRepository(LiquidityPositionEntity).findOne({
+        where: { provider: party, marketId: market.marketId, active: true },
+        order: { createdOffset: "DESC" },
+      }),
     ]);
-    if (!wallet)
-      throw new ApiError(409, "no_in_app_wallet", "deposit first: this account has no in-app wallet on the ledger");
+    if (!wallet) {
+      const collateral = this.markets.collateralOf(market);
+      throw new ApiError(
+        409,
+        "no_in_app_wallet",
+        `deposit ${collateral.symbol} first: this account has no in-app ${collateral.symbol} wallet on the ledger`,
+        {
+          instrument: collateral,
+        },
+      );
+    }
 
     const slippageBps = clampSlippage(req.slippageBps);
     const quote = ["buy", "sell", "swap", "provide_liquidity"].includes(req.action)
@@ -262,7 +302,7 @@ export class QuoteService {
       party,
       nowSec,
       walletCid: wallet.contractId,
-      walletBalance: wallet.balanceCC,
+      walletBalance: wallet.balance,
       position,
       lpPosition,
       quote,
@@ -324,30 +364,30 @@ export class QuoteService {
     const needBalance = (cost: bigint, what: string): void => {
       if (ctx.walletBalance < cost)
         throw new ApiError(409, "insufficient_balance", `in-app balance is below the ${what}`, {
-          balanceCC: formatCC(ctx.walletBalance),
-          requiredCC: formatCC(cost),
+          balance: formatAmount(ctx.walletBalance),
+          required: formatAmount(cost),
         });
     };
     const needShares = (pos: PositionEntity, side: TradeSide, shares: bigint): void => {
       const held = side === "Yes" ? pos.yesShares : pos.noShares;
       if (held < shares)
         throw new ApiError(409, "insufficient_shares", `the position holds fewer ${side} shares`, {
-          heldShares: formatCC(held),
-          requestedShares: formatCC(shares),
+          heldShares: formatAmount(held),
+          requestedShares: formatAmount(shares),
         });
     };
     switch (req.action) {
       case "buy": {
         const side = requireSide(req.side);
-        const collateral = requirePositive(req.amountCC, "amountCC");
+        const collateral = requirePositive(req.amount, "amount");
         needBalance(collateral, "collateral");
         return {
           choice: "Buy",
           value: {
             buyer: ctx.party,
             side,
-            collateralCC: formatCC(collateral),
-            minSharesOut: ctx.quote?.bounds.minSharesOut ?? formatCC(0n),
+            amount: formatAmount(collateral),
+            minSharesOut: ctx.quote?.bounds.minSharesOut ?? formatAmount(0n),
             nowSeconds: now,
             existingPosition: ctx.position?.contractId ?? null,
             walletCid: ctx.walletCid,
@@ -364,8 +404,8 @@ export class QuoteService {
           value: {
             seller: ctx.party,
             side,
-            sharesIn: formatCC(shares),
-            minProceedsCC: ctx.quote?.bounds.minProceedsCC ?? formatCC(0n),
+            sharesIn: formatAmount(shares),
+            minProceeds: ctx.quote?.bounds.minProceeds ?? formatAmount(0n),
             nowSeconds: now,
             positionCid: pos.contractId,
             walletCid: ctx.walletCid,
@@ -382,21 +422,21 @@ export class QuoteService {
           value: {
             swapper: ctx.party,
             fromSide,
-            sharesIn: formatCC(shares),
-            minSharesOut: ctx.quote?.bounds.minSharesOut ?? formatCC(0n),
+            sharesIn: formatAmount(shares),
+            minSharesOut: ctx.quote?.bounds.minSharesOut ?? formatAmount(0n),
             nowSeconds: now,
             positionCid: pos.contractId,
           },
         };
       }
       case "split": {
-        const amount = requirePositive(req.amountCC, "amountCC");
+        const amount = requirePositive(req.amount, "amount");
         needBalance(amount, "amount");
         return {
           choice: "Split",
           value: {
             user: ctx.party,
-            amount: formatCC(amount),
+            amount: formatAmount(amount),
             nowSeconds: now,
             existingPosition: ctx.position?.contractId ?? null,
             walletCid: ctx.walletCid,
@@ -404,7 +444,7 @@ export class QuoteService {
         };
       }
       case "merge": {
-        const amount = requirePositive(req.amountCC, "amountCC");
+        const amount = requirePositive(req.amount, "amount");
         const pos = needPosition();
         needShares(pos, "Yes", amount);
         needShares(pos, "No", amount);
@@ -412,7 +452,7 @@ export class QuoteService {
           choice: "Merge",
           value: {
             user: ctx.party,
-            amount: formatCC(amount),
+            amount: formatAmount(amount),
             nowSeconds: now,
             positionCid: pos.contractId,
             walletCid: ctx.walletCid,
@@ -420,15 +460,18 @@ export class QuoteService {
         };
       }
       case "provide_liquidity": {
-        const value = requirePositive(req.amountCC, "amountCC");
-        const maxCost = ctx.quote?.bounds.maxCostCC ?? formatCC(value);
-        needBalance(BigInt(Math.ceil(Number(maxCost))) * 10_000_000_000n, "liquidity cost");
+        const value = requirePositive(req.amount, "amount");
+        const maxCost = ctx.quote?.bounds.maxCost ?? formatAmount(value);
+        // The quoted bound itself, in fixed point: the Daml choice debits at most `maxCost`, so a
+        // balance that covers it is enough. Rounding the cost up to the next whole unit (or going
+        // through a double) refused trades the ledger would have taken.
+        needBalance(parseAmount(maxCost), "liquidity cost");
         return {
           choice: "ProvideLiquidity",
           value: {
             provider: ctx.party,
-            valueIncreaseCC: formatCC(value),
-            maxCostCC: maxCost,
+            valueIncrease: formatAmount(value),
+            maxCost: maxCost,
             nowSeconds: now,
             existingLpPosition: ctx.lpPosition?.contractId ?? null,
             walletCid: ctx.walletCid,
@@ -441,14 +484,14 @@ export class QuoteService {
           throw new ApiError(409, "no_position", "no liquidity position in this market");
         if (ctx.lpPosition.lpTokens < lpTokens)
           throw new ApiError(409, "insufficient_shares", "the position holds fewer LP tokens", {
-            heldShares: formatCC(ctx.lpPosition.lpTokens),
-            requestedShares: formatCC(lpTokens),
+            heldShares: formatAmount(ctx.lpPosition.lpTokens),
+            requestedShares: formatAmount(lpTokens),
           });
         return {
           choice: "WithdrawLiquidity",
           value: {
             provider: ctx.party,
-            lpTokensToBurn: formatCC(lpTokens),
+            lpTokensToBurn: formatAmount(lpTokens),
             nowSeconds: now,
             lpPositionCid: ctx.lpPosition.contractId,
             existingPosition: ctx.position?.contractId ?? null,
@@ -475,7 +518,11 @@ export class QuoteService {
 function clampSlippage(bps: number | undefined): number {
   if (bps === undefined) return DEFAULT_SLIPPAGE_BPS;
   if (!Number.isInteger(bps) || bps < 0 || bps > MAX_SLIPPAGE_BPS)
-    throw new ApiError(400, "validation_failed", `slippageBps must be an integer in 0..${MAX_SLIPPAGE_BPS}`);
+    throw new ApiError(
+      400,
+      "validation_failed",
+      `slippageBps must be an integer in 0..${MAX_SLIPPAGE_BPS}`,
+    );
   return bps;
 }
 

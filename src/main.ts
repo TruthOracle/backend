@@ -11,6 +11,7 @@ import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import { AppModule } from "./app.module";
 import { setupHttpApp } from "./app.setup";
 import { getConfiguration } from "./config";
+import { sentryInitOptions } from "./util/sentry-options";
 import { SERVICE_NAME, SERVICE_VERSION } from "./util/version";
 
 setDefaultResultOrder("ipv4first");
@@ -24,15 +25,9 @@ try {
 
 const config = getConfiguration();
 
-// Before Nest, so bootstrap failures are reported too.
+// Before Nest, so bootstrap failures are reported too. No request bodies (SPEC §8).
 if (config.sentryDsn) {
-  Sentry.init({
-    dsn: config.sentryDsn,
-    environment: config.appEnv,
-    release: `${SERVICE_NAME}@${SERVICE_VERSION}`,
-    tracesSampleRate: 0,
-    sendDefaultPii: false,
-  });
+  Sentry.init(sentryInitOptions(config));
 }
 
 async function bootstrap(): Promise<void> {

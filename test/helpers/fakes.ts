@@ -3,22 +3,41 @@
  * registered with `overrideProvider(<RealService>).useValue(<fake>)`, so they mirror the public
  * surface other services call — not the private HTTP plumbing.
  */
+import type { InstrumentEntity } from "../../src/entities/instrument.entity";
 import type { ActiveContractEntry, LedgerTransaction } from "../../src/indexer/events";
 import type { ConsumedMessage, ConsumeHandler } from "../../src/services/nats.service";
-import { totalReceivedFrom } from "../../src/services/enterprise-wallet.service";
 import { walletCreateCommandIdFor } from "../../src/services/ledger-client.service";
 import type {
-  ApplicantSummary,
-  KycEvent,
-  KycProvider,
-  KycProviderName,
-  KycSessionResult,
-  LedgerWallet,
-  PendingPayoutRecord,
-  TransferRow, KycProviderHealth } from "../../src/types";
+  TokenAppHoldingsScan,
+  TokenAppMonitorSnapshot,
+  TokenAppParsedRecord,
+  TokenAppPostOutcome,
+} from "../../src/services/token-app.service";
+import {
+  type ApplicantSummary,
+  instrumentKey,
+  type InstrumentId,
+  type KycEvent,
+  type KycProvider,
+  type KycProviderHealth,
+  type KycProviderName,
+  type KycSessionResult,
+  type LedgerWallet,
+  type PendingPayoutRecord,
+  type RegistryChoiceContext,
+  type RegistryTransferFactory,
+  sameInstrument,
+  type TokenAppBatchRequest,
+  type TokenAppBatchResult,
+  type TokenAppCommandResult,
+  type TokenAppHolding,
+  type TokenAppMintRequest,
+  type TokenAppRecord,
+  type TokenAppStatus,
+} from "../../src/types";
 import { ApiError } from "../../src/util/errors";
 import { asString } from "../../src/util/strings";
-import { formatCC, parseCC } from "../../src/util/money";
+import { formatAmount, parseAmount } from "../../src/util/money";
 
 // ---------------------------------------------------------------------------------------------
 // NATS
@@ -107,23 +126,44 @@ export class FakeNatsService {
 // Ledger
 // ---------------------------------------------------------------------------------------------
 
+/** `<owner>|<admin>:<id>` — the fake's wallet key: one UserWallet per (owner, instrument), like the ledger. */
+export function walletKeyOf(owner: string, instrument: InstrumentId): string {
+  return `${owner}|${instrumentKey(instrument)}`;
+}
+
 /**
- * In-memory ledger (UserWallets keyed by owner, PendingPayouts by cid). Every read is recorded in
- * `reads` (`"fetchUserWallet:<party>"`, `"fetchAllUserWallets"`, `"fetchPendingPayouts"`,
+ * In-memory ledger (UserWallets keyed by owner + instrument, PendingPayouts by cid). Every read is
+ * recorded in `reads` (`"fetchUserWallet:<party>"`, `"fetchAllUserWallets"`, `"fetchPendingPayouts"`,
  * `"fetchPendingPayout:<cid>"`) so specs can assert a route never touched the ledger; `failReads`
- * makes every read throw (the ledger / its Keycloak being down).
+ * makes every read throw (the ledger / its Keycloak being down). `defaultInstrument` (the test
+ * env's collateral) is what `seedUserWallet` / `seedPendingPayout` use when a spec names none.
  */
 export class FakeLedgerClient {
-  /** owner party → active UserWallet */
+  /** `walletKeyOf(owner, instrument)` → active UserWallet */
   readonly wallets = new Map<string, LedgerWallet>();
   /** contractId → active PendingPayout */
   readonly payouts = new Map<string, PendingPayoutRecord>();
   readonly archived = new Set<string>();
+  /** How each archived PendingPayout ended — the choice and its txHash, what the indexer records (`to_ledger_payouts`). */
+  readonly payoutEnds = new Map<
+    string,
+    { record: PendingPayoutRecord; choice: string; txHash: string | null }
+  >();
   /** Every read made through this fake, in order. */
   readonly reads: string[] = [];
   /** When set, every read throws it (nothing is recorded as read); use an `ApiError(502, "upstream_failed")` to mirror the real client. */
   failReads: Error | null = null;
+  /**
+   * The ledger's transactions (createTestApp links the fake stream): what a spec pushed is on the
+   * ledger, indexed only once IndexerService.runOnce() ran — so the ledger may lead the index.
+   */
+  stream: { transactions: readonly LedgerTransaction[] } | null = null;
+  readonly defaultInstrument: InstrumentId;
   private seq = 0;
+
+  constructor(defaultInstrument: InstrumentId) {
+    this.defaultInstrument = { admin: defaultInstrument.admin, id: defaultInstrument.id };
+  }
 
   isConfigured(): boolean {
     return true;
@@ -138,8 +178,8 @@ export class FakeLedgerClient {
   }
 
   /** The real id scheme under the test package name, exactly as the real client derives it. */
-  walletCreateCommandId(owner: string): string {
-    return walletCreateCommandIdFor("truthoracle-test", owner);
+  walletCreateCommandId(owner: string, instrument: InstrumentId): string {
+    return walletCreateCommandIdFor("truthoracle-test", owner, instrument);
   }
 
   nextCid(prefix: string): string {
@@ -149,36 +189,75 @@ export class FakeLedgerClient {
 
   seedUserWallet(
     owner: string,
-    fields: { balanceCC?: bigint | string; depositedCC?: bigint | string; withdrawnCC?: bigint | string; depositRefs?: string[] } = {},
+    fields: {
+      balance?: bigint | string;
+      deposited?: bigint | string;
+      withdrawn?: bigint | string;
+      creditRefs?: string[];
+      instrument?: InstrumentId;
+      auditObservers?: string[];
+    } = {},
   ): LedgerWallet {
+    const instrument = fields.instrument ?? this.defaultInstrument;
     const wallet: LedgerWallet = {
       contractId: this.nextCid("uw"),
       owner,
-      balanceCC: parseCC(fields.balanceCC ?? 0n),
-      depositedCC: parseCC(fields.depositedCC ?? 0n),
-      withdrawnCC: parseCC(fields.withdrawnCC ?? 0n),
-      depositRefs: [...(fields.depositRefs ?? [])],
+      instrument: { admin: instrument.admin, id: instrument.id },
+      balance: parseAmount(fields.balance ?? 0n),
+      deposited: parseAmount(fields.deposited ?? 0n),
+      withdrawn: parseAmount(fields.withdrawn ?? 0n),
+      creditRefs: [...(fields.creditRefs ?? [])],
+      auditObservers: [...(fields.auditObservers ?? [])],
     };
-    this.wallets.set(owner, wallet);
+    this.wallets.set(walletKeyOf(owner, instrument), wallet);
     return wallet;
   }
 
-  seedPendingPayout(fields: { user: string; amountCC: bigint | string; reason: string; marketId?: string }): PendingPayoutRecord {
+  /** The owner's active wallet in `instrument` (the default collateral when omitted), without recording a read. */
+  walletOf(
+    owner: string,
+    instrument: InstrumentId = this.defaultInstrument,
+  ): LedgerWallet | undefined {
+    return this.wallets.get(walletKeyOf(owner, instrument));
+  }
+
+  /** Replace the owner's wallet in its instrument (a spec simulating a ledger move). */
+  setWallet(wallet: LedgerWallet): void {
+    this.wallets.set(walletKeyOf(wallet.owner, wallet.instrument), wallet);
+  }
+
+  seedPendingPayout(fields: {
+    user: string;
+    amount: bigint | string;
+    reason: string;
+    marketId?: string;
+    instrument?: InstrumentId;
+  }): PendingPayoutRecord {
+    const instrument = fields.instrument ?? this.defaultInstrument;
     const record: PendingPayoutRecord = {
       contractId: this.nextCid("pp"),
       user: fields.user,
       marketId: fields.marketId ?? "1",
-      amountCC: parseCC(fields.amountCC),
+      instrument: { admin: instrument.admin, id: instrument.id },
+      amount: parseAmount(fields.amount),
       reason: fields.reason,
       createdAt: new Date(),
+      auditObservers: [],
     };
     this.payouts.set(record.contractId, record);
     return record;
   }
 
-  archivePayout(cid: string): void {
+  /** Archive a PendingPayout; `end` names the choice (default: the user's CancelPayout). */
+  archivePayout(
+    cid: string,
+    end: { choice: string; txHash?: string | null } = { choice: "CancelPayout" },
+  ): void {
+    const record = this.payouts.get(cid);
     this.payouts.delete(cid);
     this.archived.add(cid);
+    if (record)
+      this.payoutEnds.set(cid, { record, choice: end.choice, txHash: end.txHash ?? null });
   }
 
   walletByCid(cid: string): LedgerWallet | null {
@@ -188,7 +267,9 @@ export class FakeLedgerClient {
 
   /** Reads made to `fetchUserWallet`, as owner parties. */
   fetchUserWalletCalls(): string[] {
-    return this.reads.filter((r) => r.startsWith("fetchUserWallet:")).map((r) => r.slice("fetchUserWallet:".length));
+    return this.reads
+      .filter((r) => r.startsWith("fetchUserWallet:"))
+      .map((r) => r.slice("fetchUserWallet:".length));
   }
 
   private read(what: string): void {
@@ -196,15 +277,25 @@ export class FakeLedgerClient {
     this.reads.push(what);
   }
 
-  async fetchUserWallet(ownerParty: string): Promise<LedgerWallet | null> {
+  async fetchUserWallet(
+    ownerParty: string,
+    instrument: InstrumentId,
+  ): Promise<LedgerWallet | null> {
     this.read(`fetchUserWallet:${ownerParty}`);
-    const w = this.wallets.get(ownerParty);
-    return w ? { ...w, depositRefs: [...w.depositRefs] } : null;
+    const w = this.wallets.get(walletKeyOf(ownerParty, instrument));
+    return w ? { ...w, creditRefs: [...w.creditRefs] } : null;
+  }
+
+  async fetchUserWallets(ownerParty: string): Promise<LedgerWallet[]> {
+    this.read(`fetchUserWallets:${ownerParty}`);
+    return [...this.wallets.values()]
+      .filter((w) => w.owner === ownerParty)
+      .map((w) => ({ ...w, creditRefs: [...w.creditRefs] }));
   }
 
   async fetchAllUserWallets(): Promise<LedgerWallet[]> {
     this.read("fetchAllUserWallets");
-    return [...this.wallets.values()].map((w) => ({ ...w, depositRefs: [...w.depositRefs] }));
+    return [...this.wallets.values()].map((w) => ({ ...w, creditRefs: [...w.creditRefs] }));
   }
 
   async fetchPendingPayouts(): Promise<PendingPayoutRecord[]> {
@@ -218,18 +309,51 @@ export class FakeLedgerClient {
     return p ? { ...p } : null;
   }
 
-  async activeContracts(_party: string, entity: string): Promise<{ contractId: string; payload: Record<string, unknown> }[]> {
+  /** The active PredictionMarket contracts of `marketId` on the ledger (the linked stream's transactions). */
+  async fetchMarketContracts(marketId: string): Promise<string[]> {
+    this.read(`fetchMarketContracts:${marketId}`);
+    const live = new Map<string, Record<string, unknown>>();
+    for (const tx of [...(this.stream?.transactions ?? [])].sort((a, b) => a.offset - b.offset))
+      for (const e of tx.events) {
+        if (e.kind === "created" && e.entity === "PredictionMarket")
+          live.set(e.contractId, e.createArgument);
+        else if (e.kind === "exercised" && e.consuming) live.delete(e.contractId);
+      }
+    return [...live.entries()]
+      .filter(([, payload]) => asString(payload.marketId) === marketId)
+      .map(([cid]) => cid);
+  }
+
+  async activeContracts(
+    _party: string,
+    entity: string,
+  ): Promise<{ contractId: string; payload: Record<string, unknown> }[]> {
     this.read(`activeContracts:${entity}`);
     if (entity === "UserWallet") {
       return [...this.wallets.values()].map((w) => ({
         contractId: w.contractId,
-        payload: { owner: w.owner, balanceCC: formatCC(w.balanceCC), depositedCC: formatCC(w.depositedCC), withdrawnCC: formatCC(w.withdrawnCC), depositRefs: w.depositRefs },
+        payload: {
+          owner: w.owner,
+          instrument: { admin: w.instrument.admin, id: w.instrument.id },
+          balance: formatAmount(w.balance),
+          deposited: formatAmount(w.deposited),
+          withdrawn: formatAmount(w.withdrawn),
+          creditRefs: w.creditRefs,
+          auditObservers: w.auditObservers,
+        },
       }));
     }
     if (entity === "PendingPayout") {
       return [...this.payouts.values()].map((p) => ({
         contractId: p.contractId,
-        payload: { user: p.user, marketId: p.marketId, amountCC: formatCC(p.amountCC), reason: p.reason },
+        payload: {
+          user: p.user,
+          marketId: p.marketId,
+          instrument: { admin: p.instrument.admin, id: p.instrument.id },
+          amount: formatAmount(p.amount),
+          reason: p.reason,
+          auditObservers: p.auditObservers,
+        },
       }));
     }
     return [];
@@ -239,6 +363,7 @@ export class FakeLedgerClient {
     this.wallets.clear();
     this.payouts.clear();
     this.archived.clear();
+    this.payoutEnds.clear();
     this.reads.length = 0;
     this.failReads = null;
     this.seq = 0;
@@ -249,16 +374,37 @@ export class FakeLedgerClient {
 // Enterprise Wallet
 // ---------------------------------------------------------------------------------------------
 
-const NEVER_HAPPENED = new Set(["failed", "rejected", "error", "cancelled", "canceled", "not_found", "notfound"]);
+const NEVER_HAPPENED = new Set([
+  "failed",
+  "rejected",
+  "error",
+  "cancelled",
+  "canceled",
+  "not_found",
+  "notfound",
+]);
+/** The command index's failure statuses, as EnterpriseWalletService reads them (timeouts included). */
+const COMMAND_FAILED = new Set([
+  "failed",
+  "rejected",
+  "error",
+  "cancelled",
+  "canceled",
+  "aborted",
+  "timeout",
+  "timed_out",
+]);
 
 export interface RecordedSubmit {
   commandId: string;
   commands: unknown[];
+  disclosedContracts: unknown[];
 }
 
 export interface RecordedTransfer {
   to: string;
-  amountCC: bigint;
+  instrumentId: string;
+  amount: bigint;
   reason: string;
   commandId: string;
   metadata?: Record<string, string>;
@@ -267,16 +413,20 @@ export interface RecordedTransfer {
 /**
  * Applies treasury-signed commands to the FakeLedgerClient the way the real ledger would
  * (Deposit / Create UserWallet / SettleToWallet / MarkPaid), records every submit and transfer,
- * and dedups on commandId. Two status books mirror the real wallet: `statuses` is the TRANSFER
- * index (`/api/v1/transfer/{party}/{commandId}` — only `transfer()` ids live there) and
+ * and dedups on commandId. Token-standard exercises (`TransferFactory_Transfer`,
+ * `TransferInstruction_Accept`, the factory setup choices) are recorded without being applied:
+ * the tokens they move reach the index through FakeLedgerStream, never through this fake. Two
+ * status books mirror the real wallet: `statuses` is the TRANSFER index
+ * (`/api/v1/transfer/{party}/{commandId}` — only `transfer()` ids live there) and
  * `commandStatuses` the COMMAND index (`/api/v1/command/{party}/{commandId}` — external submits).
  * Toggles: `statusReadsFail` (both reads fail), `unknownCommandIds` (the command index answers
  * 404 for everything, the "not wired through" wallet), `lagLedger` (submits are accepted and
  * recorded but the ledger does not move until `applyPending()`; `rejectPending()` instead marks
- * them failed, the ledger-rejected-after-accept case).
+ * them failed, the ledger-rejected-after-accept case). There is no history: deposits are read
+ * from the ledger index (docs/TOKENS.md §2 decision 5), so specs push transfers through
+ * FakeLedgerStream and run the indexer.
  */
 export class FakeEnterpriseWallet {
-  readonly rows: TransferRow[] = [];
   readonly submits: RecordedSubmit[] = [];
   readonly transfers: RecordedTransfer[] = [];
   /** Transfer index: `transfer()` command ids only. */
@@ -288,8 +438,14 @@ export class FakeEnterpriseWallet {
   lagLedger = false;
   /** Set to make the next externalSubmit / transfer throw (then cleared). */
   failNext: Error | null = null;
+  /**
+   * Set to have the ledger reject the next externalSubmit the wallet accepted (then cleared): it
+   * answers `submitted`, applies nothing, and its status reads FAILED with this reason.
+   */
+  rejectNext: string | null = null;
+  /** A failed command's reason, as the command index reports it. */
+  readonly commandReasons = new Map<string, string>();
   private readonly pending: RecordedSubmit[] = [];
-  private tick = 0;
 
   constructor(
     readonly ledger: FakeLedgerClient,
@@ -300,50 +456,55 @@ export class FakeEnterpriseWallet {
     return true;
   }
 
-  seedInbound(fromParty: string, amountCC: bigint | string, status = "completed", extra: Partial<TransferRow> = {}): TransferRow {
-    this.tick += 1;
-    const row: TransferRow = {
-      instrumentId: "Amulet",
-      status,
-      direction: "in",
-      partyId: this.treasury,
-      partyId2: fromParty,
-      amount: formatCC(parseCC(amountCC)),
-      timestamp: new Date(Date.UTC(2026, 0, 1) + this.tick * 1000).toISOString(),
-      ...extra,
-    };
-    this.rows.unshift(row);
-    return row;
-  }
-
-  async transferHistory(partyId: string): Promise<TransferRow[]> {
-    return this.rows.filter((r) => r.partyId === partyId || r.partyId2 === partyId).map((r) => ({ ...r }));
-  }
-
-  totalReceivedFrom(rows: TransferRow[], partyId: string, counterparty: string): bigint {
-    return totalReceivedFrom(rows, partyId, counterparty);
-  }
-
-  async transferStatus(_partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
+  async transferStatus(
+    _partyId: string,
+    commandId: string,
+  ): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
     if (this.statusReadsFail) return { known: false, submitted: false, status: null };
     const status = this.statuses.get(commandId);
     if (status === undefined) return { known: true, submitted: false, status: "not_found" };
     return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
   }
 
-  async commandStatus(_partyId: string, commandId: string): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
+  async commandStatus(
+    _partyId: string,
+    commandId: string,
+  ): Promise<{ known: boolean; submitted: boolean; status: string | null }> {
     if (this.statusReadsFail) return { known: false, submitted: false, status: null };
     const status = this.unknownCommandIds ? undefined : this.commandStatuses.get(commandId);
     if (status === undefined) return { known: false, submitted: false, status: "not_found" };
-    return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
+    const reason = this.commandReasons.get(commandId);
+    return {
+      known: true,
+      submitted: !COMMAND_FAILED.has(status),
+      status,
+      ...(reason ? { reason } : {}),
+    };
   }
 
-  async externalSubmit(args: { commandId: string; commands: unknown[]; disclosedContracts?: unknown[] }): Promise<{ commandId: string; status: string }> {
+  async externalSubmit(args: {
+    commandId: string;
+    commands: unknown[];
+    disclosedContracts?: unknown[];
+  }): Promise<{ commandId: string; status: string }> {
     this.consumeFailNext();
     if (this.commandStatuses.has(args.commandId)) {
-      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, { upstreamStatus: 409 });
+      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, {
+        upstreamStatus: 409,
+      });
     }
-    const submit = { commandId: args.commandId, commands: args.commands };
+    const submit = {
+      commandId: args.commandId,
+      commands: args.commands,
+      disclosedContracts: args.disclosedContracts ?? [],
+    };
+    if (this.rejectNext !== null) {
+      this.submits.push(submit);
+      this.commandStatuses.set(args.commandId, "failed");
+      this.commandReasons.set(args.commandId, this.rejectNext);
+      this.rejectNext = null;
+      return { commandId: args.commandId, status: "submitted" };
+    }
     if (this.lagLedger) {
       this.submits.push(submit);
       this.pending.push(submit);
@@ -370,32 +531,30 @@ export class FakeEnterpriseWallet {
 
   /** `lagLedger`: the ledger rejects every accepted command (stale contract id, assertion) — nothing lands. */
   rejectPending(): void {
-    for (const submit of this.pending.splice(0)) this.commandStatuses.set(submit.commandId, "failed");
+    for (const submit of this.pending.splice(0))
+      this.commandStatuses.set(submit.commandId, "failed");
   }
 
-  async transfer(args: { to: string; amountCC: bigint; reason: string; commandId: string; metadata?: Record<string, string> }): Promise<{ commandId: string; status: string }> {
+  async transfer(args: {
+    to: string;
+    instrumentId: string;
+    amount: bigint;
+    reason: string;
+    commandId: string;
+    metadata?: Record<string, string>;
+  }): Promise<{ commandId: string; status: string }> {
     this.consumeFailNext();
     if (this.statuses.has(args.commandId)) {
-      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, { upstreamStatus: 409 });
+      throw new ApiError(502, "upstream_failed", `DUPLICATE_COMMAND ${args.commandId}`, {
+        upstreamStatus: 409,
+      });
     }
     this.transfers.push({ ...args });
     this.statuses.set(args.commandId, "completed");
-    this.tick += 1;
-    this.rows.unshift({
-      instrumentId: "Amulet",
-      status: "completed",
-      direction: "out",
-      partyId: this.treasury,
-      partyId2: args.to,
-      amount: formatCC(args.amountCC),
-      commandId: args.commandId,
-      timestamp: new Date(Date.UTC(2026, 0, 1) + this.tick * 1000).toISOString(),
-    });
     return { commandId: args.commandId, status: "completed" };
   }
 
   reset(): void {
-    this.rows.length = 0;
     this.submits.length = 0;
     this.transfers.length = 0;
     this.pending.length = 0;
@@ -405,7 +564,8 @@ export class FakeEnterpriseWallet {
     this.unknownCommandIds = false;
     this.lagLedger = false;
     this.failNext = null;
-    this.tick = 0;
+    this.rejectNext = null;
+    this.commandReasons.clear();
   }
 
   private consumeFailNext(): void {
@@ -419,41 +579,73 @@ export class FakeEnterpriseWallet {
   private apply(command: unknown): void {
     const c = command as {
       CreateCommand?: { templateId: string; createArguments: Record<string, unknown> };
-      ExerciseCommand?: { templateId: string; contractId: string; choice: string; choiceArgument: Record<string, unknown> };
+      ExerciseCommand?: {
+        templateId: string;
+        contractId: string;
+        choice: string;
+        choiceArgument: Record<string, unknown>;
+      };
     };
     if (c.CreateCommand) {
       const { templateId, createArguments: a } = c.CreateCommand;
-      if (!templateId.endsWith(":UserWallet")) throw new Error(`fake ledger: cannot create ${templateId}`);
+      if (!templateId.endsWith(":UserWallet"))
+        throw new Error(`fake ledger: cannot create ${templateId}`);
       const owner = asString(a.owner);
-      if (this.ledger.wallets.has(owner)) throw new Error(`fake ledger: UserWallet already exists for ${owner}`);
-      // `depositRefs : [Text]` is mandatory on truthoracle-v16: the real ledger rejects a Create without it.
-      if (!Array.isArray(a.depositRefs)) throw new Error("fake ledger: UserWallet.depositRefs is mandatory (missing or not a list)");
+      // `instrument : InstrumentId`, `creditRefs : [Text]` and `auditObservers : [Party]` are mandatory
+      // on truthoracle-v17: the real ledger rejects a Create without them.
+      const inst = (a.instrument ?? {}) as { admin?: unknown; id?: unknown };
+      if (!asString(inst.admin) || !asString(inst.id))
+        throw new Error("fake ledger: UserWallet.instrument is mandatory ({ admin, id })");
+      if (!Array.isArray(a.creditRefs))
+        throw new Error("fake ledger: UserWallet.creditRefs is mandatory (missing or not a list)");
+      if (!Array.isArray(a.auditObservers))
+        throw new Error(
+          "fake ledger: UserWallet.auditObservers is mandatory (missing or not a list)",
+        );
+      const instrument: InstrumentId = { admin: asString(inst.admin), id: asString(inst.id) };
+      if (this.ledger.walletOf(owner, instrument))
+        throw new Error(`fake ledger: UserWallet already exists for ${owner} in ${instrument.id}`);
       this.ledger.seedUserWallet(owner, {
-        balanceCC: asString(a.balanceCC, "0"),
-        depositedCC: asString(a.depositedCC, "0"),
-        withdrawnCC: asString(a.withdrawnCC, "0"),
-        depositRefs: a.depositRefs.map(String),
+        instrument,
+        balance: asString(a.balance, "0"),
+        deposited: asString(a.deposited, "0"),
+        withdrawn: asString(a.withdrawn, "0"),
+        creditRefs: a.creditRefs.map(String),
+        auditObservers: a.auditObservers.map(String),
       });
       return;
     }
     if (c.ExerciseCommand) {
-      const { contractId, choice, choiceArgument: arg } = c.ExerciseCommand;
-      if (choice === "Deposit") {
+      const { templateId, contractId, choice, choiceArgument: arg } = c.ExerciseCommand;
+      if (!templateId.includes(":Truthoracle:")) {
+        // An exercise on another package's contract — a token-standard interface choice
+        // (TransferFactory_Transfer, TransferInstruction_Accept) or a token factory's setup
+        // choice (docs/TOKENS.md §4.4): the tokens it moves reach the index through
+        // FakeLedgerStream; the fake wallet only records the accepted command for the spec.
+        return;
+      }
+      if (choice === "Deposit" || choice === "Grant") {
         const wallet = this.ledger.walletByCid(contractId);
         if (!wallet) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
-        const amount = parseCC(asString(arg.amountCC, "0"));
-        this.ledger.wallets.set(wallet.owner, {
+        const amount = parseAmount(asString(arg.amount, "0"));
+        const ref = asString(choice === "Deposit" ? arg.txRef : arg.ref);
+        // The Daml refuses a repeated ref — the idempotency the confirm passes key on.
+        if (wallet.creditRefs.includes(ref))
+          throw new Error(`fake ledger: ${choice} ref already credited (${ref})`);
+        this.ledger.setWallet({
           ...wallet,
           contractId: this.ledger.nextCid("uw"),
-          balanceCC: wallet.balanceCC + amount,
-          depositedCC: wallet.depositedCC + amount,
-          depositRefs: [...wallet.depositRefs, asString(arg.txRef)],
+          balance: wallet.balance + amount,
+          // Grant bumps the balance only; Deposit also counts toward lifetime deposits.
+          deposited: choice === "Deposit" ? wallet.deposited + amount : wallet.deposited,
+          creditRefs: [...wallet.creditRefs, ref],
         });
         return;
       }
       if (choice === "MarkPaid") {
-        if (!this.ledger.payouts.has(contractId)) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
-        this.ledger.archivePayout(contractId);
+        if (!this.ledger.payouts.has(contractId))
+          throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
+        this.ledger.archivePayout(contractId, { choice, txHash: asString(arg.txHash) || null });
         return;
       }
       if (choice === "SettleToWallet") {
@@ -461,13 +653,25 @@ export class FakeEnterpriseWallet {
         if (!payout) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
         const wallet = this.ledger.walletByCid(asString(arg.walletCid));
         if (!wallet) throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${asString(arg.walletCid)}`);
-        this.ledger.wallets.set(wallet.owner, { ...wallet, contractId: this.ledger.nextCid("uw"), balanceCC: wallet.balanceCC + payout.amountCC });
-        this.ledger.archivePayout(contractId);
+        // v17 asserts `wallet.instrument == payout.instrument`: a bond cannot land in another token's wallet.
+        if (!sameInstrument(wallet.instrument, payout.instrument))
+          throw new Error("fake ledger: wallet holds a different instrument than the payout");
+        this.ledger.setWallet({
+          ...wallet,
+          contractId: this.ledger.nextCid("uw"),
+          balance: wallet.balance + payout.amount,
+        });
+        this.ledger.archivePayout(contractId, { choice });
         return;
       }
       if (choice === "CreateMarket") {
         // The market itself reaches the index through FakeLedgerStream (docs/MARKETS.md §4); the
         // fake wallet only records that the treasury accepted the exercise.
+        return;
+      }
+      if (choice === "ResolveT0" || choice === "Resolve" || choice === "VoidMarket") {
+        // review F0 (market.resolve): recorded only, like CreateMarket — a spec that needs the
+        // resolved market pushes the successor version through FakeLedgerStream.
         return;
       }
       throw new Error(`fake ledger: unsupported choice ${choice}`);
@@ -498,13 +702,27 @@ export class FakeKycProvider implements KycProvider {
   }
 
   async healthCheck(): Promise<KycProviderHealth> {
-    return { ok: this.configured, message: this.configured ? "fake provider" : "fake provider unconfigured", upstreamStatus: null, checkedAt: new Date().toISOString(), details: {} };
+    return {
+      ok: this.configured,
+      message: this.configured ? "fake provider" : "fake provider unconfigured",
+      upstreamStatus: null,
+      checkedAt: new Date().toISOString(),
+      details: {},
+    };
   }
 
-  async createSession(user: { id: string }, applicantId: string | null, level: string): Promise<KycSessionResult> {
+  async createSession(
+    user: { id: string },
+    applicantId: string | null,
+    level: string,
+  ): Promise<KycSessionResult> {
     this.seq += 1;
     this.sessions.push({ userId: user.id, applicantId, level });
-    return { accessToken: `fake-token-${this.seq}`, expiresAt: new Date(Date.now() + 600_000), applicantId: applicantId ?? `applicant-${user.id}` };
+    return {
+      accessToken: `fake-token-${this.seq}`,
+      expiresAt: new Date(Date.now() + 600_000),
+      applicantId: applicantId ?? `applicant-${user.id}`,
+    };
   }
 
   verifyWebhook(): KycEvent | null {
@@ -557,10 +775,6 @@ export class FakeLedgerStream {
     return this.configured;
   }
 
-  get updatesEndpoint(): "updates" | "trees" {
-    return "updates";
-  }
-
   push(...txs: LedgerTransaction[]): void {
     this.transactions.push(...txs);
     this.transactions.sort((a, b) => a.offset - b.offset);
@@ -569,7 +783,9 @@ export class FakeLedgerStream {
   async ledgerEnd(): Promise<number> {
     this.calls.push("ledgerEnd");
     if (this.end !== null) return this.end;
-    return this.transactions.length > 0 ? this.transactions[this.transactions.length - 1].offset : 0;
+    return this.transactions.length > 0
+      ? this.transactions[this.transactions.length - 1].offset
+      : 0;
   }
 
   async prunedOffset(): Promise<number> {
@@ -610,5 +826,346 @@ export class FakeLedgerStream {
     this.acsAt = null;
     this.calls.length = 0;
     this.failNext = null;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Token registry (CIP-56 off-ledger API)
+// ---------------------------------------------------------------------------------------------
+
+export interface RecordedRegistryCall {
+  instrument: string;
+  kind: "transferFactory" | "accept" | "reject" | "withdraw";
+  /** The choice argument of a transfer-factory lookup, the instruction cid otherwise. */
+  input: unknown;
+}
+
+/**
+ * In-memory stand-in for TokenRegistryService: every lookup answers a canned factory / context
+ * whose disclosed contracts name the factory with a concrete template (`factoryTemplateId`), and
+ * is recorded in `calls`. `failNext` makes the next call throw (a registry down or refusing the
+ * client). A fake registry is configured for every instrument that has a registry URL.
+ */
+export class FakeTokenRegistry {
+  readonly calls: RecordedRegistryCall[] = [];
+  factoryId = "00factory0001";
+  factoryTemplateId = "tokenpkg:TruthOracle.CBYN.Factory:CbynFactory";
+  transferKind = "direct";
+  failNext: Error | null = null;
+
+  isConfigured(instrument: InstrumentEntity): boolean {
+    return Boolean(instrument.registryUrl);
+  }
+
+  private context(): RegistryChoiceContext {
+    return {
+      choiceContextData: {
+        values: { tokenConfigCid: { tag: "AV_ContractId", value: "00tokenconfig0001" } },
+      },
+      disclosedContracts: [
+        {
+          templateId: this.factoryTemplateId,
+          contractId: this.factoryId,
+          createdEventBlob: "blob-factory",
+          synchronizerId: "sync::test",
+        },
+        {
+          templateId: "tokenpkg:Cantor8.Token.TokenConfig:TokenConfig",
+          contractId: "00tokenconfig0001",
+          createdEventBlob: "blob-config",
+          synchronizerId: "sync::test",
+        },
+      ],
+    };
+  }
+
+  private consumeFailNext(): void {
+    if (this.failNext) {
+      const err = this.failNext;
+      this.failNext = null;
+      throw err;
+    }
+  }
+
+  async transferFactory(
+    instrument: InstrumentEntity,
+    choiceArguments: Record<string, unknown>,
+  ): Promise<RegistryTransferFactory> {
+    this.consumeFailNext();
+    this.calls.push({ instrument: instrument.id, kind: "transferFactory", input: choiceArguments });
+    return {
+      factoryId: this.factoryId,
+      transferKind: this.transferKind,
+      choiceContext: this.context(),
+    };
+  }
+
+  async acceptContext(instrument: InstrumentEntity, cid: string): Promise<RegistryChoiceContext> {
+    this.consumeFailNext();
+    this.calls.push({ instrument: instrument.id, kind: "accept", input: cid });
+    return this.context();
+  }
+
+  async rejectContext(instrument: InstrumentEntity, cid: string): Promise<RegistryChoiceContext> {
+    this.consumeFailNext();
+    this.calls.push({ instrument: instrument.id, kind: "reject", input: cid });
+    return this.context();
+  }
+
+  async withdrawContext(instrument: InstrumentEntity, cid: string): Promise<RegistryChoiceContext> {
+    this.consumeFailNext();
+    this.calls.push({ instrument: instrument.id, kind: "withdraw", input: cid });
+    return this.context();
+  }
+
+  reset(): void {
+    this.calls.length = 0;
+    this.failNext = null;
+    this.factoryId = "00factory0001";
+    this.factoryTemplateId = "tokenpkg:TruthOracle.CBYN.Factory:CbynFactory";
+    this.transferKind = "direct";
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// token-app (Cantor8 mint / burn)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * In-memory stand-in for TokenAppService (docs/TOKENS.md §4.4, §4.7): every mint / burn is
+ * recorded (`minted` / `burned`) and answered `submitted`; nothing reaches the ledger index — a
+ * spec that needs the minted holding to show up pushes it through FakeLedgerStream, exactly as
+ * the real token-app's mint would arrive. `configured = false` makes every command answer
+ * `503 token_app_unconfigured` (and `status()` report it); `failNext` makes the next command
+ * throw (token-app down).
+ */
+export class FakeTokenApp {
+  configured = true;
+  reachable = true;
+  readonly minted: TokenAppMintRequest[] = [];
+  readonly burned: TokenAppMintRequest[] = [];
+  failNext: Error | null = null;
+  // ── command ledger + sync (docs/RAMP.md §7) ──
+  /** The next `postCommand` answers this; `lands` says whether token-app records it anyway (a lost answer). */
+  nextPost: { outcome: TokenAppPostOutcome; lands: boolean } | null = null;
+  /** Records token-app holds beyond what was posted here (unknown / duplicate / mismatch scenarios). */
+  readonly extraRecords: TokenAppParsedRecord[] = [];
+  /** Posted command ids token-app has not recorded (yet). */
+  readonly unrecorded = new Set<string>();
+  /** `/status`: total supply of every instrument (null = the net of its records) and the monitor's last success. */
+  statusSupply: bigint | null = null;
+  monitorLastSuccessAt: Date | null = null;
+  private readonly postedAt = new Map<string, Date>();
+
+  isConfigured(): boolean {
+    return this.configured;
+  }
+
+  async mint(req: TokenAppMintRequest): Promise<TokenAppCommandResult> {
+    this.ensure();
+    this.minted.push({ ...req });
+    return { commandId: req.commandId, status: "submitted", raw: { command_id: req.commandId } };
+  }
+
+  async burn(req: TokenAppMintRequest): Promise<TokenAppCommandResult> {
+    this.ensure();
+    this.burned.push({ ...req });
+    return { commandId: req.commandId, status: "submitted", raw: { command_id: req.commandId } };
+  }
+
+  async mintBatch(req: TokenAppBatchRequest): Promise<TokenAppBatchResult> {
+    this.ensure();
+    for (const e of req.entries) this.minted.push(this.entryOf(req, e));
+    return {
+      commandId: req.commandId,
+      status: "submitted",
+      entryCount: req.entries.length,
+      raw: {},
+    };
+  }
+
+  async burnBatch(req: TokenAppBatchRequest): Promise<TokenAppBatchResult> {
+    this.ensure();
+    for (const e of req.entries) this.burned.push(this.entryOf(req, e));
+    return {
+      commandId: req.commandId,
+      status: "submitted",
+      entryCount: req.entries.length,
+      raw: {},
+    };
+  }
+
+  async status(): Promise<TokenAppStatus> {
+    const up = this.configured && this.reachable;
+    return {
+      configured: this.configured,
+      url: this.configured ? "http://token-app.fake" : null,
+      appName: "truthoracle",
+      reachable: up,
+      raw: up ? { tokens: [], mints: this.minted.length, burns: this.burned.length } : null,
+    };
+  }
+
+  async holdings(): Promise<TokenAppHolding[]> {
+    this.ensure();
+    return [];
+  }
+
+  async postCommand(kind: "mint" | "burn", req: TokenAppMintRequest): Promise<TokenAppPostOutcome> {
+    if (!this.configured)
+      return {
+        outcome: "not_sent",
+        httpStatus: 0,
+        status: null,
+        code: "token_app_unconfigured",
+        message: "token-app is not configured",
+      };
+    let next = this.nextPost ?? {
+      outcome: {
+        outcome: "accepted",
+        httpStatus: 200,
+        status: "submitted",
+        code: null,
+        message: null,
+      },
+      lands: true,
+    };
+    this.nextPost = null;
+    if (this.failNext) {
+      next = {
+        outcome: {
+          outcome: "unknown",
+          httpStatus: 0,
+          status: null,
+          code: "upstream_failed",
+          message: this.failNext.message,
+        },
+        lands: false,
+      };
+      this.failNext = null;
+    }
+    if (next.lands) {
+      (kind === "mint" ? this.minted : this.burned).push({ ...req });
+      this.postedAt.set(`${kind}|${req.commandId}`, new Date());
+    }
+    return next.outcome;
+  }
+
+  async listRecords(
+    kind: "mint" | "burn",
+    filter: { instrumentId: string; partyId?: string },
+  ): Promise<TokenAppParsedRecord[]> {
+    this.ensure();
+    const posted = (kind === "mint" ? this.minted : this.burned)
+      .filter((m) => !this.unrecorded.has(m.commandId))
+      .map((m): TokenAppParsedRecord => ({
+        kind,
+        commandId: m.commandId,
+        updateId: `update-${m.commandId}`,
+        partyId: m.partyId,
+        instrumentId: m.instrumentId,
+        amount: m.amount,
+        createdAt: this.postedAt.get(`${kind}|${m.commandId}`) ?? new Date(0),
+      }));
+    return [...posted, ...this.extraRecords.filter((r) => r.kind === kind)].filter(
+      (r) =>
+        r.instrumentId === filter.instrumentId && (!filter.partyId || r.partyId === filter.partyId),
+    );
+  }
+
+  async monitor(instrumentId: string): Promise<TokenAppMonitorSnapshot> {
+    this.ensure();
+    const [mints, burns] = [
+      await this.listRecords("mint", { instrumentId }),
+      await this.listRecords("burn", { instrumentId }),
+    ];
+    const net = mints.reduce((s, r) => s + r.amount, 0n) - burns.reduce((s, r) => s + r.amount, 0n);
+    const now = new Date();
+    return {
+      updatedAt: now,
+      token: {
+        totalSupply: this.statusSupply ?? net,
+        totalLockedSupply: 0n,
+        uniqueHolders: null,
+        updatedAt: now,
+      },
+      monitor: {
+        lastSuccessAt: this.monitorLastSuccessAt ?? now,
+        ageSeconds: 5,
+        pollIntervalSeconds: 60,
+        monitoringEnabled: true,
+      },
+    };
+  }
+
+  async holdingsScan(): Promise<TokenAppHoldingsScan> {
+    this.ensure();
+    return { scannedAt: new Date(), total: 0, holdings: [] };
+  }
+
+  async health(): Promise<{ ok: boolean; httpStatus: number }> {
+    return { ok: this.reachable, httpStatus: this.reachable ? 200 : 0 };
+  }
+
+  async mints(): Promise<TokenAppRecord[]> {
+    this.ensure();
+    return this.minted.map((m) => this.recordOf(m));
+  }
+
+  async burns(): Promise<TokenAppRecord[]> {
+    this.ensure();
+    return this.burned.map((m) => this.recordOf(m));
+  }
+
+  reset(): void {
+    this.configured = true;
+    this.reachable = true;
+    this.minted.length = 0;
+    this.burned.length = 0;
+    this.failNext = null;
+    this.nextPost = null;
+    this.extraRecords.length = 0;
+    this.unrecorded.clear();
+    this.statusSupply = null;
+    this.monitorLastSuccessAt = null;
+    this.postedAt.clear();
+  }
+
+  private entryOf(
+    req: TokenAppBatchRequest,
+    e: TokenAppBatchRequest["entries"][number],
+  ): TokenAppMintRequest {
+    return {
+      commandId: req.commandId,
+      instrumentId: req.instrumentId,
+      partyId: e.partyId,
+      amount: e.amount,
+      decimals: req.decimals,
+    };
+  }
+
+  private recordOf(m: TokenAppMintRequest): TokenAppRecord {
+    return {
+      commandId: m.commandId,
+      partyId: m.partyId,
+      instrumentId: m.instrumentId,
+      amount: formatAmount(m.amount),
+      updateId: `update-${m.commandId}`,
+      createdAt: new Date(0).toISOString(),
+    };
+  }
+
+  private ensure(): void {
+    if (!this.configured)
+      throw new ApiError(
+        503,
+        "token_app_unconfigured",
+        "token-app is not configured (TOKEN_APP_URL and its Keycloak client)",
+      );
+    if (this.failNext) {
+      const err = this.failNext;
+      this.failNext = null;
+      throw err;
+    }
   }
 }

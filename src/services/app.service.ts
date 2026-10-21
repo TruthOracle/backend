@@ -1,8 +1,17 @@
-import { Injectable, Logger, type BeforeApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+  Injectable,
+  Logger,
+  type BeforeApplicationShutdown,
+  type OnModuleInit,
+} from "@nestjs/common";
 import { DataSource } from "typeorm";
 
 import { Config } from "../config";
-import { SETTING_APP_NETWORK, SETTING_KYC_PEPPER_HASH, SettingEntity } from "../entities/setting.entity";
+import {
+  SETTING_APP_NETWORK,
+  SETTING_KYC_PEPPER_HASH,
+  SettingEntity,
+} from "../entities/setting.entity";
 import type { CheckState, HealthResponse, ReadinessResponse } from "../types";
 import { SERVICE_NAME, SERVICE_VERSION } from "../util/version";
 import { NatsService } from "./nats.service";
@@ -46,7 +55,9 @@ export class AppService implements OnModuleInit, BeforeApplicationShutdown {
    */
   private warnWithoutSignInProvider(): void {
     if (this.config.googleClientIds.length > 0 || this.config.telegramBotToken) return;
-    this.logger.warn("no sign-in provider is configured (GOOGLE_CLIENT_IDS / TELEGRAM_BOT_TOKEN): nobody can create an account, so nobody can deposit or trade");
+    this.logger.warn(
+      "no sign-in provider is configured (GOOGLE_CLIENT_IDS / TELEGRAM_BOT_TOKEN): nobody can create an account, so nobody can deposit or trade",
+    );
   }
 
   /** The load balancer must stop routing here while the HTTP server drains (§14). */
@@ -62,10 +73,15 @@ export class AppService implements OnModuleInit, BeforeApplicationShutdown {
       await runner.query("SELECT pg_advisory_lock($1)", [MIGRATION_ADVISORY_LOCK_KEY.toString()]);
       try {
         const applied = await this.dataSource.runMigrations({ transaction: "all" });
-        if (applied.length > 0) this.logger.log(`applied ${applied.length} migration(s): ${applied.map((m) => m.name).join(", ")}`);
+        if (applied.length > 0)
+          this.logger.log(
+            `applied ${applied.length} migration(s): ${applied.map((m) => m.name).join(", ")}`,
+          );
         return applied.length;
       } finally {
-        await runner.query("SELECT pg_advisory_unlock($1)", [MIGRATION_ADVISORY_LOCK_KEY.toString()]);
+        await runner.query("SELECT pg_advisory_unlock($1)", [
+          MIGRATION_ADVISORY_LOCK_KEY.toString(),
+        ]);
       }
     } finally {
       await runner.release();
@@ -94,7 +110,9 @@ export class AppService implements OnModuleInit, BeforeApplicationShutdown {
     }
     if (stored.value === expected) return;
     if (this.config.kycPepperRotationAck === expected) {
-      await this.dataSource.getRepository(SettingEntity).update({ key: SETTING_KYC_PEPPER_HASH }, { value: expected });
+      await this.dataSource
+        .getRepository(SettingEntity)
+        .update({ key: SETTING_KYC_PEPPER_HASH }, { value: expected });
       this.logger.warn(
         "KYC_FINGERPRINT_PEPPER rotated (acknowledged by KYC_PEPPER_ROTATION_ACK). Existing to_kyc_persons bindings were built with the OLD pepper — recompute them per docs/RUNBOOK.md and then unset the ack.",
       );
@@ -110,7 +128,10 @@ export class AppService implements OnModuleInit, BeforeApplicationShutdown {
    * table both get the row one of them wrote (and compare against it) instead of one dying on a
    * raw primary-key violation.
    */
-  private async settingOrInit(key: string, value: string): Promise<{ value: string; initialised: boolean }> {
+  private async settingOrInit(
+    key: string,
+    value: string,
+  ): Promise<{ value: string; initialised: boolean }> {
     const inserted = await this.dataSource.query<{ key: string }[]>(
       `INSERT INTO to_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING RETURNING key`,
       [key, value],
@@ -139,7 +160,8 @@ export class AppService implements OnModuleInit, BeforeApplicationShutdown {
       this.check("nats", () => Promise.resolve(this.nats.isConnected())),
     ]);
     const checks = { postgres, redis, nats };
-    const status = Object.values(checks).every((c) => c === "ok") && !this.draining ? "ok" : "degraded";
+    const status =
+      Object.values(checks).every((c) => c === "ok") && !this.draining ? "ok" : "degraded";
     return this.draining ? { status, checks, draining: true } : { status, checks };
   }
 

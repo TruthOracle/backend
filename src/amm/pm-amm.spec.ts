@@ -100,8 +100,8 @@ describe("market quotes", () => {
     if (!yes || !no) return;
     expect(yes.priceAfter).toBeGreaterThan(0.5);
     expect(no.priceAfter).toBeLessThan(0.5);
-    approx(yes.feeCC, 0.03, 1e-12);
-    approx(yes.netCC, 9.97, 1e-12);
+    approx(yes.fee, 0.03, 1e-12);
+    approx(yes.net, 9.97, 1e-12);
     expect(yes.sharesOut).toBeGreaterThan(10);
     expect(yes.sharesOut).toBeLessThan(20);
     // At p = 0.5 the two sides are symmetric.
@@ -118,9 +118,9 @@ describe("market quotes", () => {
     const after: AmmMarketState = { ...m, currentPrice: buy.priceAfter };
     const sell = quoteSell(after, "Yes", buy.sharesOut, NOW);
     if (!sell) throw new Error("no sell quote");
-    expect(sell.netCC).toBeLessThan(10);
-    expect(sell.netCC).toBeGreaterThan(8);
-    approx(sell.feeCC, sell.grossCC * 0.003, 1e-12);
+    expect(sell.net).toBeLessThan(10);
+    expect(sell.net).toBeGreaterThan(8);
+    approx(sell.fee, sell.gross * 0.003, 1e-12);
     expect(sell.priceAfter).toBeLessThan(buy.priceAfter);
   });
 
@@ -129,7 +129,7 @@ describe("market quotes", () => {
     const swap = quoteSwap(m, "Yes", 10, NOW);
     if (!swap) throw new Error("no swap quote");
     approx(swap.feeShares, 0.03, 1e-12);
-    // 10 YES at 0.7 ≈ 7 CC of value ≈ 23 NO at 0.3, less impact.
+    // 10 YES at 0.7 ≈ 7 units of value ≈ 23 NO at 0.3, less impact.
     expect(swap.sharesOut).toBeGreaterThan(15);
     expect(swap.sharesOut).toBeLessThan(24);
     expect(swap.priceAfter).toBeLessThan(0.7);
@@ -139,7 +139,7 @@ describe("market quotes", () => {
     const m = market();
     const q = quoteProvideLiquidity(m, 10, NOW);
     if (!q) throw new Error("no liquidity quote");
-    expect(q.costCC).toBeGreaterThan(0);
+    expect(q.cost).toBeGreaterThan(0);
     expect(q.lpMinted).toBeGreaterThan(0);
     approx(q.poolShare, q.lpMinted / (m.lpTokenSupply + q.lpMinted), 1e-12);
     expect(q.newL).toBeGreaterThan(m.liquidityL);

@@ -33,7 +33,11 @@ export class SessionGuard implements CanActivate {
     req.requestHost = requestHostOf(req, this.config);
     req.requestProto = requestProtoOf(req, this.config);
 
-    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [context.getHandler(), context.getClass()]) === true;
+    const isPublic =
+      this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) === true;
 
     const { token, kind } = extractToken(req);
     if (!token) {
@@ -56,8 +60,13 @@ export class SessionGuard implements CanActivate {
     // §6.8: an admin session is an operator credential for /admin and the session's own
     // housekeeping; every other account route refuses it unless the handler opted in.
     if (verified.session.kind === "admin" && !isPublic) {
-      const allowed = this.reflector.getAllAndOverride<boolean>(ALLOW_ADMIN_SESSION_KEY, [context.getHandler(), context.getClass()]) === true;
-      if (!allowed) throw new ApiError(403, "forbidden", "admin sessions cannot use account routes");
+      const allowed =
+        this.reflector.getAllAndOverride<boolean>(ALLOW_ADMIN_SESSION_KEY, [
+          context.getHandler(),
+          context.getClass(),
+        ]) === true;
+      if (!allowed)
+        throw new ApiError(403, "forbidden", "admin sessions cannot use account routes");
     }
 
     req.session = verified.session;
@@ -69,7 +78,14 @@ export class SessionGuard implements CanActivate {
   }
 }
 
-function extractToken(req: AuthedRequest): { token: string; kind: "cookie" | "bearer" } {
+/**
+ * The credential a request presents: `Authorization: Bearer <tok>`, else the `to_session` cookie
+ * ("" when neither). Also used by the body parser to pick the 8 MB limit (app.setup.ts, C40).
+ */
+export function extractToken(req: Pick<AuthedRequest, "headers">): {
+  token: string;
+  kind: "cookie" | "bearer";
+} {
   const auth = req.headers.authorization;
   if (typeof auth === "string" && /^bearer\s+/i.test(auth)) {
     return { token: auth.replace(/^bearer\s+/i, "").trim(), kind: "bearer" };

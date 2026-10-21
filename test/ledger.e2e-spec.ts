@@ -19,7 +19,7 @@ import {
   type ApiStats,
   type ApiWalletEntry,
 } from "../src/types";
-import { formatCC, parseCC } from "../src/util/money";
+import { formatAmount, parseAmount } from "../src/util/money";
 import { TEST_TREASURY, useTestApp } from "./helpers/app";
 import { LedgerFixture, parties } from "./helpers/ledger-fixtures";
 import { bodyOf, issueSessionDirect } from "./helpers/session";
@@ -29,7 +29,7 @@ const operator = makeTestWallet("op");
 const ctx = useTestApp({ env: { ADMIN_OPERATORS: operator.partyId } });
 
 const [alice, bob] = parties(2, "trader");
-const dec = (v: string): string => formatCC(parseCC(v));
+const dec = (v: string): string => formatAmount(parseAmount(v));
 
 /** Boots a fixture ledger with one market, Alice's funded wallet and one Buy, fully indexed. */
 async function seedTradedMarket(): Promise<{
@@ -51,7 +51,7 @@ async function seedTradedMarket(): Promise<{
     wallet: d.wallet,
     buyer: alice,
     side: "Yes",
-    collateralCC: "10",
+    amount: "10",
     sharesOut: "18",
   });
   ctx.stream.push(...f.txs);
@@ -156,7 +156,7 @@ describe("indexer loop", () => {
       seller: alice,
       side: "Yes",
       sharesIn: "18",
-      grossCC: "9",
+      gross: "9",
     });
     ctx.stream.push(sold.tx);
     ctx.stream.pruned = sold.tx.offset;
@@ -198,7 +198,7 @@ describe("indexer loop", () => {
       await ctx.agent.get("/api/v1/markets/1").expect(200),
     ).market;
     expect(m.contractId).toBe(sold.market.cid);
-    expect(m.totalVolumeCC).toBe(dec("19"));
+    expect(m.totalVolume).toBe(dec("19"));
     // The Sell itself was never seen: no trade row for it, the gap says so.
     const trades = bodyOf<ApiPage<ApiMarketEvent>>(
       await ctx.agent.get("/api/v1/markets/1/trades").expect(200),
@@ -267,9 +267,9 @@ describe("markets", () => {
       synchronizerId: "sync::test",
     });
     expect(m.currentPrice).toBe(dec("0.55"));
-    expect(m.totalVolumeCC).toBe(dec("10"));
-    expect(m.accumulatedFeesCC).toBe(dec("0.09"));
-    expect(m.prizePoolCC).toBe(dec("0.01"));
+    expect(m.totalVolume).toBe(dec("10"));
+    expect(m.accumulatedFees).toBe(dec("0.09"));
+    expect(m.prizePool).toBe(dec("0.01"));
     expect(m.policy).toMatchObject({
       operatorResolution: true,
       sources: ["https://source.test/price"],
@@ -291,13 +291,25 @@ describe("markets", () => {
 
   it("filters, searches, sorts and validates the list query", async () => {
     const f = new LedgerFixture(TEST_TREASURY);
-    const a = f.createMarket({ marketId: 1, question: "Rain tomorrow?", ticker: "WEATHER-1-RAIN", eventTicker: "WEATHER-1" });
-    f.createMarket({ marketId: 2, question: "ETH above 5k?", ticker: "CRYPTO-1-ETH5K", eventTicker: "CRYPTO-1" });
+    const a = f.createMarket({
+      marketId: 1,
+      question: "Rain tomorrow?",
+      ticker: "WEATHER-1-RAIN",
+      eventTicker: "WEATHER-1",
+    });
+    f.createMarket({
+      marketId: 2,
+      question: "ETH above 5k?",
+      ticker: "CRYPTO-1-ETH5K",
+      eventTicker: "CRYPTO-1",
+    });
     f.resolveT0(a.market, "Yes");
     ctx.stream.push(...f.txs);
     await ctx.get(IndexerService).runOnce();
     // Categories are the placeholder series' (empty until an operator sets them).
-    await ctx.dataSource.query(`UPDATE to_series SET category = 'weather' WHERE ticker = 'WEATHER'`);
+    await ctx.dataSource.query(
+      `UPDATE to_series SET category = 'weather' WHERE ticker = 'WEATHER'`,
+    );
     await ctx.dataSource.query(`UPDATE to_series SET category = 'crypto' WHERE ticker = 'CRYPTO'`);
 
     expect(
@@ -360,7 +372,7 @@ describe("markets", () => {
       seller: alice,
       side: "Yes",
       sharesIn: "8",
-      grossCC: "5",
+      gross: "5",
     });
     ctx.stream.push(sold.tx);
     await ctx.get(IndexerService).runOnce();
@@ -377,18 +389,18 @@ describe("markets", () => {
       offset: 4,
       updateId: "update-0004",
     });
-    expect(buy.amountCC).toBe(dec("10"));
+    expect(buy.amount).toBe(dec("10"));
     expect(buy.shares).toBe(dec("18"));
-    expect(buy.feeCC).toBe(dec("0.1"));
-    expect(buy.netCC).toBe(dec("9.9"));
+    expect(buy.fee).toBe(dec("0.1"));
+    expect(buy.net).toBe(dec("9.9"));
     expect(buy.priceBefore).toBe(dec("0.5"));
     expect(buy.priceAfter).toBe(dec("0.55"));
     expect(buy.commandId).toMatch(/^buy-/);
     expect(sell).toMatchObject({ kind: "sell", actor: alice, side: "Yes", offset: 5 });
     expect(sell.shares).toBe(dec("8"));
-    expect(sell.amountCC).toBe(dec("5"));
-    expect(sell.feeCC).toBe(dec("0.05"));
-    expect(sell.netCC).toBe(dec("4.95"));
+    expect(sell.amount).toBe(dec("5"));
+    expect(sell.fee).toBe(dec("0.05"));
+    expect(sell.net).toBe(dec("4.95"));
     expect(sell.priceAfter).toBe(dec("0.52"));
 
     const activity = bodyOf<ApiPage<ApiMarketEvent>>(
@@ -397,7 +409,7 @@ describe("markets", () => {
     expect(activity.items.map((e) => e.kind)).toEqual(["sell", "buy", "market_created"]);
     expect(activity.items[2].details).toMatchObject({
       initialProbability: dec("0.5"),
-      initialValueCC: dec("200"),
+      initialValue: dec("200"),
     });
     expect(
       bodyOf<ApiPage<ApiMarketEvent>>(
@@ -405,10 +417,10 @@ describe("markets", () => {
       ).total,
     ).toBe(1);
 
-    const history = bodyOf<{ points: { price: string; volumeCC: string; offset: number }[] }>(
+    const history = bodyOf<{ points: { price: string; volume: string; offset: number }[] }>(
       await ctx.agent.get("/api/v1/markets/1/price-history").expect(200),
     );
-    expect(history.points.map((p) => [p.offset, p.price, p.volumeCC])).toEqual([
+    expect(history.points.map((p) => [p.offset, p.price, p.volume])).toEqual([
       [1, dec("0.5"), dec("0")],
       [4, dec("0.55"), dec("10")],
       [5, dec("0.52"), dec("15")],
@@ -455,7 +467,7 @@ describe("markets", () => {
     expect(activity.items[1]).toMatchObject({ outcome: "Yes", actor: TEST_TREASURY });
     expect(activity.items[1].details).toMatchObject({ sourceUri: "https://source.test/price" });
     expect(activity.items[0]).toMatchObject({ kind: "redeem", actor: alice, outcome: "Yes" });
-    expect(activity.items[0].amountCC).toBe(dec("18"));
+    expect(activity.items[0].amount).toBe(dec("18"));
     expect(activity.items[0].details).toMatchObject({ reason: "resolve", yesShares: dec("18") });
 
     const { cookie } = await issueSessionDirect(ctx, { ...makeTestWallet("a"), partyId: alice });
@@ -472,7 +484,7 @@ describe("markets", () => {
     ).toEqual([]);
 
     const ledger = bodyOf<{
-      wallet: { balanceCC: string; withdrawnCC: string } | null;
+      wallet: { balance: string; withdrawn: string } | null;
       payouts: {
         contractId: string;
         active: boolean;
@@ -481,8 +493,8 @@ describe("markets", () => {
         reason: string;
       }[];
     }>(await ctx.agent.get("/api/v1/in-app-wallet/ledger").set("Cookie", cookie).expect(200));
-    expect(ledger.wallet?.balanceCC).toBe(dec("88"));
-    expect(ledger.wallet?.withdrawnCC).toBe(dec("20"));
+    expect(ledger.wallet?.balance).toBe(dec("88"));
+    expect(ledger.wallet?.withdrawn).toBe(dec("20"));
     expect(ledger.payouts).toHaveLength(1);
     expect(ledger.payouts[0]).toMatchObject({
       contractId: withdrawn.payoutCid,
@@ -491,13 +503,13 @@ describe("markets", () => {
       txHash: "0xabc",
       reason: "withdraw",
     });
-    expect(ledger.payouts[0]).toHaveProperty("amountCC", dec("20"));
+    expect(ledger.payouts[0]).toHaveProperty("amount", dec("20"));
 
     const history = bodyOf<ApiPage<ApiWalletEntry>>(
       await ctx.agent.get("/api/v1/in-app-wallet/history").set("Cookie", cookie).expect(200),
     );
     expect(
-      history.items.map((e) => [e.kind, e.amountCC, e.reason, e.marketId, e.rootChoice]),
+      history.items.map((e) => [e.kind, e.amount, e.reason, e.marketId, e.rootChoice]),
     ).toEqual([
       ["withdraw", dec("20"), "withdraw", null, null],
       ["credit", dec("18"), "resolve", 1, "RedeemPosition"],
@@ -532,7 +544,7 @@ describe("portfolio and aggregates", () => {
       wallet: bobDeposit.wallet,
       buyer: bob,
       side: "No",
-      collateralCC: "4",
+      amount: "4",
       sharesOut: "7",
       newPrice: "0.5",
     });
@@ -543,7 +555,7 @@ describe("portfolio and aggregates", () => {
       position,
       buyer: alice,
       side: "Yes",
-      collateralCC: "2",
+      amount: "2",
       sharesOut: "3",
       newPrice: "0.6",
     });
@@ -557,9 +569,9 @@ describe("portfolio and aggregates", () => {
     expect(mine.parties).toEqual([alice]);
     expect(mine.positions).toHaveLength(1);
     expect(mine.positions[0].yesShares).toBe(dec("21"));
-    expect(mine.positions[0].costBasisCC).toBe(dec("12"));
-    expect(mine.positions[0].valueCC).toBe(dec("12.6")); // 21 × 0.6
-    expect(mine.positions[0].redeemableCC).toBeNull();
+    expect(mine.positions[0].costBasis).toBe(dec("12"));
+    expect(mine.positions[0].value).toBe(dec("12.6")); // 21 × 0.6
+    expect(mine.positions[0].redeemable).toBeNull();
     expect(mine.positions[0].market?.currentPrice).toBe(dec("0.6"));
     const all = bodyOf<{ positions: ApiPosition[] }>(
       await ctx.agent.get("/api/v1/me/positions?status=all").set("Cookie", cookie).expect(200),
@@ -569,7 +581,7 @@ describe("portfolio and aggregates", () => {
     const trades = bodyOf<ApiPage<ApiMarketEvent>>(
       await ctx.agent.get("/api/v1/me/trades").set("Cookie", cookie).expect(200),
     );
-    expect(trades.items.map((t) => [t.actor, t.amountCC])).toEqual([
+    expect(trades.items.map((t) => [t.actor, t.amount])).toEqual([
       [alice, dec("2")],
       [alice, dec("10")],
     ]);
@@ -594,13 +606,13 @@ describe("portfolio and aggregates", () => {
       traders: 2,
       indexedOffset: 8,
     });
-    expect(stats.totalVolumeCC).toBe(dec("16"));
+    expect(stats.totalVolume).toBe(dec("16"));
 
     const board = bodyOf<{
       window: string;
-      entries: { party: string; volumeCC: string; trades: number; realizedPnlCC: string }[];
+      entries: { party: string; volume: string; trades: number; realizedPnl: string }[];
     }>(await ctx.agent.get("/api/v1/leaderboard?window=all").expect(200));
-    expect(board.entries.map((e) => [e.party, e.volumeCC, e.trades, e.realizedPnlCC])).toEqual([
+    expect(board.entries.map((e) => [e.party, e.volume, e.trades, e.realizedPnl])).toEqual([
       [alice, dec("12"), 2, dec("-12")],
       [bob, dec("4"), 1, dec("-4")],
     ]);
@@ -626,9 +638,9 @@ describe("portfolio and aggregates", () => {
     await ctx.get(IndexerService).runOnce();
     const { cookie } = await issueSessionDirect(ctx, { ...makeTestWallet("a"), partyId: alice });
     const page = bodyOf<
-      ApiPage<{ direction: string; counterparty: string; amountCC: string; choice: string }>
+      ApiPage<{ direction: string; counterparty: string; amount: string; choice: string }>
     >(await ctx.agent.get("/api/v1/in-app-wallet/transfers").set("Cookie", cookie).expect(200));
-    expect(page.items.map((t) => [t.direction, t.amountCC, t.choice])).toEqual([
+    expect(page.items.map((t) => [t.direction, t.amount, t.choice])).toEqual([
       ["out", dec("3"), "AmuletRules_Transfer"],
       ["in", dec("25"), "TransferPreapproval_SendV2"],
     ]);
@@ -701,12 +713,10 @@ describe("admin ledger", () => {
       ).total,
     ).toBe(2);
 
-    const wallets = bodyOf<ApiPage<{ owner: string; balanceCC: string }>>(
+    const wallets = bodyOf<ApiPage<{ owner: string; balance: string }>>(
       await ctx.agent.get("/api/v1/admin/ledger/wallets").set(headers).expect(200),
     );
-    expect(wallets.items).toEqual([
-      expect.objectContaining({ owner: alice, balanceCC: dec("89") }),
-    ]);
+    expect(wallets.items).toEqual([expect.objectContaining({ owner: alice, balance: dec("89") })]);
     const payouts = bodyOf<ApiPage<{ contractId: string; active: boolean }>>(
       await ctx.agent.get("/api/v1/admin/ledger/payouts?active=true").set(headers).expect(200),
     );
@@ -739,9 +749,11 @@ describe("admin ledger", () => {
         admin: TEST_TREASURY,
         user: alice,
         marketId: "0",
-        amountCC: dec("1"),
+        instrument: f.instrument(),
+        amount: dec("1"),
         reason: "withdraw",
         createdAt: "1760000500",
+        auditObservers: [],
       }),
     ];
     const resynced = bodyOf<{ status: ApiLedgerStatus }>(
@@ -773,6 +785,67 @@ describe("admin ledger", () => {
       ).error,
     ).toBe("forbidden");
     await ctx.agent.get("/api/v1/admin/ledger/status").expect(401);
+  });
+
+  it("R3-01: a UserWallet or PendingPayout another party signed as admin is kept raw, never projected", async () => {
+    const { f } = await seedTradedMarket();
+    const [mallory] = parties(1, "mallory");
+    // Both need only mallory's signature: the treasury is just an observer, so they reach its stream.
+    ctx.stream.push(
+      f.tx([
+        f.created(
+          "UserWallet",
+          f.cid("uw"),
+          {
+            admin: mallory,
+            owner: alice,
+            instrument: f.instrument(),
+            balance: dec("50000"),
+            deposited: dec("50000"),
+            withdrawn: dec("0"),
+            creditRefs: [],
+            auditObservers: [TEST_TREASURY],
+          },
+          { signatories: [mallory], observers: [alice, TEST_TREASURY] },
+        ),
+        f.created(
+          "PendingPayout",
+          f.cid("pp"),
+          {
+            admin: mallory,
+            user: mallory,
+            marketId: "0",
+            instrument: f.instrument(),
+            amount: dec("50000"),
+            reason: "withdraw",
+            createdAt: "1760000500",
+            auditObservers: [TEST_TREASURY],
+          },
+          { signatories: [mallory], observers: [mallory, TEST_TREASURY] },
+        ),
+      ]),
+    );
+    await ctx.get(IndexerService).runOnce();
+    const { cookie } = await issueSessionDirect(ctx, operator, { kind: "admin" });
+    const headers = { Cookie: cookie, ...ctx.csrf };
+
+    const wallets = bodyOf<ApiPage<{ owner: string; balance: string }>>(
+      await ctx.agent.get("/api/v1/admin/ledger/wallets").set(headers).expect(200),
+    );
+    expect(wallets.items).toEqual([expect.objectContaining({ owner: alice, balance: dec("90") })]);
+    expect(
+      bodyOf<ApiPage<unknown>>(
+        await ctx.agent.get("/api/v1/admin/ledger/payouts").set(headers).expect(200),
+      ).total,
+    ).toBe(0);
+    expect(
+      bodyOf<ApiPage<unknown>>(
+        await ctx.agent
+          .get("/api/v1/admin/ledger/events?entity=PendingPayout")
+          .set(headers)
+          .expect(200),
+      ).total,
+    ).toBe(1);
   });
 
   it("the indexer state row survives resets of the other tables only through re-creation", async () => {

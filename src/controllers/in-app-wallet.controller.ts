@@ -1,15 +1,17 @@
-import { Controller, Get, HttpCode, Post, Req } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Post, Req } from "@nestjs/common";
 import { ApiBearerAuth, ApiCookieAuth, ApiTags } from "@nestjs/swagger";
 
 import { type AuthedRequest, actorOf, principalOf } from "../auth/request";
+import { ReconcileDepositsDto } from "../dto/wallets.dto";
 import { DepositService } from "../services/deposit.service";
 import { RateLimitService } from "../services/rate-limit.service";
 import type { InAppWalletOverview, ReconcileResult } from "../types";
 
 /**
  * In-app wallet overview + deposit reconciliation (docs/API.md "In-app wallet"; ARCHITECTURE
- * §8.3). Amounts never come from the client: the service derives them from the treasury history
- * and the ledger. Payout routes live in PayoutsController (`in-app-wallet/payouts`).
+ * §8.3; docs/TOKENS.md §4.3). Amounts never come from the client: the service derives them from
+ * the treasury's inbound transfers and the ledger; the client only names the instrument. Payout
+ * routes live in PayoutsController (`in-app-wallet/payouts`).
  */
 @ApiTags("in-app-wallet")
 @ApiCookieAuth("to_session")
@@ -21,7 +23,7 @@ export class InAppWalletController {
     private readonly rateLimit: RateLimitService,
   ) {}
 
-  /** May serve the 15 s cached ledger/history view; only reconcile insists on fresh reads. */
+  /** One balance row per instrument; may serve the 15 s cached ledger/history view — only reconcile insists on fresh reads. */
   @Get()
   overview(@Req() req: AuthedRequest): Promise<InAppWalletOverview> {
     const { user } = principalOf(req);
@@ -29,14 +31,17 @@ export class InAppWalletController {
   }
 
   /**
-   * `409 no_primary_wallet | deposit_in_progress | deposit_attribution_drift | kyc_duplicate_identity`.
-   * Rate limit: reconcile 30/min/user (§13).
+   * `409 no_primary_wallet | deposit_in_progress | deposit_attribution_drift | kyc_duplicate_identity
+   * | instrument_disabled`, `404 instrument_unknown`. Rate limit: reconcile 30/min/user (§13).
    */
   @Post("deposits/reconcile")
   @HttpCode(200)
-  async reconcile(@Req() req: AuthedRequest): Promise<ReconcileResult> {
+  async reconcile(
+    @Body() body: ReconcileDepositsDto,
+    @Req() req: AuthedRequest,
+  ): Promise<ReconcileResult> {
     const { user } = principalOf(req);
     await this.rateLimit.enforce("reconcile", { userId: user.id });
-    return this.deposits.reconcile(user.id, actorOf(req));
+    return this.deposits.reconcile(user.id, actorOf(req), body.instrument);
   }
 }

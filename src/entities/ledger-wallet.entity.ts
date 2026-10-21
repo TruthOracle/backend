@@ -5,11 +5,18 @@ import { moneyTransformer } from "../util/money";
 
 /**
  * Every `UserWallet` contract version (docs/INDEXER.md §3 `to_ledger_wallets`). The active row
- * per owner is the in-app balance the ledger holds right now; the archived rows are how it got
- * there (one per Deposit / Credit / Debit / Withdraw — see `to_wallet_entries`).
+ * per (owner, instrument) is the in-app balance the ledger holds right now in that instrument;
+ * the archived rows are how it got there (one per Deposit / Grant / Credit / Debit / Withdraw —
+ * see `to_wallet_entries`).
  */
 @Entity({ name: "to_ledger_wallets" })
 @Index("ix_to_ledger_wallets_owner_active", ["owner", "active"])
+@Index("ix_to_ledger_wallets_owner_instrument_active", [
+  "owner",
+  "instrumentAdmin",
+  "instrumentId",
+  "active",
+])
 export class LedgerWalletEntity {
   @PrimaryColumn({ name: "contract_id", type: "text" })
   contractId!: string;
@@ -20,38 +27,27 @@ export class LedgerWalletEntity {
   @Column({ type: "text" })
   admin!: string;
 
-  @Column({
-    name: "balance_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
-  balanceCC!: bigint;
+  @Column({ name: "instrument_admin", type: "text" })
+  instrumentAdmin!: string;
 
-  @Column({
-    name: "deposited_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
-  depositedCC!: bigint;
+  @Column({ name: "instrument_id", type: "text" })
+  instrumentId!: string;
 
-  @Column({
-    name: "withdrawn_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    default: 0,
-    transformer: moneyTransformer,
-  })
-  withdrawnCC!: bigint;
+  @Column({ type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
+  balance!: bigint;
 
-  @Column({ name: "deposit_refs", type: "jsonb", default: () => "'[]'::jsonb" })
-  depositRefs!: string[];
+  @Column({ type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
+  deposited!: bigint;
+
+  @Column({ type: "numeric", precision: 38, scale: 10, default: 0, transformer: moneyTransformer })
+  withdrawn!: bigint;
+
+  /** Deposit txRefs and grant refs already applied, newest first (`UserWallet.creditRefs`). */
+  @Column({ name: "credit_refs", type: "jsonb", default: () => "'[]'::jsonb" })
+  creditRefs!: string[];
+
+  @Column({ name: "audit_observers", type: "jsonb", default: () => "'[]'::jsonb" })
+  auditObservers!: string[];
 
   @Column({ type: "boolean", default: true })
   active!: boolean;

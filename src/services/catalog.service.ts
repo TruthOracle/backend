@@ -11,6 +11,7 @@ import {
   NatsSubjects,
   TICKER_PATTERN,
   TRADE_KINDS,
+  sameInstrument,
   type Actor,
   type ApiEvent,
   type ApiMarket,
@@ -20,13 +21,16 @@ import {
   type ApiSettlementSource,
   type EventSort,
   type EventStatus,
+  type InstrumentId,
+  type InstrumentRef,
   type MarketPhase,
   type SeriesFrequency,
   type SeriesStatus,
 } from "../types";
 import { ApiError } from "../util/errors";
-import { formatCC, parseCC } from "../util/money";
+import { formatAmount, parseAmount } from "../util/money";
 import { AuditService } from "./audit.service";
+import { InstrumentsService } from "./instruments.service";
 import { MarketsService } from "./markets.service";
 import { NatsService } from "./nats.service";
 
@@ -58,6 +62,13 @@ export interface EventInput {
 }
 export type EventPatch = Partial<Omit<EventInput, "ticker">> & { archived?: boolean };
 
+/** A series' per-instrument figures (`seriesCounts`). */
+interface SeriesCounts {
+  events: number;
+  markets: number;
+  volume: bigint;
+}
+
 /** The backend-owned presentation of a market (`to_market_metadata`); a field left out is untouched. */
 export interface MarketMetadataPatch {
   imageUrl?: string;
@@ -68,6 +79,8 @@ export interface SeriesListQuery {
   category?: string;
   status?: SeriesStatus | "all";
   q?: string;
+  /** The instrument the counts are computed over (`?instrument=`); omitted = the default collateral (docs/TOKENS.md §4.5). */
+  instrument?: InstrumentId;
   page: number;
   limit: number;
 }
@@ -79,6 +92,8 @@ export interface EventListQuery {
   q?: string;
   /** Card ordering (docs/MARKETS.md §3); without it the list is by strike date, newest first. */
   sort?: EventSort;
+  /** Only events denominated in this instrument (plus events without a market yet); omitted = the default collateral. */
+  instrument?: InstrumentId;
   withNestedMarkets: boolean;
   includeArchived: boolean;
   page: number;
@@ -86,18 +101,31 @@ export interface EventListQuery {
 }
 
 /**
+ * The member markets an event's aggregates are summed over: its unarchived markets in the event's
+ * own collateral (docs/TOKENS.md §2 decision 9). A market in another instrument that reached the
+ * ledger past the backend's check is left out — a sum across tokens would be meaningless.
+ */
+const EVENT_MEMBERS =
+  "FROM to_markets m WHERE m.event_ticker = e.ticker AND m.archived = false AND m.collateral_admin = e.collateral_admin AND m.collateral_id = e.collateral_id";
+
+/**
  * SQL ordering for `sort=` — computed over the member markets so the whole catalog is ranked,
  * not just the page. `trending` is the last 24 h of hourly-candle volume (ties by lifetime
  * volume); `closing` is the soonest still-open close time (already-closed events last).
  */
-export function eventSortOrder(sort: EventSort | undefined): { select: string; direction: "ASC" | "DESC"; nulls?: "NULLS FIRST" | "NULLS LAST"; then?: string }[] {
-  const members = "FROM to_markets m WHERE m.event_ticker = e.ticker AND m.archived = false";
-  const volume = `(SELECT COALESCE(SUM(m.total_volume_cc), 0) ${members})`;
+export function eventSortOrder(sort: EventSort | undefined): {
+  select: string;
+  direction: "ASC" | "DESC";
+  nulls?: "NULLS FIRST" | "NULLS LAST";
+  then?: string;
+}[] {
+  const members = EVENT_MEMBERS;
+  const volume = `(SELECT COALESCE(SUM(m.total_volume), 0) ${members})`;
   switch (sort) {
     case "trending":
       return [
         {
-          select: `(SELECT COALESCE(SUM(c.volume_cc), 0) FROM to_market_candles c JOIN to_markets m ON m.market_id = c.market_id WHERE m.event_ticker = e.ticker AND m.archived = false AND c.period_secs = 3600 AND c.period_start >= now() - interval '24 hours')`,
+          select: `(SELECT COALESCE(SUM(c.volume), 0) FROM to_market_candles c JOIN to_markets m ON m.market_id = c.market_id WHERE m.event_ticker = e.ticker AND m.archived = false AND m.collateral_admin = e.collateral_admin AND m.collateral_id = e.collateral_id AND c.period_secs = 3600 AND c.period_start >= now() - interval '24 hours')`,
           direction: "DESC",
         },
         { select: volume, direction: "DESC" },
@@ -151,13 +179,27 @@ export class CatalogService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly markets: MarketsService,
+    private readonly instruments: InstrumentsService,
     private readonly audit: AuditService,
     private readonly nats: NatsService,
   ) {}
 
+  /**
+   * The instrument a catalog listing is computed over (docs/TOKENS.md §4.5): the query's
+   * `?instrument=<admin>:<id>`, else the default collateral, else — on a platform with no
+   * collateral configured — nothing: the catalog is then listed unfiltered rather than refused,
+   * because the catalog rows are operator data that exist before any market does.
+   */
+  async listingInstrument(requested?: InstrumentId): Promise<InstrumentRef | null> {
+    if (requested) return this.instruments.refOf(requested);
+    const fallback = await this.instruments.defaultCollateral();
+    return fallback ? this.instruments.toRef(fallback) : null;
+  }
+
   // ───────────────────────────────────────────── series ─────────────────────────────────────────────
 
   async listSeries(query: SeriesListQuery): Promise<ApiPage<ApiSeries>> {
+    const instrument = await this.listingInstrument(query.instrument);
     const qb = this.dataSource.getRepository(SeriesEntity).createQueryBuilder("s");
     if ((query.status ?? "active") !== "all")
       qb.andWhere("s.status = :status", { status: query.status ?? "active" });
@@ -171,29 +213,40 @@ export class CatalogService {
       .skip((query.page - 1) * query.limit)
       .take(query.limit)
       .getManyAndCount();
-    const counts = await this.seriesCounts(rows.map((r) => r.ticker));
+    const counts = await this.seriesCounts(
+      rows.map((r) => r.ticker),
+      instrument,
+    );
     return {
-      items: rows.map((s) => this.toApiSeries(s, counts.get(s.ticker))),
+      items: rows.map((s) => this.toApiSeries(s, counts.get(s.ticker), instrument)),
       page: query.page,
       limit: query.limit,
       total,
     };
   }
 
-  async getSeries(tickerRaw: string): Promise<{ series: ApiSeries; events: ApiEvent[] }> {
+  async getSeries(
+    tickerRaw: string,
+    requested?: InstrumentId,
+  ): Promise<{ series: ApiSeries; events: ApiEvent[] }> {
     const ticker = tickerRaw.trim().toUpperCase();
     const row = await this.dataSource.getRepository(SeriesEntity).findOneBy({ ticker });
     if (!row) throw new ApiError(404, "not_found", `series ${ticker} does not exist`);
-    const counts = await this.seriesCounts([ticker]);
+    const instrument = await this.listingInstrument(requested);
+    const counts = await this.seriesCounts([ticker], instrument);
     const events = await this.listEvents({
       series: ticker,
       status: "all",
+      instrument: requested,
       withNestedMarkets: false,
       includeArchived: false,
       page: 1,
       limit: 100,
     });
-    return { series: this.toApiSeries(row, counts.get(ticker)), events: events.items };
+    return {
+      series: this.toApiSeries(row, counts.get(ticker), instrument),
+      events: events.items,
+    };
   }
 
   async createSeries(input: SeriesInput, actor: Actor, reason?: string): Promise<ApiSeries> {
@@ -218,7 +271,7 @@ export class CatalogService {
       await repo.save(row);
       await this.record(manager, actor, "catalog.series_created", "series", ticker, { reason });
       await this.announce("series", ticker);
-      return this.toApiSeries(row, undefined);
+      return this.toApiSeries(row, undefined, await this.listingInstrument());
     });
   }
 
@@ -248,16 +301,25 @@ export class CatalogService {
         fields: Object.keys(patch),
       });
       await this.announce("series", ticker);
-      const counts = await this.seriesCounts([ticker], manager);
-      return this.toApiSeries(row, counts.get(ticker));
+      const instrument = await this.listingInstrument();
+      const counts = await this.seriesCounts([ticker], instrument, manager);
+      return this.toApiSeries(row, counts.get(ticker), instrument);
     });
   }
 
   // ───────────────────────────────────────────── events ─────────────────────────────────────────────
 
   async listEvents(query: EventListQuery): Promise<ApiPage<ApiEvent>> {
+    const instrument = await this.listingInstrument(query.instrument);
     const qb = this.dataSource.getRepository(CatalogEventEntity).createQueryBuilder("e");
     if (!query.includeArchived) qb.andWhere("e.archived = false");
+    // Per instrument (docs/TOKENS.md §4.5): the events denominated in it, plus the events no market
+    // has fixed yet — they belong to no instrument and carry zero aggregates under every one.
+    if (instrument)
+      qb.andWhere(
+        "(e.collateral_admin IS NULL OR (e.collateral_admin = :admin AND e.collateral_id = :id))",
+        { admin: instrument.admin, id: instrument.id },
+      );
     if (query.series)
       qb.andWhere("e.series_ticker = :series", { series: query.series.trim().toUpperCase() });
     if (query.category)
@@ -400,7 +462,11 @@ export class CatalogService {
     reason?: string,
   ): Promise<ApiMarket> {
     if (patch.imageUrl === undefined && patch.description === undefined)
-      throw new ApiError(400, "validation_failed", "nothing to update: send imageUrl and/or description");
+      throw new ApiError(
+        400,
+        "validation_failed",
+        "nothing to update: send imageUrl and/or description",
+      );
     const market = await this.markets.resolve(ref);
     await this.dataSource.transaction(async (manager) => {
       const repo = manager.getRepository(MarketMetadataEntity);
@@ -411,11 +477,20 @@ export class CatalogService {
       if (patch.description !== undefined) row.description = patch.description;
       row.updatedByUserId = actor.userId ?? null;
       await repo.save(row);
-      await this.record(manager, actor, "catalog.market_metadata_updated", "market", market.ticker, {
-        reason,
-        marketId: market.marketId,
-        fields: Object.keys(patch).filter((k) => patch[k as keyof MarketMetadataPatch] !== undefined),
-      });
+      await this.record(
+        manager,
+        actor,
+        "catalog.market_metadata_updated",
+        "market",
+        market.ticker,
+        {
+          reason,
+          marketId: market.marketId,
+          fields: Object.keys(patch).filter(
+            (k) => patch[k as keyof MarketMetadataPatch] !== undefined,
+          ),
+        },
+      );
     });
     await this.announce("market", market.ticker);
     return this.markets.get(market.marketId);
@@ -424,7 +499,10 @@ export class CatalogService {
   // ───────────────────────────────────────────── feed ─────────────────────────────────────────────
 
   /** `GET /events/:ticker/trades`: the pool trades of every member market, newest first, keyset-paginated. */
-  async eventTrades(tickerRaw: string, opts: { limit: number; cursor: string }): Promise<ApiPage<ApiMarketEvent>> {
+  async eventTrades(
+    tickerRaw: string,
+    opts: { limit: number; cursor: string },
+  ): Promise<ApiPage<ApiMarketEvent>> {
     const ticker = tickerRaw.trim().toUpperCase();
     const row = await this.dataSource.getRepository(CatalogEventEntity).findOneBy({ ticker });
     if (!row) throw new ApiError(404, "not_found", `event ${ticker} does not exist`);
@@ -455,7 +533,9 @@ export class CatalogService {
     const seriesRows = await manager
       .getRepository(SeriesEntity)
       .createQueryBuilder("s")
-      .where("s.ticker IN (:...tickers)", { tickers: [...new Set(rows.map((r) => r.seriesTicker))] })
+      .where("s.ticker IN (:...tickers)", {
+        tickers: [...new Set(rows.map((r) => r.seriesTicker))],
+      })
       .getMany();
     const series = new Map(seriesRows.map((s) => [s.ticker, s]));
     // Likeliest outcome first — what an event page and a card list (Kalshi orders by price).
@@ -472,19 +552,43 @@ export class CatalogService {
       list.push(m);
       byEvent.set(m.eventTicker, list);
     }
+    const nowSec = Math.floor(Date.now() / 1000);
+    // The event's one collateral (docs/TOKENS.md §2 decision 9): the catalog column once a market
+    // fixed it, else the members'. Only the members in that instrument are the event's legs here —
+    // a stray market in another token (one that bypassed the backend's check) is neither summed
+    // nor nested; it stays addressable through `GET /markets?event=`.
+    const collateralOf = (e: CatalogEventEntity, all: MarketEntity[]): InstrumentId | null =>
+      e.collateralAdmin && e.collateralId
+        ? { admin: e.collateralAdmin, id: e.collateralId }
+        : all[0]
+          ? { admin: all[0].collateralAdmin, id: all[0].collateralId }
+          : null;
+    const membersOf = new Map<string, MarketEntity[]>();
+    for (const e of rows) {
+      const all = byEvent.get(e.ticker) ?? [];
+      const collateral = collateralOf(e, all);
+      membersOf.set(
+        e.ticker,
+        collateral
+          ? all.filter((m) =>
+              sameInstrument({ admin: m.collateralAdmin, id: m.collateralId }, collateral),
+            )
+          : [],
+      );
+    }
+    const memberRows = [...membersOf.values()].flat();
     // One batch of extras for every member: the 24 h volume feeds the event aggregate whether or
     // not the markets are nested, and shaping reuses it.
-    const extras = await this.markets.extrasFor(marketRows, manager);
+    const extras = await this.markets.extrasFor(memberRows, manager);
     const shapedByEvent = new Map<string, ApiMarket[]>();
     if (withMarkets)
-      for (const m of marketRows) {
+      for (const m of memberRows) {
         const list = shapedByEvent.get(m.eventTicker) ?? [];
         list.push(this.markets.toApi(m, false, extras.get(m.marketId)));
         shapedByEvent.set(m.eventTicker, list);
       }
-    const nowSec = Math.floor(Date.now() / 1000);
     return rows.map((e) => {
-      const members = byEvent.get(e.ticker) ?? [];
+      const members = membersOf.get(e.ticker) ?? [];
       const phases = members.map((m) => this.markets.phaseOf(m, nowSec));
       const s = series.get(e.seriesTicker);
       let volume = 0n;
@@ -493,7 +597,7 @@ export class CatalogService {
       let liquidity = 0;
       let close: number | null = null;
       for (const m of members) {
-        volume += m.totalVolumeCC;
+        volume += m.totalVolume;
         volume24h += extras.get(m.marketId)?.volume24h ?? 0n;
         openInterest += m.openInterestYes + m.openInterestNo;
         const amm = ammStateOf(m);
@@ -502,6 +606,10 @@ export class CatalogService {
         close = close === null ? m.expiresAtSec : Math.max(close, m.expiresAtSec);
       }
       const top = members[0];
+      const collateralId = collateralOf(e, byEvent.get(e.ticker) ?? []);
+      const collateral = collateralId
+        ? this.markets.instrumentRef(collateralId.admin, collateralId.id)
+        : null;
       const api: ApiEvent = {
         ticker: e.ticker,
         seriesTicker: e.seriesTicker,
@@ -518,14 +626,20 @@ export class CatalogService {
         productMetadata: e.productMetadata ?? {},
         archived: e.archived,
         status: deriveEventStatus(phases),
+        instrument: collateral,
         marketCount: members.length,
-        volumeCC: formatCC(volume),
+        volume: formatAmount(volume),
         closeTime: close === null ? null : new Date(close * 1000).toISOString(),
-        volume24hCC: formatCC(volume24h),
-        openInterestCC: formatCC(openInterest),
-        liquidityCC: formatCC(numberToDecimal(liquidity)),
+        volume24h: formatAmount(volume24h),
+        openInterest: formatAmount(openInterest),
+        liquidity: formatAmount(numberToDecimal(liquidity)),
         topMarket: top
-          ? { marketId: top.marketId, ticker: top.ticker, yesSubTitle: top.yesSubTitle, currentPrice: formatCC(top.currentPrice) }
+          ? {
+              marketId: top.marketId,
+              ticker: top.ticker,
+              yesSubTitle: top.yesSubTitle,
+              currentPrice: formatAmount(top.currentPrice),
+            }
           : null,
         createdAt: e.createdAt.toISOString(),
         updatedAt: e.updatedAt.toISOString(),
@@ -537,7 +651,8 @@ export class CatalogService {
 
   private toApiSeries(
     s: SeriesEntity,
-    counts: { events: number; markets: number } | undefined,
+    counts: SeriesCounts | undefined,
+    instrument: InstrumentRef | null,
   ): ApiSeries {
     return {
       ticker: s.ticker,
@@ -550,31 +665,49 @@ export class CatalogService {
       description: s.description,
       status: s.status,
       productMetadata: s.productMetadata ?? {},
+      instrument,
       eventCount: counts?.events ?? 0,
       marketCount: counts?.markets ?? 0,
+      volume: formatAmount(counts?.volume ?? 0n),
       createdAt: s.createdAt.toISOString(),
       updatedAt: s.updatedAt.toISOString(),
     };
   }
 
+  /**
+   * A series' figures in ONE instrument (docs/TOKENS.md §4.5): its unarchived events denominated
+   * in it (an event without a market yet belongs to no instrument and counts under every one),
+   * the member markets of those events in that instrument, and their lifetime volume. Without an
+   * instrument (no collateral configured) every event and market counts.
+   */
   private async seriesCounts(
     tickers: string[],
+    instrument: InstrumentRef | null,
     manager: EntityManager = this.dataSource.manager,
-  ): Promise<Map<string, { events: number; markets: number }>> {
-    const out = new Map<string, { events: number; markets: number }>();
+  ): Promise<Map<string, SeriesCounts>> {
+    const out = new Map<string, SeriesCounts>();
     if (tickers.length === 0) return out;
-    const rows = await manager.query<{ series_ticker: string; events: string; markets: string }[]>(
+    const rows = await manager.query<
+      { series_ticker: string; events: string; markets: string; volume: string }[]
+    >(
       `SELECT e.series_ticker,
               COUNT(DISTINCT e.ticker)::text AS events,
-              COUNT(m.market_id)::text AS markets
+              COUNT(m.market_id)::text AS markets,
+              COALESCE(SUM(m.total_volume), 0)::text AS volume
          FROM to_events e
          LEFT JOIN to_markets m ON m.event_ticker = e.ticker AND m.archived = false
+              AND m.collateral_admin = e.collateral_admin AND m.collateral_id = e.collateral_id
         WHERE e.series_ticker = ANY($1::text[]) AND e.archived = false
+          AND ($2::text IS NULL OR e.collateral_admin IS NULL OR (e.collateral_admin = $2 AND e.collateral_id = $3))
         GROUP BY e.series_ticker`,
-      [tickers],
+      [tickers, instrument?.admin ?? null, instrument?.id ?? null],
     );
     for (const r of rows)
-      out.set(r.series_ticker, { events: Number(r.events), markets: Number(r.markets) });
+      out.set(r.series_ticker, {
+        events: Number(r.events),
+        markets: Number(r.markets),
+        volume: parseAmount(r.volume),
+      });
     return out;
   }
 
@@ -616,4 +749,4 @@ function escapeLike(s: string): string {
 }
 
 /** Shared by the read side: `Σ volume` etc. arrive as numeric strings. */
-export const parseNumeric = (v: string | null | undefined): bigint => parseCC(v ?? "0");
+export const parseNumeric = (v: string | null | undefined): bigint => parseAmount(v ?? "0");

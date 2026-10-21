@@ -2,11 +2,23 @@ import { Controller, Get, Query, UseInterceptors } from "@nestjs/common";
 import { ApiTags } from "@nestjs/swagger";
 
 import { Public } from "../auth/decorators";
-import { LeaderboardQueryDto, LedgerWaitQueryDto } from "../dto/ledger.dto";
+import { InstrumentQueryDto, LeaderboardQueryDto, LedgerWaitQueryDto } from "../dto/ledger.dto";
 import { IndexerService } from "../services/indexer.service";
 import { MarketsService } from "../services/markets.service";
-import type { ApiLeaderboardEntry, ApiLedgerStatus, ApiStats } from "../types";
+import {
+  type ApiLeaderboardEntry,
+  type ApiLedgerStatus,
+  type ApiStats,
+  type InstrumentId,
+  type InstrumentRef,
+  parseInstrumentKey,
+} from "../types";
 import { LedgerOffsetInterceptor } from "../util/ledger-offset.interceptor";
+
+/** The DTO already shaped the key; a parse miss here can only be a bug, so it reads as "default". */
+function instrumentOf(raw: string | undefined): InstrumentId | undefined {
+  return raw ? (parseInstrumentKey(raw) ?? undefined) : undefined;
+}
 
 const DEFAULT_WAIT_MS = 10_000;
 
@@ -40,17 +52,22 @@ export class LedgerController {
       .then((r) => ({ ...r, requested: query.offset }));
   }
 
+  /** Aggregates over one instrument's markets (`?instrument=<admin>:<id>`, default the default collateral). */
   @Get("stats")
   @UseInterceptors(LedgerOffsetInterceptor)
-  async stats(): Promise<ApiStats> {
-    return this.markets.stats(await this.indexer.currentOffset());
+  async stats(@Query() query: InstrumentQueryDto): Promise<ApiStats> {
+    return this.markets.stats(await this.indexer.currentOffset(), instrumentOf(query.instrument));
   }
 
   @Get("leaderboard")
   @UseInterceptors(LedgerOffsetInterceptor)
   leaderboard(
     @Query() query: LeaderboardQueryDto,
-  ): Promise<{ window: string; entries: ApiLeaderboardEntry[] }> {
-    return this.markets.leaderboard(query.window ?? "30d", query.limit ?? 25);
+  ): Promise<{ window: string; instrument: InstrumentRef; entries: ApiLeaderboardEntry[] }> {
+    return this.markets.leaderboard(
+      query.window ?? "30d",
+      query.limit ?? 25,
+      instrumentOf(query.instrument),
+    );
   }
 }

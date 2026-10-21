@@ -53,7 +53,9 @@ export class SessionService {
   ) {}
 
   hashToken(token: string): string {
-    return createHmac("sha256", this.config.sessionSecret).update(token, "utf8").digest("base64url");
+    return createHmac("sha256", this.config.sessionSecret)
+      .update(token, "utf8")
+      .digest("base64url");
   }
 
   ttlMsFor(kind: SessionKind): number {
@@ -94,7 +96,12 @@ export class SessionService {
 
     let session: SessionEntity;
     let cached = await this.redis.getJson<CachedSession>(`sess:${tokenHash}`).catch(() => null);
-    if (cached && (await this.redis.claimOnce(`sess_recheck:${cached.id}`, RECHECK_INTERVAL_MS).catch(() => false))) {
+    if (
+      cached &&
+      (await this.redis
+        .claimOnce(`sess_recheck:${cached.id}`, RECHECK_INTERVAL_MS)
+        .catch(() => false))
+    ) {
       // Periodic re-validation of a cache hit: an eviction that failed must not outlive this window.
       const stored = await this.sessions.findOne({ where: { id: cached.id } });
       if (!stored || stored.revokedAt || stored.expiresAt.getTime() <= Date.now()) {
@@ -130,18 +137,30 @@ export class SessionService {
 
   /** Bump `last_seen_at` at most every 5 minutes (a Redis claim throttles the write). */
   async touch(session: SessionEntity): Promise<void> {
-    const claimed = await this.redis.claimOnce(`sess_touch:${session.id}`, TOUCH_INTERVAL_MS).catch(() => false);
+    const claimed = await this.redis
+      .claimOnce(`sess_touch:${session.id}`, TOUCH_INTERVAL_MS)
+      .catch(() => false);
     if (!claimed) return;
     await this.sessions.update({ id: session.id, revokedAt: IsNull() }, { lastSeenAt: new Date() });
   }
 
-  async revoke(sessionId: string, actor?: { type: ActorType; userId?: string | null; sessionId?: string | null; ip?: string | null }): Promise<void> {
+  async revoke(
+    sessionId: string,
+    actor?: {
+      type: ActorType;
+      userId?: string | null;
+      sessionId?: string | null;
+      ip?: string | null;
+    },
+  ): Promise<void> {
     const session = await this.sessions.findOne({ where: { id: sessionId } });
     if (!session) return;
     if (!session.revokedAt) {
       // The audit row commits with the change it describes (ARCHITECTURE §5).
       await this.dataSource.transaction(async (manager) => {
-        await manager.getRepository(SessionEntity).update({ id: sessionId }, { revokedAt: new Date() });
+        await manager
+          .getRepository(SessionEntity)
+          .update({ id: sessionId }, { revokedAt: new Date() });
         if (actor) {
           await this.audit.record(
             {
@@ -174,7 +193,9 @@ export class SessionService {
     }
     // Belt and braces: anything the index still knows about is evicted too.
     const indexed = await this.redis.smembers(`user_sessions:${userId}`);
-    const keepHash = exceptSessionId ? live.find((s) => s.id === exceptSessionId)?.tokenHash : undefined;
+    const keepHash = exceptSessionId
+      ? live.find((s) => s.id === exceptSessionId)?.tokenHash
+      : undefined;
     for (const hash of indexed) {
       if (hash === keepHash) continue;
       await this.evict(userId, hash);
@@ -219,7 +240,11 @@ export class SessionService {
     return clearedSessionCookie(this.config);
   }
 
-  toApi(session: SessionEntity, authMethod: IdentityProvider, currentSessionId: string | null): ApiSession {
+  toApi(
+    session: SessionEntity,
+    authMethod: IdentityProvider,
+    currentSessionId: string | null,
+  ): ApiSession {
     return {
       id: session.id,
       kind: session.kind,
@@ -247,7 +272,10 @@ export class SessionService {
     try {
       await this.redis.setJson(`sess:${session.tokenHash}`, cached, ttl);
       await this.redis.sadd(`user_sessions:${session.userId}`, session.tokenHash);
-      await this.redis.pexpire(`user_sessions:${session.userId}`, Math.max(ttl, this.config.sessionTtlMs));
+      await this.redis.pexpire(
+        `user_sessions:${session.userId}`,
+        Math.max(ttl, this.config.sessionTtlMs),
+      );
     } catch (err) {
       this.logger.warn(`session cache warm failed: ${(err as Error).message}`);
     }
@@ -264,7 +292,11 @@ export class SessionService {
       await this.redis.srem(`user_sessions:${userId}`, tokenHash);
     } catch (err) {
       this.logger.error(`session cache evict failed: ${(err as Error).message}`);
-      throw new ApiError(502, "upstream_failed", "the session could not be evicted from the cache; retry the revocation");
+      throw new ApiError(
+        502,
+        "upstream_failed",
+        "the session could not be evicted from the cache; retry the revocation",
+      );
     }
   }
 }

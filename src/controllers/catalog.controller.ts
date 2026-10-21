@@ -2,18 +2,37 @@ import { Controller, Get, Param, Query, UseInterceptors } from "@nestjs/common";
 import { ApiTags } from "@nestjs/swagger";
 
 import { Public } from "../auth/decorators";
-import { EventListQueryDto, EventTradesQueryDto, SeriesListQueryDto } from "../dto/catalog.dto";
+import {
+  CatalogInstrumentQueryDto,
+  EventListQueryDto,
+  EventTradesQueryDto,
+  SeriesListQueryDto,
+} from "../dto/catalog.dto";
 import { DEFAULT_PAGE_LIMIT } from "../dto/common.dto";
 import { CandlesQueryDto } from "../dto/ledger.dto";
 import { CandlesService } from "../services/candles.service";
 import { CatalogService } from "../services/catalog.service";
-import type { ApiEvent, ApiEventCandlesticks, ApiMarketEvent, ApiPage, ApiSeries } from "../types";
+import {
+  parseInstrumentKey,
+  type ApiEvent,
+  type ApiEventCandlesticks,
+  type ApiMarketEvent,
+  type ApiPage,
+  type ApiSeries,
+  type InstrumentId,
+} from "../types";
 import { LedgerOffsetInterceptor } from "../util/ledger-offset.interceptor";
+
+/** `?instrument=<admin>:<id>` → the pair, or undefined when absent (the DTO validated the form). */
+function instrumentOf(raw: string | undefined): InstrumentId | undefined {
+  return raw ? (parseInstrumentKey(raw) ?? undefined) : undefined;
+}
 
 /**
  * Public catalog reads (docs/API.md "Catalog"; docs/MARKETS.md §2–§3): series and events, with
  * the member markets nested on request. Everything derived (event status, volume, close time)
  * comes from the ledger index, so the responses carry `x-ledger-offset` like the market reads.
+ * Listings are per instrument (`?instrument=`, default the default collateral — docs/TOKENS.md §4.5).
  */
 @ApiTags("catalog")
 @Controller()
@@ -31,14 +50,18 @@ export class CatalogController {
       category: query.category,
       status: query.status,
       q: query.q,
+      instrument: instrumentOf(query.instrument),
       page: query.page ?? 1,
       limit: query.limit ?? DEFAULT_PAGE_LIMIT,
     });
   }
 
   @Get("series/:ticker")
-  getSeries(@Param("ticker") ticker: string): Promise<{ series: ApiSeries; events: ApiEvent[] }> {
-    return this.catalog.getSeries(ticker);
+  getSeries(
+    @Param("ticker") ticker: string,
+    @Query() query: CatalogInstrumentQueryDto,
+  ): Promise<{ series: ApiSeries; events: ApiEvent[] }> {
+    return this.catalog.getSeries(ticker, instrumentOf(query.instrument));
   }
 
   @Get("events")
@@ -49,6 +72,7 @@ export class CatalogController {
       category: query.category,
       q: query.q,
       sort: query.sort,
+      instrument: instrumentOf(query.instrument),
       withNestedMarkets: query.withNestedMarkets ?? false,
       includeArchived: query.includeArchived ?? false,
       page: query.page ?? 1,

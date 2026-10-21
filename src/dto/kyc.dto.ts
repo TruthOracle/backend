@@ -2,7 +2,9 @@ import { Type } from "class-transformer";
 import {
   ArrayMaxSize,
   IsArray,
+  IsBoolean,
   IsIn,
+  IsOptional,
   IsString,
   IsUUID,
   Length,
@@ -53,6 +55,89 @@ export class KycMockDocumentDto {
   number!: string;
 }
 
+// ── compliance identity (SPEC §11.1; stage S7a): the mock applicant beyond the fingerprinted person ──
+
+/** One more way the document writes the name (be / ru Cyrillic, Latin). */
+export class KycMockNameDto {
+  @IsString()
+  @Length(1, 200)
+  firstName!: string;
+
+  @IsString()
+  @Length(1, 200)
+  lastName!: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(1, 200)
+  middleName?: string;
+}
+
+/** The provider's AML screening as the mock reports it (absent = not screened). */
+export class KycMockAmlDto {
+  @IsOptional()
+  @IsBoolean()
+  pep?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  sanctions?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  adverseMedia?: boolean;
+}
+
+/** The art.8 data a real provider holds (names, birth place, residence, document dates, AML). */
+export class KycMockIdentityDto {
+  /** Every name form; default: the person's name. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(6)
+  @ValidateNested({ each: true })
+  @Type(() => KycMockNameDto)
+  names?: KycMockNameDto[];
+
+  @IsOptional()
+  @IsString()
+  @Length(1, 200)
+  birthPlace?: string;
+
+  /** Default: the person's country. */
+  @IsOptional()
+  @Matches(ISO3, { message: "nationality must be an ISO-3166 alpha-3 code" })
+  nationality?: string;
+
+  /** Default: the person's country. */
+  @IsOptional()
+  @Matches(ISO3, { message: "residenceCountry must be an ISO-3166 alpha-3 code" })
+  residenceCountry?: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(1, 300)
+  addressLine?: string;
+
+  /** The first document's personal (identification) number. */
+  @IsOptional()
+  @IsString()
+  @Length(1, 64)
+  personalNumber?: string;
+
+  @IsOptional()
+  @Matches(ISO_DATE, { message: "docIssuedAt must be YYYY-MM-DD" })
+  docIssuedAt?: string;
+
+  @IsOptional()
+  @Matches(ISO_DATE, { message: "docExpiresAt must be YYYY-MM-DD" })
+  docExpiresAt?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => KycMockAmlDto)
+  aml?: KycMockAmlDto;
+}
+
 export class KycMockSubmitDto {
   @IsUUID()
   verificationId!: string;
@@ -70,4 +155,10 @@ export class KycMockSubmitDto {
   @ValidateNested({ each: true })
   @Type(() => KycMockDocumentDto)
   documents!: KycMockDocumentDto[];
+
+  /** SPEC §11.1 (S7a): optional identity data beyond the person (defaults derive from it). */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => KycMockIdentityDto)
+  identity?: KycMockIdentityDto;
 }

@@ -27,17 +27,21 @@ export class LedgerPayoutEntity {
   @Column({ name: "market_id", type: "bigint", transformer: bigintNumberTransformer })
   marketId!: number;
 
-  @Column({
-    name: "amount_cc",
-    type: "numeric",
-    precision: 38,
-    scale: 10,
-    transformer: moneyTransformer,
-  })
-  amountCC!: bigint;
+  /** `PendingPayout.instrument` — the market's collateral for bonds / prizes, the wallet's instrument for withdrawals. */
+  @Column({ name: "instrument_admin", type: "text" })
+  instrumentAdmin!: string;
+
+  @Column({ name: "instrument_id", type: "text" })
+  instrumentId!: string;
+
+  @Column({ type: "numeric", precision: 38, scale: 10, transformer: moneyTransformer })
+  amount!: bigint;
 
   @Column({ type: "text" })
   reason!: string;
+
+  @Column({ name: "audit_observers", type: "jsonb", default: () => "'[]'::jsonb" })
+  auditObservers!: string[];
 
   @Column({ name: "created_at_sec", type: "bigint", transformer: bigintNumberTransformer })
   createdAtSec!: number;

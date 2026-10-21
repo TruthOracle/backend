@@ -23,7 +23,12 @@ export class ApiError extends Error {
   readonly code: ErrorCode;
   readonly details?: Record<string, unknown>;
 
-  constructor(status: number, code: ErrorCode, message?: string, details?: Record<string, unknown>) {
+  constructor(
+    status: number,
+    code: ErrorCode,
+    message?: string,
+    details?: Record<string, unknown>,
+  ) {
     super(message ?? code);
     this.name = "ApiError";
     this.status = status;
@@ -36,7 +41,9 @@ export class ApiError extends Error {
   }
 
   toBody(): ErrorBody {
-    return this.details ? { error: this.code, message: this.message, details: this.details } : { error: this.code, message: this.message };
+    return this.details
+      ? { error: this.code, message: this.message, details: this.details }
+      : { error: this.code, message: this.message };
   }
 }
 
@@ -108,7 +115,8 @@ function fromHttpException(exception: HttpException): { status: number; body: Er
 export function bodyParserToApiError(err: unknown): ApiError | null {
   if (!err || typeof err !== "object" || err instanceof ApiError) return null;
   const e = err as { status?: unknown; statusCode?: unknown; type?: unknown; message?: unknown };
-  const status = typeof e.status === "number" ? e.status : typeof e.statusCode === "number" ? e.statusCode : 0;
+  const status =
+    typeof e.status === "number" ? e.status : typeof e.statusCode === "number" ? e.statusCode : 0;
   if (status < 400 || status > 499) return null;
   const type = typeof e.type === "string" ? e.type : "";
   if (type === "entity.parse.failed" || type === "entity.verify.failed") {
@@ -154,7 +162,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
         status = HttpStatus.INTERNAL_SERVER_ERROR;
         body = { error: "internal_error", message: "internal error" };
         const err = exception instanceof Error ? exception : new Error(String(exception));
-        this.logger.error(`${req.method} ${req.originalUrl ?? req.url} → 500: ${err.message}`, err.stack);
+        this.logger.error(
+          `${req.method} ${req.originalUrl ?? req.url} → 500: ${err.message}`,
+          err.stack,
+        );
         // Tags only — never bodies, cookies or PII (ARCHITECTURE §14).
         Sentry.captureException(err, {
           tags: { route: `${req.method} ${routePath}`, requestId: req.id ?? "" },
@@ -163,12 +174,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
     }
 
     if (status >= 500 && exception instanceof ApiError) {
-      this.logger.warn(`${req.method} ${req.originalUrl ?? req.url} → ${status} ${body.error}: ${body.message}`);
+      this.logger.warn(
+        `${req.method} ${req.originalUrl ?? req.url} → ${status} ${body.error}: ${body.message}`,
+      );
     }
 
     if (status === 429) {
       const retryAfter = body.details?.retryAfterSec;
-      if (typeof retryAfter === "number") res.setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfter))));
+      if (typeof retryAfter === "number")
+        res.setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfter))));
     }
     if (res.headersSent) return;
     res.status(status);

@@ -1,4 +1,9 @@
-import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from "@nestjs/common";
+import {
+  Injectable,
+  Logger,
+  type OnApplicationBootstrap,
+  type OnModuleDestroy,
+} from "@nestjs/common";
 
 import { DepositService } from "../services/deposit.service";
 import { RedisService } from "../services/redis.service";
@@ -54,7 +59,9 @@ export class DepositConfirmProcessor implements OnApplicationBootstrap, OnModule
     try {
       const result = await this.deposits.confirmPending();
       if (result.confirmed || result.failed) {
-        this.logger.log(`confirm pass: ${result.confirmed} credit(s) confirmed, ${result.failed} failed`);
+        this.logger.log(
+          `confirm pass: ${result.confirmed} credit(s) confirmed, ${result.failed} failed`,
+        );
       }
       return result;
     } catch (err) {

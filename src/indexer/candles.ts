@@ -5,7 +5,7 @@
  * EntityManager it was given, so a replayed transaction (skipped as a whole) never double-counts.
  */
 import { CANDLE_PERIOD_SECS } from "../types";
-import { formatCC } from "../util/money";
+import { formatAmount } from "../util/money";
 
 /** What one market version contributes to its candles. */
 export interface CandleContribution {
@@ -14,7 +14,7 @@ export interface CandleContribution {
   atSec: number;
   price: bigint;
   liquidityL: bigint;
-  /** Δ `totalVolumeCC` against the consumed predecessor (0 for the first version and non-trade versions). */
+  /** Δ `totalVolume` against the consumed predecessor (0 for the first version and non-trade versions). */
   volumeDelta: bigint;
   /** 1 for Buy / Sell / SwapShares versions, else 0. */
   trades: number;
@@ -41,11 +41,11 @@ export function candleUpsert(
   c: CandleContribution,
   periodSecs: number,
 ): { sql: string; params: unknown[] } {
-  const price = formatCC(c.price);
-  const notional = formatCC((c.price * c.volumeDelta) / 10_000_000_000n);
+  const price = formatAmount(c.price);
+  const notional = formatAmount((c.price * c.volumeDelta) / 10_000_000_000n);
   return {
     sql: `INSERT INTO to_market_candles
-            (market_id, period_secs, period_start, open, high, low, close, volume_cc, notional_cc, trades,
+            (market_id, period_secs, period_start, open, high, low, close, volume, notional, trades,
              open_interest, liquidity_l, last_offset, last_node_id, updated_at)
           VALUES ($1, $2, to_timestamp($3), $4, $4, $4, $4, $5, $6, $7, $8, $9, $10, $11, now())
           ON CONFLICT (market_id, period_secs, period_start) DO UPDATE SET
@@ -57,8 +57,8 @@ export function candleUpsert(
                                THEN EXCLUDED.liquidity_l ELSE to_market_candles.liquidity_l END,
             open_interest = CASE WHEN (EXCLUDED.last_offset, EXCLUDED.last_node_id) >= (to_market_candles.last_offset, to_market_candles.last_node_id)
                                  THEN EXCLUDED.open_interest ELSE to_market_candles.open_interest END,
-            volume_cc = to_market_candles.volume_cc + EXCLUDED.volume_cc,
-            notional_cc = to_market_candles.notional_cc + EXCLUDED.notional_cc,
+            volume = to_market_candles.volume + EXCLUDED.volume,
+            notional = to_market_candles.notional + EXCLUDED.notional,
             trades = to_market_candles.trades + EXCLUDED.trades,
             last_offset = GREATEST(to_market_candles.last_offset, EXCLUDED.last_offset),
             last_node_id = CASE WHEN EXCLUDED.last_offset >= to_market_candles.last_offset THEN EXCLUDED.last_node_id ELSE to_market_candles.last_node_id END,
@@ -68,11 +68,11 @@ export function candleUpsert(
       periodSecs,
       periodStartSec(c.atSec, periodSecs),
       price,
-      formatCC(c.volumeDelta),
+      formatAmount(c.volumeDelta),
       notional,
       c.trades,
-      formatCC(c.openInterest),
-      formatCC(c.liquidityL),
+      formatAmount(c.openInterest),
+      formatAmount(c.liquidityL),
       String(c.offset),
       c.nodeId,
     ],

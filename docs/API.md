@@ -3,10 +3,13 @@
 All times are UTC: ISO 8601 strings end in `Z`, epoch fields are seconds since the Unix epoch, and daily candles are UTC days.
 
 
-Shared contract between `truthoracle-backend` and the `truthoracle-canton` frontend. Every
+Shared contract between `truthoracle-backend` and the `pm-frontend` frontend. Every
 route is under `/api/v1` (frontend reaches it as `/__backend/api/v1/...`). Bodies and
 responses are JSON. Money is a **string with exactly 10 decimals** (`"12.5000000000"`),
-never a number. Timestamps are ISO-8601 strings. Ids are UUIDs unless stated.
+never a number, and every money field sits next to the `InstrumentRef` it is denominated in
+(`collateral` on a market, `instrument` everywhere else — docs/TOKENS.md §2); the instrument's
+`decimals` is for display and withdrawal quantisation only. Timestamps are ISO-8601 strings.
+Ids are UUIDs unless stated.
 
 Errors: HTTP status + `{ "error": "<code>", "message": "<human text>", "details"?: {...} }`.
 Codes are listed in ARCHITECTURE.md §11. Rate-limited responses are `429 rate_limited`
@@ -21,6 +24,8 @@ login request sets `"client": "native"`).
 
 ```ts
 type Money = string;                       // "0.0000000000"
+/** A CIP-56 instrument: `admin` = the registry party (cBYN: the transfer agent; Canton Coin: the DSO), `id` = the token id. */
+interface InstrumentRef { admin: string; id: string; symbol: string; name: string; decimals: number }
 type KycStatus = "none" | "pending" | "approved" | "rejected" | "blocked_duplicate";
 type IdentityProvider = "google" | "telegram" | "canton_wallet";
 
@@ -35,13 +40,18 @@ interface Identity {
   status: "active" | "unlinked"; verifiedAt: string; lastUsedAt: string | null;
   kycLocked: boolean;                       // cannot be unlinked while the KYC approval stands
 }
-interface LedgerWallet { contractId: string; owner: string; balanceCC: Money; depositedCC: Money; withdrawnCC: Money }
+// one on-ledger UserWallet; a party holds one per instrument (truthoracle-v17)
+interface LedgerWallet { contractId: string; owner: string; instrument: InstrumentRef; balance: Money; deposited: Money; withdrawn: Money; creditRefs: string[] }
+interface WalletCredit {
+  instrument: InstrumentRef;
+  credited: Money;                          // in-app credits attributed to this wallet in the instrument (the only attribution — nothing predates the backend)
+  received?: Money;                         // only in GET /in-app-wallet: what the party sent the treasury in the instrument
+}
 interface Wallet {
   id: string; chain: "canton"; kind: "cantor8"; partyId: string; label: string | null;
   isPrimary: boolean; status: "active" | "revoked"; verifiedAt: string;
-  creditedCC: Money;                        // in-app credits attributed to this wallet (the only attribution — nothing predates the backend)
-  receivedCC?: Money;                       // only in GET /in-app-wallet
-  ownLedgerWallet: LedgerWallet | null;     // a non-primary party's own on-ledger UserWallet, if any
+  credits: WalletCredit[];                  // one entry per instrument the wallet was credited (or sent) in; empty until the first deposit
+  ownLedgerWallets: LedgerWallet[];         // a non-primary party's own on-ledger UserWallets (one per instrument), if any
 }
 interface KycVerification {
   id: string; provider: "mock" | "sumsub" | "admin"; levelName: string; attemptNo: number;
@@ -60,9 +70,9 @@ interface Capabilities {
 interface Session { id: string; kind: "user" | "admin"; authMethod: IdentityProvider; identityId: string;
   createdAt: string; expiresAt: string; lastSeenAt: string | null; ip: string | null; userAgent: string | null; current: boolean }
 interface Payout {
-  pendingPayoutCid: string; payeeParty: string; walletId: string | null; amountCC: Money; reason: string;
+  pendingPayoutCid: string; payeeParty: string; walletId: string | null; instrument: InstrumentRef; amount: Money; reason: string;
   status: "queued" | "settling" | "settled_external" | "settled_in_app" | "blocked_kyc" | "blocked_unknown_user" |
-          "blocked_unknown_reason" | "blocked_wallet_revoked" | "failed" | "archived";
+          "blocked_unknown_reason" | "blocked_wallet_revoked" | "blocked_ramp_hold" | "failed" | "archived";
   retryAfterKyc: boolean; attempts: number; lastError: string | null; firstSeenAt: string; settledAt: string | null;
   onLedger: boolean;                         // still an active PendingPayout contract
 }
@@ -128,20 +138,43 @@ by another account returns `409 identity_already_linked`; a wallet owned by anot
 Deposits and withdrawals **require a signed-in account** (ARCHITECTURE §18): there is no
 account-less money path. Trading and reads stay wallet-signed, but a choice that debits or
 credits a `UserWallet` presupposes one exists — i.e. an account that deposited through this API.
-- `GET /in-app-wallet` → `200 { partyId: string | null, ledger: LedgerWallet | null, wallets: Wallet[] (with receivedCC), attribution: { creditedTotalCC: Money, ledgerDepositedCC: Money, delta: Money }, pending: { submitted: number }, payouts: Payout[] }`
-  (`delta = ledgerDepositedCC − creditedTotalCC`; anything beyond 1e-9 CC makes the next reconcile answer `409 deposit_attribution_drift`)
-- `POST /in-app-wallet/deposits/reconcile` → `200 { credited: Money, status: "confirmed" | "submitted" | "nothing_outstanding", commandId?: string, perWallet: { walletId, partyId, amountCC: Money }[], ledger: LedgerWallet | null }`
-  | `409 no_primary_wallet` | `409 deposit_in_progress` | `409 deposit_attribution_drift` (`details: { kind: "over_credit" | "ledger_below_expected" | "ledger_above_expected" | "duplicate_user_wallet", walletId?, amountCC? }`) | `409 kyc_duplicate_identity` | `502 upstream_failed`
+- `GET /in-app-wallet` → `200 { partyId: string | null, wallets: Wallet[] (credits with received), balances: { instrument: InstrumentRef, ledger: LedgerWallet | null, attribution: { creditedTotal: Money, ledgerDeposited: Money, delta: Money } }[], pending: { submitted: number }, payouts: Payout[] }`
+  — one `balances` row per instrument the account holds a wallet or a credit in, plus the default collateral and the rewards instrument even before a wallet exists (`delta = ledgerDeposited − creditedTotal` per instrument; anything beyond 1e-9 units makes the next reconcile in that instrument answer `409 deposit_attribution_drift`)
+- `POST /in-app-wallet/deposits/reconcile` `{ instrument?: { admin, id } }` (default: the default collateral) → `200 { instrument: InstrumentRef, credited: Money, status: "confirmed" | "submitted" | "nothing_outstanding", commandId?: string, perWallet: { walletId, partyId, amount: Money }[], ledger: LedgerWallet | null }`
+  | `409 no_primary_wallet` | `409 deposit_in_progress` | `409 deposit_attribution_drift` (`details: { kind: "over_credit" | "ledger_below_expected" | "ledger_above_expected" | "duplicate_user_wallet", instrument, walletId?, amount? }`) | `409 kyc_duplicate_identity` | `409 instrument_disabled` | `404 instrument_unknown` | `503 ledger_stale` (`details: { offset, ledgerEnd, lag, maxLag }` — the ledger index lags the ledger end by more than `LEDGER_FRESH_OFFSETS`, or no participant is configured to check against; retry shortly) | `502 upstream_failed`
+  — the received side is the ledger index (`to_ledger_transfers`, docs/TOKENS.md §2 decision 5): what the linked parties sent the treasury in the instrument, token-standard or Canton Coin, as the treasury's own transaction stream showed it
 - `GET /in-app-wallet/payouts` → `200 { payouts: Payout[] }`
-- `POST /in-app-wallet/payouts/:cid/settle` → `200 { payout: Payout, mode: "external" | "in_app" | "already_settled" }` | `404 payout_not_found` | `409 kyc_required` | `409 payout_blocked` (`details.status`)
+- `POST /in-app-wallet/payouts/:cid/settle` → `200 { payout: Payout, mode: "external" | "in_app" | "offramp" | "already_settled" }` | `404 payout_not_found` | `409 kyc_required` | `409 payout_blocked` (`details.status`) | `409 ramp_hold` (card-bought value on hold, docs/RAMP.md §6 — the row is `blocked_ramp_hold` and settles by itself when the hold ends). `offramp` = a withdrawal bound to a card cash-out: MarkPaid only, the fiat follows (docs/RAMP.md §3.2)
 
 ## KYC
 - `GET /kyc` → `200 KycSummary & { history: KycVerification[] }`
 - `POST /kyc/sessions` → `200 { provider: "sumsub", accessToken, expiresAt, levelName, verificationId }` | `200 { provider: "mock", verificationId, levelName }` | `409 kyc_duplicate_identity` | `503 kyc_provider_unavailable`
 - `POST /kyc/mock/submit` `{ verificationId, outcome: "approved" | "rejected_retry" | "rejected_final", person: { firstName, lastName, dob: "YYYY-MM-DD", country: "ISO3" }, documents: { docType: "PASSPORT" | "ID_CARD" | "DRIVERS" | "RESIDENCE_PERMIT", country, number }[] }` → `200 { verification, userKycStatus }` (mock provider only)
 
+## Fiat ramp (session; user sessions only; docs/RAMP.md)
+BYN card on-ramp and off-ramp for the ramp instrument (the default collateral, cBYN). 1 BYN = 1 token; `amount` is the side the user gives (fiat charged on-ramp, tokens withdrawn off-ramp), whole in the fiat's decimals; the fee comes off the other side. KYC is required whatever `KYC_ENFORCE_WITHDRAWALS` says (`RAMP_REQUIRE_KYC`). Order creation needs an `Idempotency-Key` header (8–128 of `[A-Za-z0-9_.:-]`): a retry answers the same order, the key reused for another request is `409 bad_request`. Opening, attaching and cancelling share 10/min/user.
+- `GET /ramp` → `200 RampOverview` — `{ enabled, provider, instrument, fiat: { currency, decimals }, fees: { onramp|offramp: { bps, fixed } }, limits: { onramp|offramp: { min, max, dailyMax, monthlyMax, dailyRemaining, monthlyRemaining } }, holdHours, hold: { locked, until }, capabilities: { cardPayouts }, eligibility: { onramp|offramp: string[] /* empty = allowed */ }, openOrders: RampOrder[] }`
+- `POST /ramp/quote` `{ direction: "onramp" | "offramp", amount }` → `200 { direction, instrument, fiatCurrency, fiatAmount, tokenAmount, fee }` | `400 validation_failed` | `503 ramp_unavailable`
+- `POST /ramp/onramp` `{ amount, expectedTokenAmount? }` → `200 { order: RampOrder, checkoutUrl }` | `503 ramp_unavailable` (`details.reason`) | `403 user_suspended` | `409 no_primary_wallet | kyc_required | kyc_duplicate_identity | ramp_limit_exceeded (details.limit, available) | ramp_quote_changed | ramp_order_open (details.orderId)` | `400 validation_failed` | `502 upstream_failed` (the acquirer refused; the order is `failed`)
+- `POST /ramp/offramp` `{ amount, paymentMethodId, expectedFiatAmount? }` → `200 { order: RampOrder, withdraw: { walletContractId, ownerParty, amount } }` — then sign `UserWallet.Withdraw { amount, nowSeconds }` on `walletContractId` and call attach | the on-ramp's errors plus `403 ramp_not_eligible` (no payout-eligible card) | `409 no_in_app_wallet | insufficient_balance | ramp_hold (details.unlockedAmount, holdUntil)`
+- `POST /ramp/orders/:id/attach` `{ pendingPayoutCid }` → `200 RampOrder` — binds the signed withdrawal and settles it (MarkPaid), then advances the cash-out | `409 ramp_order_state` (not waiting, or the PendingPayout's payee / instrument / amount / reason differ) | `404 not_found`
+- `POST /ramp/orders/:id/cancel` → `200 RampOrder` | `409 ramp_order_state` (paid, signed or closed)
+- `GET /ramp/orders?direction=&page=&limit=` → `{ items: RampOrder[], page, limit, total }` · `GET /ramp/orders/:id` → `RampOrder` | `404 not_found`
+- `GET /ramp/payment-methods` → `RampPaymentMethod[]` · `DELETE /ramp/payment-methods/:id` → `204` | `409 ramp_order_state` (a cash-out to it is in flight)
+- `POST /ramp/mock/payments/:paymentId/complete` `{ outcome: "succeeded" | "declined" | "no_3ds", cardSeed? }` · `POST /ramp/mock/payments/:paymentId/chargeback` → `200 { delivered: true }` (mock acquirer only; route absent otherwise)
+
+```ts
+interface RampOrder { id: string; direction: "onramp" | "offramp"; status: RampOrderStatus /* docs/RAMP.md §4 */; reviewStep: string | null;
+  instrument: InstrumentRef; fiatCurrency: string; fiatAmount: Money; tokenAmount: Money; fee: Money; paymentMethod: RampPaymentMethod | null;
+  checkoutUrl: string | null /* while awaiting_payment */; expiresAt: string | null; holdUntil: string | null; pendingPayoutCid: string | null;
+  failureCode: string | null; createdAt: string; updatedAt: string; completedAt: string | null }
+interface RampPaymentMethod { id: string; brand: string | null; last4: string | null; expMonth: number | null; expYear: number | null;
+  issuerCountry: string | null; status: "active" | "removed" | "blocked"; payoutEligible: boolean; createdAt: string; lastUsedAt: string | null }
+```
+
 ## Webhooks
 - `POST /webhooks/kyc/sumsub` (raw body, `x-payload-digest`, `x-payload-digest-alg`) → `200 { received: true }` | `401`
+- `POST /webhooks/ramp/:provider` (raw body, the provider's signature headers; mock: `x-mock-signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, 5-minute tolerance) → `200 { received: true }` | `401 webhook_rejected` | `404 not_found` (not the configured provider)
 
 ## Admin (admin session only)
 - `GET /admin/users?q=&page=` → `{ items: User[], page, limit, total }`
@@ -164,8 +197,9 @@ interface AuditEvent { id: string; actorType: "user" | "admin" | "system"; actor
 ## Ledger index (docs/INDEXER.md)
 
 Read-only routes over the backend's index of the treasury's ledger view. Daml `Decimal`s
-(prices, shares, CC) are 10-dp strings like Money; Daml `Int` epoch seconds are ISO-8601; durations
-are integer seconds; parties are Canton party ids. Every response below carries
+(prices, shares, amounts) are 10-dp strings like Money; Daml `Int` epoch seconds are ISO-8601;
+durations are integer seconds; parties are Canton party ids. Every amount-carrying object names
+its instrument (`collateral` on a market, `instrument` elsewhere). Every response below carries
 `x-ledger-offset: <last applied offset>`.
 
 ```ts
@@ -179,37 +213,42 @@ type MarketEventKind = "market_created" | "buy" | "sell" | "swap" | "split" | "m
 interface Market {
   marketId: number; ticker: string; eventTicker: string; yesSubTitle; noSubTitle: string;   // the contract's own identity (docs/MARKETS.md §2)
   seriesTicker: string | null;                                                               // through the event's catalog row (null only for a placeholder event without a series)
-  contractId: string; templateId: string | null; admin: string; question; resolutionDescription: string;
+  contractId: string; templateId: string | null; admin: string; collateral: InstrumentRef;   // the instrument every amount below is in (docs/TOKENS.md §2); fixed at creation
+  question; resolutionDescription: string;
   imageUrl; description; category: string;                                                   // backend-owned presentation (docs/MARKETS.md §1): own image else the event's; the series' category
   metadata: { imageUrl; description; updatedAt: string } | null;                             // the operator's own presentation row, null when the market shows its event's image
   createdAt; expiresAt; tradingStartsAt: string; gracePeriodSecs; liquidityPeriodSecs: number; isDynamic: boolean;
   reserveYes; reserveNo; liquidityL; lpTokenSupply; currentPrice: Decimal; feeBps; prizeFeeShareBps: number;
-  accumulatedFeesCC; prizePoolCC; totalVolumeCC: Decimal; status: MarketStatus; outcome: Outcome | null; resolvedAt: string | null;
-  proposal: { proposer; proposedOutcome: Outcome; proposedAt; bondCC; challenger: string | null; challengerOutcome: Outcome | null; challengeEndsAt } | null;
-  policy: { operatorResolution: boolean; sources: string[]; sourceKeys: { sourceUri; publicKey }[]; reporters: string[]; quorum; challengeSecs: number; bondCC: Decimal };
+  accumulatedFees; prizePool; totalVolume: Decimal; status: MarketStatus; outcome: Outcome | null; resolvedAt: string | null;
+  proposal: { proposer; proposedOutcome: Outcome; proposedAt; bond; challenger: string | null; challengerOutcome: Outcome | null; challengeEndsAt } | null;
+  policy: { operatorResolution: boolean; sources: string[]; sourceKeys: { sourceUri; publicKey }[]; reporters: string[]; quorum; challengeSecs: number; bond: Decimal };
   auditObservers: string[]; phase: Phase; archived: boolean; tradeCount: number; lastTradeAt: string | null;
-  previousPrice: Decimal | null; priceChange24h: Decimal | null; volume24hCC: Decimal;   // from the hourly candles
-  openInterest: { yes; no; total: Decimal }; liquidityCC: Decimal;                        // outstanding shares; pool value V(P)
-  book: { yesBid; yesAsk; noBid; noAsk; referenceCC: Decimal } | null;                    // AMM-implied for a 1 CC order, trading only
+  previousPrice: Decimal | null; priceChange24h: Decimal | null; volume24h: Decimal;   // from the hourly candles
+  openInterest: { yes; no; total: Decimal }; liquidity: Decimal;                        // outstanding shares; pool value V(P)
+  book: { yesBid; yesAsk; noBid; noAsk; reference: Decimal } | null;                    // AMM-implied for a 1-unit order, trading only
   updatedOffset; createdOffset: number; synchronizerId: string | null;
   createdEventBlob?: string | null;        // GET /markets/:id only — the disclosed contract a user-signed trade needs
 }
-interface MarketSummary { marketId; ticker; eventTicker; yesSubTitle; noSubTitle; contractId; question; imageUrl; category; status; outcome; currentPrice; expiresAt; resolvedAt; phase; archived }
+interface MarketSummary { marketId; ticker; eventTicker; yesSubTitle; noSubTitle; contractId; collateral: InstrumentRef; question; imageUrl; category; status; outcome; currentPrice; expiresAt; resolvedAt; phase; archived }
 interface MarketEvent {
   id: string; eventId: string; marketId: number; kind: MarketEventKind; actor: string; side: "Yes" | "No" | null;
-  amountCC; netCC; shares; sharesOut; feeCC; priceBefore; priceAfter; lpTokens: Decimal | null; outcome: Outcome | null;
+  instrument: InstrumentRef;                                                                  // the market's collateral: what amount / net / fee / notional are in
+  amount; net; shares; sharesOut; fee; priceBefore; priceAfter; lpTokens: Decimal | null; outcome: Outcome | null;
   details: Record<string, unknown>; offset: number; updateId: string; commandId: string | null; effectiveAt: string;
 }
-interface PricePoint { t: string; price: Decimal; volumeCC: Decimal; offset: number }
-interface Position { contractId; holder; marketId; yesShares; noShares; costBasisCC; active; createdAt; createdOffset; archivedAt;
-  market: MarketSummary | null; valueCC: Decimal | null; redeemableCC: Decimal | null }
-interface LiquidityPosition { contractId; provider; marketId; lpTokens; depositedCC; active; createdAt; createdOffset; archivedAt; market; poolShare: Decimal | null }
-interface WalletEntry { id; eventId; owner; kind: "deposit" | "credit" | "debit" | "withdraw"; amountCC; reason: string | null; txRef: string | null;
+interface PricePoint { t: string; price: Decimal; volume: Decimal; offset: number }
+interface Position { contractId; holder; marketId; instrument: InstrumentRef | null /* the market's collateral; null only when the market is not indexed */;
+  yesShares; noShares; costBasis; active; createdAt; createdOffset; archivedAt; market: MarketSummary | null; value: Decimal | null; redeemable: Decimal | null }
+interface LiquidityPosition { contractId; provider; marketId; instrument: InstrumentRef | null; lpTokens; deposited; active; createdAt; createdOffset; archivedAt; market; poolShare: Decimal | null }
+interface WalletEntry { id; eventId; owner; instrument: InstrumentRef; kind: "deposit" | "grant" | "credit" | "debit" | "withdraw"; amount; reason: string | null;
+  txRef: string | null /* deposit: the transfer ref; grant: reward:<grantId> */;
   balanceAfter: Decimal | null; marketId: number | null; rootChoice: string | null; walletContractId; offset; updateId; effectiveAt }
-interface IndexedWallet { contractId; owner; balanceCC; depositedCC; withdrawnCC; depositRefs: string[]; updatedOffset; updatedAt }
-interface LedgerPayout { contractId; user; marketId; amountCC; reason; createdAt; createdOffset; active;
+interface IndexedWallet { contractId; owner; instrument: InstrumentRef; balance; deposited; withdrawn; creditRefs: string[]; updatedOffset; updatedAt }
+interface LedgerPayout { contractId; user; marketId; instrument: InstrumentRef; amount; reason; createdAt; createdOffset; active;
   settledKind: "mark_paid" | "settle_to_wallet" | "cancelled" | "archived" | null; settledAt; settledOffset; txHash: string | null; refunded: boolean | null }
-interface LedgerTransfer { updateId; offset; direction: "in" | "out"; counterparty; amountCC; choice; recordTime }
+interface LedgerTransfer { updateId; nodeId: number; offset; direction: "in" | "out"; counterparty; instrument: InstrumentRef; amount; kind: "token_standard" | "amulet"; choice; recordTime }
+interface LedgerHolding { contractId; owner; instrument: InstrumentRef; amount; locked: boolean; lockExpiresAt: string | null; createdOffset: number; active: boolean }   // the treasury's token-standard holdings (docs/TOKENS.md §4.2)
+interface TransferInstruction { contractId; instrument: InstrumentRef; sender; receiver; amount; executeBefore: string | null; status: "pending" | "completed" | "failed"; createdOffset: number }   // two-step offers the treasury sent or received
 interface Attestation { contractId; attester; marketId; sourceUri; fetchedAt; outcome; payloadHash; hasSourceSignature; responseExcerpt; active; createdOffset }
 interface ModelForecast { contractId; author; marketId; modelId; probabilityYes; committedAt; marketPriceAtCommit; active; createdOffset }
 interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt; bootstrapOffset; offset: number; ledgerEnd; lag; prunedOffset: number | null;
@@ -227,7 +266,7 @@ interface LedgerStatus { enabled; running; bootstrapped: boolean; bootstrappedAt
 ```ts
 // every activity row also carries the trade-feed view (Kalshi GET /markets/trades):
 interface MarketEvent { …; tradeId: string /* = eventId */; ticker: string; action: "buy" | "sell" | "swap" | "split" | "merge" | null;
-  yesPrice: Decimal | null /* priceAfter */; noPrice: Decimal | null /* 1 − yesPrice */; notionalCC: Decimal | null /* amountCC */;
+  yesPrice: Decimal | null /* priceAfter */; noPrice: Decimal | null /* 1 − yesPrice */; notional: Decimal | null /* amount */;
   takerParty: string /* masked: first 8…last 6 of the party id */; createdAt: string /* effectiveAt */ }
 ```
 - `GET /markets/:market/price-history?from=&to=&resolution=raw|1m|5m|15m|1h|4h|1d&limit=` → `{ marketId, resolution, points: PricePoint[] }` oldest first (one point per market version, or the last per bucket; the latest `limit` win)
@@ -240,24 +279,24 @@ interface MarketEvent { …; tradeId: string /* = eventId */; ticker: string; ac
 ```ts
 interface Candle { startTs: number; endTs: number;   // [startTs, endTs) epoch seconds
   price: { open; high; low; close; mean: Decimal; previous: Decimal | null };   // mean = volume-weighted post-trade price
-  volumeCC: Decimal; trades: number; openInterest: Decimal; liquidityL: Decimal | null; empty: boolean }
-interface Candlesticks { marketId: number; ticker: string; periodInterval: 1 | 60 | 1440; startTs; endTs: number; candlesticks: Candle[] }
+  volume: Decimal; trades: number; openInterest: Decimal; liquidityL: Decimal | null; empty: boolean }
+interface Candlesticks { marketId: number; ticker: string; instrument: InstrumentRef /* what volume is in */; periodInterval: 1 | 60 | 1440; startTs; endTs: number; candlesticks: Candle[] }
 interface EventCandlesticks { eventTicker: string; periodInterval; startTs; endTs: number;
-  markets: { marketId; ticker; yesSubTitle; noSubTitle; status; currentPrice: Decimal; candlesticks: Candle[] }[] }
+  markets: { marketId; ticker; instrument: InstrumentRef; yesSubTitle; noSubTitle; status; currentPrice: Decimal; candlesticks: Candle[] }[] }
 ```
 
 ### Quotes and orders (docs/MARKETS.md §6–§7)
-- `GET /markets/:market/quote?action=buy|sell|swap|provide_liquidity&side=Yes|No&amountCC=&shares=&slippageBps=` (public) → `Quote` | `409 market_not_tradable` (`details.phase`) | `409 quote_unavailable` | `400 validation_failed` — `amountCC` for buy / provide_liquidity, `shares` for sell / swap; slippage 0..2000 bps (default 100)
-- `POST /markets/:market/orders/prepare` (user session) `{ action: buy|sell|swap|split|merge|provide_liquidity|withdraw_liquidity|redeem, side?, amountCC?, shares?, lpTokens?, slippageBps? }` → `PreparedOrder` | `409 no_primary_wallet` | `409 no_in_app_wallet` | `409 no_position` | `409 insufficient_balance` (`details.balanceCC`, `details.requiredCC`) | `409 insufficient_shares` (`details.heldShares`, `details.requestedShares`) | `409 market_not_tradable` | `409 trading_halted` (`details.estimatedResumeAt`; never for `redeem`) | `409 quote_unavailable`
+- `GET /markets/:market/quote?action=buy|sell|swap|provide_liquidity&side=Yes|No&amount=&shares=&slippageBps=` (public) → `Quote` | `409 market_not_tradable` (`details.phase`) | `409 quote_unavailable` | `400 validation_failed` — `amount` for buy / provide_liquidity, `shares` for sell / swap; slippage 0..2000 bps (default 100)
+- `POST /markets/:market/orders/prepare` (user session) `{ action: buy|sell|swap|split|merge|provide_liquidity|withdraw_liquidity|redeem, side?, amount?, shares?, lpTokens?, slippageBps? }` → `PreparedOrder` (the `ExerciseCommand` uses the v17 argument names: `amount`, `minProceeds`, `valueIncrease`, `maxCost`; `walletContractId` is the account's wallet in `market.collateral`) | `409 no_primary_wallet` | `409 no_in_app_wallet` (`details.instrument` — deposit that instrument first) | `409 no_position` | `409 insufficient_balance` (`details.balance`, `details.required`) | `409 insufficient_shares` (`details.heldShares`, `details.requestedShares`) | `409 market_not_tradable` | `409 trading_halted` (`details.estimatedResumeAt`; never for `redeem`) | `409 quote_unavailable`
 
 ```ts
-interface Quote { marketId; ticker; contractId; updatedOffset; nowSeconds: number; phase: Phase; effectiveL: Decimal;
+interface Quote { marketId; ticker; instrument: InstrumentRef /* the market's collateral */; contractId; updatedOffset; nowSeconds: number; phase: Phase; effectiveL: Decimal;
   quote: QuoteBuy | QuoteSell | QuoteSwap | QuoteLiquidity;
-  bounds: { slippageBps: number; minSharesOut?: Decimal; minProceedsCC?: Decimal; maxCostCC?: Decimal } }
-interface QuoteBuy { action: "buy"; side; collateralCC; feeCC; netCC; sharesOut; avgPrice; priceBefore; priceAfter; priceImpact; maxPayoutCC: Decimal }
-interface QuoteSell { action: "sell"; side; sharesIn; grossCC; feeCC; netCC; avgPrice; priceBefore; priceAfter; priceImpact: Decimal }
+  bounds: { slippageBps: number; minSharesOut?: Decimal; minProceeds?: Decimal; maxCost?: Decimal } }
+interface QuoteBuy { action: "buy"; side; amount; fee; net; sharesOut; avgPrice; priceBefore; priceAfter; priceImpact; maxPayout: Decimal }
+interface QuoteSell { action: "sell"; side; sharesIn; gross; fee; net; avgPrice; priceBefore; priceAfter; priceImpact: Decimal }
 interface QuoteSwap { action: "swap"; fromSide; sharesIn; feeShares; sharesOut; priceBefore; priceAfter; priceImpact: Decimal }
-interface QuoteLiquidity { action: "provide_liquidity"; valueIncreaseCC; costCC; lpMinted; poolShare; newL: Decimal }
+interface QuoteLiquidity { action: "provide_liquidity"; valueIncrease; cost; lpMinted; poolShare; newL: Decimal }
 interface PreparedOrder { action; marketId; ticker; actAs: string;                       // the account's primary party signs
   command: { ExerciseCommand: { templateId; contractId; choice; choiceArgument } };      // JSON Ledger API v2, sign as-is
   disclosedContracts: { templateId; contractId; createdEventBlob; synchronizerId }[];   // the market version
@@ -266,49 +305,70 @@ interface PreparedOrder { action; marketId; ticker; actAs: string;              
 ```
 
 ### Catalog (public; docs/MARKETS.md §2–§3)
-- `GET /series?category=&status=active|archived|all&q=&page=&limit=` → `{ items: Series[], … }` (active only by default)
-- `GET /series/:ticker` → `{ series: Series, events: Event[] }` | `404 not_found`
-- `GET /events?series=&status=unopened|open|closed|settled|all&category=&q=&sort=trending|newest|closing|volume&withNestedMarkets=&includeArchived=&page=&limit=` → `{ items: Event[], … }` (status derived from the member markets; `sort` ranks the whole catalog — `trending` = 24 h hourly-candle volume across the members then lifetime volume, `closing` = soonest still-open close time first, `newest` = created, `volume` = lifetime; default by strike date, newest first; nested markets likeliest outcome first)
+Listings are **per instrument** (docs/TOKENS.md §4.5): `?instrument=<admin>:<id>` names the collateral the events, counts and sums are computed over (default: the default collateral; `400 validation_failed` when malformed). An event is denominated in the instrument its first market fixed; an event without a market yet belongs to no instrument and is listed under every one with zero figures and `instrument: null`.
+- `GET /series?category=&status=active|archived|all&q=&instrument=&page=&limit=` → `{ items: Series[], … }` (active only by default; `eventCount`, `marketCount`, `volume` in `instrument`)
+- `GET /series/:ticker?instrument=` → `{ series: Series, events: Event[] }` | `404 not_found`
+- `GET /events?series=&status=unopened|open|closed|settled|all&category=&q=&sort=trending|newest|closing|volume&instrument=&withNestedMarkets=&includeArchived=&page=&limit=` → `{ items: Event[], … }` (only events in `instrument`, plus the ones without a market; status derived from the member markets; `sort` ranks the whole catalog — `trending` = 24 h hourly-candle volume across the members then lifetime volume, `closing` = soonest still-open close time first, `newest` = created, `volume` = lifetime; default by strike date, newest first; nested markets likeliest outcome first)
 - `GET /events/:ticker` → `{ event: Event }` with `markets` nested | `404 not_found`
 - `GET /events/:ticker/trades?limit=&cursor=` → `{ items: MarketEvent[], limit, nextCursor }` — the pool trades of every member market, newest first, keyset-paginated (`cursor` = the previous `nextCursor`) | `404 not_found`
 
 ```ts
 interface Series { ticker; title; category: string; frequency: "one_off" | "daily" | "weekly" | "monthly" | "quarterly" | "annual" | "custom";
   tags: string[]; settlementSources: { name; url }[]; contractUrl: string | null; description: string; status: "active" | "archived";
-  productMetadata: Record<string, unknown>; eventCount; marketCount: number; createdAt; updatedAt }
+  productMetadata: Record<string, unknown>;
+  instrument: InstrumentRef | null /* what the three figures below are in: the query's, else the default collateral; null when none is configured */;
+  eventCount /* events in that instrument, incl. those without a market yet */; marketCount: number /* their member markets in it */; volume: Decimal /* Σ totalVolume of those */;
+  createdAt; updatedAt }
 interface Event { ticker; seriesTicker; title; subTitle; category; imageUrl; description: string; mutuallyExclusive: boolean;
   strikeDate: string | null; strikePeriod: string | null; settlementSources: { name; url }[]; productMetadata; archived: boolean;
-  status: "unopened" | "open" | "closed" | "settled"; marketCount: number; volumeCC: Decimal; closeTime: string | null;
-  volume24hCC: Decimal /* Σ members' last 24 h */; openInterestCC: Decimal /* Σ outstanding shares */; liquidityCC: Decimal /* Σ pool value */;
+  status: "unopened" | "open" | "closed" | "settled"; instrument: InstrumentRef | null /* fixed by the first market (or its submission); every aggregate below is a sum over the members in it */; marketCount: number; volume: Decimal; closeTime: string | null;
+  volume24h: Decimal /* Σ members' last 24 h */; openInterest: Decimal /* Σ outstanding shares */; liquidity: Decimal /* Σ pool value */;
   topMarket: { marketId; ticker; yesSubTitle; currentPrice: Decimal } | null /* the likeliest outcome */;
   markets?: Market[] /* likeliest first */; createdAt; updatedAt }
 ```
 
 ### Exchange (public; docs/MARKETS.md §8)
 - `GET /exchange/status` → `{ exchangeActive, tradingActive: boolean, halt: { active, reason, since, estimatedResumeAt }, ledger: { indexEnabled, indexRunning, offset, ledgerEnd, lag, lastRecordTime, lastError, stale }, network, packageName, serverTime }`
+- `GET /exchange/instruments` → `{ instruments: (InstrumentRef & { kind: "collateral" | "rewards", enabled: boolean, isDefaultCollateral: boolean, walletInstrumentId: string })[] }` — every enabled instrument (docs/TOKENS.md §4.1); `walletInstrumentId` is what the Cantor8 wallet SDK's `send()` expects
 
 ### Ledger (public)
 - `GET /ledger/status` → `LedgerStatus`
 - `GET /ledger/wait?offset=&timeoutMs=` → `200 { reached: boolean, offset, requested }` — resolves once the index reaches `offset` or after `timeoutMs` (default 10 s, max 30 s)
-- `GET /stats` → `{ markets: { total, trading, proposed, resolved, voided }, totalVolumeCC, volume24hCC, trades, trades24h, traders, indexedOffset }`
-- `GET /leaderboard?window=24h|7d|30d|all&limit=` → `{ window, entries: { party, volumeCC, trades, markets, realizedPnlCC }[] }`
+- `GET /stats?instrument=<admin>:<id>` → `{ instrument: InstrumentRef, markets: { total, trading, proposed, resolved, voided }, totalVolume, volume24h, trades, trades24h, traders, indexedOffset }` — over the markets of one instrument (default: the default collateral)
+- `GET /leaderboard?window=24h|7d|30d|all&limit=&instrument=` → `{ window, instrument: InstrumentRef, entries: { party, instrument, volume, trades, markets, realizedPnl }[] }`
 
 ### Portfolio (session; user sessions only)
 The account's parties = the primary party + every active linked wallet.
-- `GET /me/positions?status=open|all` → `{ parties, positions: Position[] }` (`valueCC` = mark-to-market while Trading, the redeemable amount once settled)
+- `GET /me/positions?status=open|all` → `{ parties, positions: Position[] }` (`value` = mark-to-market while Trading, the redeemable amount once settled)
 - `GET /me/liquidity?status=open|all` → `{ parties, positions: LiquidityPosition[] }`
 - `GET /me/trades?marketId=&kind=&page=&limit=` · `GET /me/activity?…` → `{ items: MarketEvent[], … }`
 
 ### In-app wallet ledger (session)
 - `GET /in-app-wallet/ledger` → `{ partyId, wallet: IndexedWallet | null, payouts: LedgerPayout[] }`
 - `GET /in-app-wallet/history?kind=&page=&limit=` → `{ items: WalletEntry[], … }` — the statement of the primary party's UserWallet
-- `GET /in-app-wallet/transfers?direction=&page=&limit=` → `{ items: LedgerTransfer[], … }` — Canton Coin between the treasury and the account's wallets
+- `GET /in-app-wallet/transfers?direction=&instrument=<admin>:<id>&page=&limit=` → `{ items: LedgerTransfer[], … }` — token transfers between the treasury and the account's wallets, every row with its `instrument` and `amount`; omitted `instrument` = every instrument
+
+### Rewards (session; user sessions only; docs/TOKENS.md §4.6)
+- `GET /me/rewards` → `{ instrument: InstrumentRef, wallet: LedgerWallet | null, totals: { credited: Money, queued: Money }, grants: RewardGrant[] }` — the account's rewards wallet as the ledger shows it, the grants credited and the ones still in flight (`queued` = queued + submitted + blocked_float), the last 100 grants newest first | `404 not_found` (no rewards instrument configured)
+
+```ts
+interface RewardGrant { id: string; userId: string | null; party: string; ruleId: string | null;
+  kind: "trade_volume_rebate" | "winning_redeem_bonus" | "first_deposit_bonus" | "manual";
+  sourceEventId: string | null /* the wallet entry / market event it was earned on; null for manual */;
+  instrument: InstrumentRef; amount: Money; reason: string;
+  status: "queued" | "submitted" | "credited" | "failed" | "blocked_float";
+  commandId: string | null /* reward-grant-<id>-<attempt> */; ref: string /* reward:<id>, what UserWallet.creditRefs carries once credited */;
+  error: string | null; createdAt: string; creditedAt: string | null }
+interface RewardRule { id: string; kind: "trade_volume_rebate" | "winning_redeem_bonus" | "first_deposit_bonus"; params: Record<string, string> /* decimal strings */; enabled: boolean; createdAt; updatedAt }
+```
 
 ### Admin — ledger (admin session)
 - `GET /admin/ledger/status` → `LedgerStatus`
 - `POST /admin/ledger/resync` `{ reason }` → `{ status }` (re-snapshot the ACS at the ledger end; audited `ledger.resync`)
 - `GET /admin/ledger/events?updateId=&contractId=&marketId=&entity=&choice=&fromOffset=&page=` → raw created / exercised events (`{ id, eventId, offset, nodeId, updateId, kind, template, contractId, choice, consuming, actingParties, payload, result, parentNodeId, effectiveAt, commandId }`)
-- `GET /admin/ledger/wallets?owner=` · `GET /admin/ledger/payouts?active=&user=` · `GET /admin/ledger/transfers?direction=&counterparty=`
+- `GET /admin/ledger/wallets?owner=` · `GET /admin/ledger/payouts?active=&user=` · `GET /admin/ledger/transfers?direction=&counterparty=&instrument=<admin>:<id>` (every row with `instrument` and `amount`)
+- `GET /admin/ledger/holdings?instrument=&active=&page=` → `{ items: LedgerHolding[], … }` — the treasury's token-standard holdings as indexed, largest first (docs/TOKENS.md §4.2; what a registry-mode transfer can spend)
+- `GET /admin/ledger/transfer-instructions?instrument=&status=pending|completed|failed&party=&page=` → `{ items: TransferInstruction[], … }` — two-step offers the treasury sent or received (`party` matches sender or receiver)
 - `GET /admin/ledger/markets/:marketId/positions` · `/liquidity` → holders / providers, largest first
 
 ### Admin — catalog and exchange (admin session; docs/MARKETS.md §2–§4, §8)
@@ -317,6 +377,49 @@ The account's parties = the primary party + every active linked wallet.
 - `PATCH /admin/series/:ticker` `{ …any of the above, status?: active | archived }` → `{ series }`
 - `POST /admin/events` `{ ticker, seriesTicker, title, subTitle?, imageUrl?, description?, mutuallyExclusive?, strikeDate?, strikePeriod?, settlementSources?, productMetadata?, reason? }` → `{ event }` | `404 not_found` (series) | `409 catalog_conflict`
 - `PATCH /admin/events/:ticker` `{ …, archived? }` → `{ event }`
-- `POST /admin/markets` `{ eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValueCC, feeBps?, prizeFeeShareBps?, policy?, auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars) | `409 catalog_conflict` | `503 not_ready` (MarketCounter not indexed) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract. `imageUrl` / `description` are backend-owned presentation written to `to_market_metadata` before the submit, never to the ledger (a blank `imageUrl` shows the event's image); the category is the series'.
+- `POST /admin/markets` `{ collateral?: { admin, id }, eventTicker, ticker, question, yesSubTitle?, noSubTitle?, imageUrl?, description?, resolutionDescription?, expiresAt, gracePeriodSecs?, isDynamic?, liquidityPeriodSecs?, initialProbability, initialValue, feeBps?, prizeFeeShareBps?, policy? (with `bond`), auditObservers?, reason? }` → `{ commandId, status, ticker, eventTicker, collateral: InstrumentRef, expectedMarketId }` | `400 validation_failed` (`ticker` / `eventTicker` missing or malformed, a side label over 80 chars, a `collateral` that is not an enabled collateral instrument) | `409 catalog_conflict` (incl. a collateral other than the event's) | `503 not_ready` (MarketCounter not indexed, or no default collateral configured) | `502 upstream_failed` (Enterprise Wallet, incl. a duplicate ticker's command id). `yesSubTitle` / `noSubTitle` default to `Yes` / `No`; all four identity fields are mandatory on the contract. `imageUrl` / `description` are backend-owned presentation written to `to_market_metadata` before the submit, never to the ledger (a blank `imageUrl` shows the event's image); the category is the series'.
 - `PATCH /admin/markets/:market/metadata` `{ imageUrl?, description?, reason? }` → `{ market }` | `400 validation_failed` (neither field) | `404 not_found`. Audited `catalog.market_metadata_updated`; publishes `truthoracle.catalog.changed { kind: "market" }`.
+- `GET /admin/markets/:marketId/resolution` (role `ops` or `approver`; `:marketId` = the on-ledger id) → `{ market: { marketId, ticker, question, status, expiresAt, gracePeriodSecs, collateral: InstrumentRef, operatorResolution, sources, outcome }, windows: { resolveT0From, resolveT0To, resolveFrom, voidFrom }, choicesAvailable, pending: Approval | null, asOf }` | `403 role_required` | `404 not_found`. Times are ISO-8601 UTC, bounds inclusive, judged by the backend clock at `asOf`.
+- `POST /admin/markets/:marketId/resolution` `{ choice: ResolveT0 | Resolve | VoidMarket, outcome?: Yes | No | Void, sourceUri?, attestationCids?, reason, signature? }` → four-eyes `market.resolve` (`ops` asks, `approver` approves): `202 { approval }` | `200 { approval, result: { marketId, choice, commandId } }` | `400 validation_failed` (`outcome` + http(s) `sourceUri` ≤ 2048 required by ResolveT0 only; 1–50 distinct `attestationCids` required by Resolve only) | `403 role_required` | `404 not_found` | `409 market_not_resolvable` (`details.reason`: `archived`, `status`, `operator_resolution_off`, `not_expired`, `window_closed`, `grace_not_elapsed`, `source_not_allowed`, `attestation_unknown|archived|other_market|source|window|malformed`, `no_tier`, `attestations_disagree`) | `409 approval_pending` | `503 ledger_stale` | `503 not_ready`. The only way any market is resolved or voided. Execution re-validates on fresh reads, exercises the choice on the market's current contract treasury-signed (command id `market-resolve-<marketId>-<approvalId>`, `nowSeconds` = the backend clock) and audits `market.resolution_submitted`. With `RAMP_DUAL_CONTROL=false` it executes at once, signed by the requester when `RAMP_APPROVAL_SIGNATURES` (C23).
 - `POST /admin/exchange/halt` `{ active: boolean, reason, estimatedResumeAt? }` → `{ halt }`
+
+### Admin — instruments (admin session; docs/TOKENS.md §4.1)
+- `GET /admin/instruments` → `{ instruments: AdminInstrument[] }` (disabled rows included)
+- `POST /admin/instruments` `{ admin, id, decimals, kind: "collateral" | "rewards", symbol?, name?, enabled?, isDefaultCollateral?, registryUrl?, registryAuth?: "none" | "ledger" | "keycloak", transferMode?: "wallet" | "registry" | null, walletInstrumentId?, setupChoices?, reason? }` → `{ instrument }` | `409 instrument_exists`
+- `PATCH /admin/instruments/:admin/:id` `{ symbol?, name?, decimals?, enabled?, isDefaultCollateral?, registryUrl?, registryAuth?, transferMode?, walletInstrumentId?, setupChoices?, reason? }` → `{ instrument }` | `404 not_found` — the `(admin, id)` pair is immutable
+- `POST /admin/instruments/:admin/:id/setup` `{ autoAccept?: boolean, mintDelegation?: boolean, reason? }` → `{ instrument: InstrumentRef, factoryId, factoryTemplateId, actions: { kind: "autoAccept" | "mintDelegation", choice, commandId, status }[] }` | `400 validation_failed` (neither action) | `404 not_found` | `503 not_ready` (no `registryUrl`) | `502 upstream_failed` (registry or wallet) — the one-off setup a Cantor8 token needs from the treasury (docs/TOKENS.md §4.4): the registry's transfer-factory lookup for a self-transfer of 0 names and discloses the token's factory, and the instrument's `setupChoices.autoAccept` (default `CreateAutoAccept { receiver: treasury }`) / `setupChoices.mintDelegation` (default `CreateMintDelegation { recipient: treasury }`) are exercised on it as the treasury under `setup-<kind>-<sha256(admin|id|treasury)[:40]>`; audited `token.setup` per action. Not applicable to Canton Coin.
+
+```ts
+interface AdminInstrument extends InstrumentRef { kind; enabled; isDefaultCollateral: boolean; walletInstrumentId: string;
+  registryUrl: string | null; registryAuth: "none" | "ledger" | "keycloak"; transferMode: "wallet" | "registry" | null;
+  setupChoices: Record<string, string>; createdAt; updatedAt }
+```
+
+### Admin — rewards (admin session; docs/TOKENS.md §4.6)
+Every route answers `503 not_ready` when no rewards instrument is configured (`REWARDS_INSTRUMENT_ADMIN`), except the rules, which exist regardless.
+- `GET /admin/rewards/rules` → `{ rules: RewardRule[] }` — the three automatic rules, seeded at boot with the documented defaults (`trade_volume_rebate { perUnit: "0.01", minTrade: "1" }`, `winning_redeem_bonus { fraction: "0.05" }`, `first_deposit_bonus { amount: "10" }`), enabled only on `APP_ENV=dev`
+- `PUT /admin/rewards/rules/:id` `{ params?, enabled?, reason }` → `{ rule }` | `400 validation_failed` (a key the kind does not have, a missing key, a non-decimal value, `fraction` above 1) | `404 not_found`. `params` replaces the whole object. Audited `reward.rule_updated` with before / after.
+- `POST /admin/rewards/grant` `{ userId | party, amount, reason }` → `{ grant: RewardGrant }` (status `queued`; the processor submits it on its next pass). By `userId` the grant goes to the account's primary party (`404 not_found`, `403 user_suspended`, `409 no_primary_wallet`); by `party` to that party, attributed to its account when one has linked it (`userId: null` otherwise). `amount` must be positive and whole in the instrument's decimals (`400 validation_failed`). Audited `reward.grant_requested`.
+- `GET /admin/rewards/grants?status=queued|submitted|credited|failed|blocked_float&userId=&page=&limit=` → `{ items: RewardGrant[], … }` newest first
+- `GET /admin/rewards/float` → `{ instrument: InstrumentRef, treasuryHoldings: Money, liabilities: Money, pending: Money, headroom: Money }` — the float rule's figures from the index: Σ of the treasury's active holdings of the rewards instrument, Σ `UserWallet.balance` in it, the grants submitted or credited that the index does not show in a balance yet, and `headroom = treasuryHoldings − liabilities − pending` (a grant is submitted only while it fits)
+
+### Admin — tokens (admin session; docs/TOKENS.md §4.7)
+Mint and burn go through Cantor8's token-app; without `TOKEN_APP_URL` both answer `503 token_app_unconfigured` before anything is written. Amounts must be positive and whole in the instrument's decimals (`400 validation_failed`).
+- `POST /admin/tokens/mint` `{ instrument: { admin, id }, amount, to?: "treasury" | <party>, creditUserId?, reason }` → `TokenOperation` | `404 instrument_unknown` | `409 instrument_disabled` | `502 upstream_failed` (token-app). Default target: the treasury. With `creditUserId` (mint-and-credit, the on-ramp primitive) the mint must land on the treasury (`400 validation_failed` otherwise) and the account must be active with a primary party (`404 not_found`, `403 user_suspended`, `409 no_primary_wallet`, `409 kyc_duplicate_identity`); its `UserWallet` in the instrument is created BEFORE the mint, then `UserWallet.Deposit { amount, txRef: "mint:<commandId>" }` runs through the deposit write-ahead row and confirm pass (ARCHITECTURE §8.3) — `credit.status` is `confirmed` or `submitted` (the DepositConfirmProcessor finishes it). A credit refused while another credit of the account is in flight answers `409 deposit_in_progress` with `details.mint` naming the mint that already landed. Audited `token.mint`; publishes `truthoracle.token.minted`.
+- `POST /admin/tokens/burn` `{ instrument, amount, party, reason }` → `TokenOperation` (`credit: null`) | `404 not_found` (unregistered instrument; disabled ones may be burned). Audited `token.burn`; publishes `truthoracle.token.burned`.
+- `GET /admin/tokens/status` → `{ tokenApp: { configured, url, appName, reachable, raw }, instruments: { instrument: InstrumentRef, treasuryHoldings: Money, liabilities: Money }[] }` — token-app's own `/status` snapshot (`reachable: false`, never an error, when it is down or unconfigured) next to the index's float per registered instrument (disabled ones included)
+
+```ts
+interface TokenOperation { commandId: string /* mint-<24 hex> | burn-<24 hex> */; status: string /* token-app's */; instrument: InstrumentRef; amount: Money;
+  party: string /* minted to / burned from */; credit: { commandId: string /* mint-credit-<sha256(commandId)[:40]> */; txRef: string /* mint:<commandId> */; status: "confirmed" | "submitted" } | null }
+```
+
+### Admin — fiat ramp (admin session; docs/RAMP.md §8, §11)
+Every action needs a `reason` and is audited `ramp.admin_action`.
+- `GET /admin/ramp/orders?status=&direction=&userId=&page=&limit=` → `{ items: AdminRampOrder[], page, limit, total }` — `AdminRampOrder` adds `userId, partyId, provider, idempotencyKey`, the provider ids, every command id, `attempts, lastError, details`
+- `GET /admin/ramp/orders/:id` → `{ order: AdminRampOrder, events: { id, type, kind, objectId, sandbox, receivedAt, processedAt, attempts, error }[], journal: { entryId, orderId, account, currency, amount, memo, createdAt }[], audit: AuditEvent[] }`
+- `POST /admin/ramp/orders/:id/retry` `{ reason }` → `AdminRampOrder` — resumes a `needs_review` order at `reviewStep`; at the payment step it is the approval and needs the acquirer to report the exact amount captured | `409 ramp_order_state`
+- `POST /admin/ramp/orders/:id/refund` `{ reason }` → `AdminRampOrder` — on-ramp: card refund while nothing was minted; cash-out: re-mint and credit back after the burn when the card payout failed | `409 ramp_order_state`
+- `POST /admin/ramp/orders/:id/fail` `{ reason }` → `AdminRampOrder` — closes a reviewed on-ramp whose payment the acquirer does not show as captured | `409 ramp_order_state`
+- `GET /admin/ramp/reconciliation` → `{ checkedAt, ok, checks: { name, ok, detail }[], journal: Record<account, Money>, orders: { byStatus, stuck }, token: { instrument, orderOutstanding, treasuryHoldings, liabilities } }`
+- `GET /admin/ramp/provider` → `{ provider, configured, capabilities: { cardPayouts, refunds }, webhookUrl: string | null, health }` — `webhookUrl` is what the acquirer is told to post to (`RAMP_PUBLIC_API_URL`); never card data

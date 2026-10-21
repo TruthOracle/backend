@@ -1,7 +1,13 @@
 import { Injectable } from "@nestjs/common";
 
 import { Config } from "../config";
-import type { ApplicantSummary, KycEvent, KycProvider, KycProviderHealth, KycSessionResult } from "../types";
+import type {
+  ApplicantSummary,
+  KycEvent,
+  KycProvider,
+  KycProviderHealth,
+  KycSessionResult,
+} from "../types";
 import { ApiError } from "../util/errors";
 
 /** Staged applicant data is discarded after this long even if nobody applied it. */
@@ -31,14 +37,18 @@ export class KycProviderMockService implements KycProvider {
   }
 
   isConfigured(): boolean {
-    return this.config.kycProvider === "mock" && !this.config.isMainnet && this.config.appEnv !== "prod";
+    return (
+      this.config.kycProvider === "mock" && !this.config.isMainnet && this.config.appEnv !== "prod"
+    );
   }
 
   async healthCheck(): Promise<KycProviderHealth> {
     const configured = this.isConfigured();
     return {
       ok: configured,
-      message: configured ? "mock provider active (dev / test only)" : "mock provider is refused in prod and on mainnet",
+      message: configured
+        ? "mock provider active (dev / test only)"
+        : "mock provider is refused in prod and on mainnet",
       upstreamStatus: null,
       checkedAt: new Date().toISOString(),
       details: { staged: this.staged.size, remembered: this.remembered.size },
@@ -58,7 +68,10 @@ export class KycProviderMockService implements KycProvider {
   }
 
   /** The mock has no webhooks: the mock controller drives the pipeline directly. */
-  verifyWebhook(_rawBody: Buffer, _headers: Record<string, string | string[] | undefined>): KycEvent | null {
+  verifyWebhook(
+    _rawBody: Buffer,
+    _headers: Record<string, string | string[] | undefined>,
+  ): KycEvent | null {
     return null;
   }
 
@@ -82,7 +95,11 @@ export class KycProviderMockService implements KycProvider {
     this.sweep();
     const hit = this.staged.get(applicantId)?.summary ?? this.remembered.get(applicantId);
     if (!hit) {
-      throw new ApiError(502, "upstream_failed", "mock provider: no applicant data is known for this applicant");
+      throw new ApiError(
+        502,
+        "upstream_failed",
+        "mock provider: no applicant data is known for this applicant",
+      );
     }
     return hit;
   }

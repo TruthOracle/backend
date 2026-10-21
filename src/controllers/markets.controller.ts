@@ -25,7 +25,7 @@ import type {
 } from "../types";
 import { ApiError } from "../util/errors";
 import { LedgerOffsetInterceptor } from "../util/ledger-offset.interceptor";
-import { parseCC } from "../util/money";
+import { parseAmount } from "../util/money";
 
 /**
  * Public market reads over the ledger index (docs/API.md "Markets", "Candlesticks", "Quotes and
@@ -148,8 +148,8 @@ export class MarketsController {
     return this.quotes.quote(market, {
       action: query.action,
       side: query.side,
-      amountCC: query.amountCC === undefined ? undefined : parseCC(query.amountCC),
-      shares: query.shares === undefined ? undefined : parseCC(query.shares),
+      amount: query.amount === undefined ? undefined : parseAmount(query.amount),
+      shares: query.shares === undefined ? undefined : parseAmount(query.shares),
       slippageBps: query.slippageBps,
     });
   }
@@ -161,9 +161,7 @@ export class MarketsController {
   }
 
   @Get(":market/attestations")
-  async attestations(
-    @Param("market") ref: string,
-  ): Promise<{ attestations: ApiAttestation[] }> {
+  async attestations(@Param("market") ref: string): Promise<{ attestations: ApiAttestation[] }> {
     const market = await this.markets.resolve(ref);
     return this.markets.attestations(market.marketId).then((attestations) => ({ attestations }));
   }
