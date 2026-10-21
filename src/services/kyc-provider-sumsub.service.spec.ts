@@ -2,7 +2,9 @@ import { createHmac } from "node:crypto";
 
 import {
   acceptedDigestAlgorithms,
+  amlFromLabels,
   interpretSumsubProbe,
+  normaliseSumsubAmlCase,
   normaliseSumsubApplicant,
   parseSumsubEvent,
   parseSumsubTimestamp,
@@ -215,6 +217,27 @@ describe("Sumsub adapter (§9.1) — locally computed vectors", () => {
       sandbox: false,
       documents: [{ docType: "PASSPORT", country: "IND", number: "Z1", dob: "1990-01-01" }],
       person: { firstName: "Jana", lastName: "Doe", dob: "1990-01-01", country: "IND" },
+      // SPEC §11.1 (S7a): both name forms, the document, the country — no AML evidence → null.
+      identity: {
+        names: [
+          { firstName: "Йана", lastName: "Доу", middleName: null },
+          { firstName: "Jana", lastName: "Doe", middleName: null },
+        ],
+        birthPlace: null,
+        birthCountry: null,
+        nationality: "IND",
+        residenceCountry: "IND",
+        address: null,
+        document: {
+          type: "PASSPORT",
+          country: "IND",
+          number: "Z1",
+          personalNumber: null,
+          issuedAt: null,
+          expiresAt: null,
+        },
+        aml: null,
+      },
     });
     const pending = normaliseSumsubApplicant({
       review: { reviewStatus: "pending", reviewResult: { reviewAnswer: "GREEN" } },
@@ -274,6 +297,173 @@ describe("Sumsub adapter — operator probe (docs/KYC.md §6)", () => {
     expect(interpretSumsubProbe(500)).toMatchObject({
       ok: false,
       message: "Sumsub answered HTTP 500",
+    });
+  });
+});
+
+describe("Sumsub adapter — the art.8 identity and AML screening (SPEC §11.1, S7a)", () => {
+  it("keeps every name form (be / ru Cyrillic with patronymic, Latin), birth place, nationality, residence, address and the identity document", () => {
+    const s = normaliseSumsubApplicant({
+      review: { reviewStatus: "completed", reviewResult: { reviewAnswer: "GREEN" } },
+      info: {
+        firstName: "Сяргей",
+        firstNameEn: "Siarhei",
+        middleName: "Мікалаевіч",
+        middleNameEn: "Mikalaevich",
+        lastName: "Іваноў",
+        lastNameEn: "Ivanou",
+        dob: "1990-05-17",
+        placeOfBirth: "г. Мінск",
+        placeOfBirthEn: "Minsk",
+        countryOfBirth: "BLR",
+        country: "BLR",
+        nationality: "BLR",
+        addresses: [
+          {
+            country: "BLR",
+            state: "Minsk",
+            town: "Minsk",
+            street: "Nezavisimosti",
+            buildingNumber: "4",
+            flatNumber: "12",
+            postCode: "220030",
+          },
+        ],
+        idDocs: [
+          {
+            idDocType: "DRIVERS",
+            country: "BLR",
+            number: "D1",
+            firstName: "Сергей",
+            middleName: "Николаевич",
+            lastName: "Иванов",
+          },
+          {
+            idDocType: "ID_CARD",
+            country: "BLR",
+            number: "KH1234567",
+            additionalNumber: "3170590A001PB1",
+            issuedDate: "2021-03-01",
+            validUntil: "2031-03-01",
+            firstName: "Сяргей",
+            lastName: "Іваноў",
+            middleName: "Мікалаевіч",
+            firstNameEn: "SIARHEI",
+            lastNameEn: "IVANOU",
+          },
+        ],
+      },
+    });
+    expect(s.identity).toEqual({
+      names: [
+        { firstName: "Сяргей", lastName: "Іваноў", middleName: "Мікалаевіч" },
+        { firstName: "Siarhei", lastName: "Ivanou", middleName: "Mikalaevich" },
+        { firstName: "Сергей", lastName: "Иванов", middleName: "Николаевич" },
+        { firstName: "SIARHEI", lastName: "IVANOU", middleName: null },
+      ],
+      birthPlace: "Minsk",
+      birthCountry: "BLR",
+      nationality: "BLR",
+      residenceCountry: "BLR",
+      address: {
+        country: "BLR",
+        region: "Minsk",
+        city: "Minsk",
+        line: "Nezavisimosti, 4, 12, 220030",
+      },
+      // The ID card wins over the driving licence; the personal number is `additionalNumber`.
+      document: {
+        type: "ID_CARD",
+        country: "BLR",
+        number: "KH1234567",
+        personalNumber: "3170590A001PB1",
+        issuedAt: "2021-03-01",
+        expiresAt: "2031-03-01",
+      },
+      aml: null,
+    });
+    // The fingerprinted `person` is untouched (Latin first).
+    expect(s.person).toEqual({
+      firstName: "Siarhei",
+      lastName: "Ivanou",
+      dob: "1990-05-17",
+      country: "BLR",
+    });
+  });
+
+  it("a termless document has no expiry; citizenship falls back to a passport's country, residence to a permit's", () => {
+    const s = normaliseSumsubApplicant({
+      info: {
+        country: "POL",
+        idDocs: [
+          { idDocType: "PASSPORT", country: "UKR", number: "P1", validUntil: "2099-01-01" },
+          {
+            idDocType: "RESIDENCE_PERMIT",
+            country: "BLR",
+            number: "R1",
+            termless: true,
+            validUntil: "2099-01-01",
+          },
+        ],
+      },
+    });
+    expect(s.identity).toMatchObject({
+      nationality: "UKR",
+      residenceCountry: "BLR",
+      document: { type: "PASSPORT", number: "P1", expiresAt: null },
+      names: [],
+    });
+  });
+
+  it("AML: reject labels set flags (the rest stay unknown); riskLabels.aml is a screen (absent labels are false)", () => {
+    const red = normaliseSumsubApplicant({
+      review: {
+        reviewStatus: "completed",
+        reviewResult: { reviewAnswer: "RED", rejectLabels: ["SANCTIONS", "DOCUMENT_DAMAGED"] },
+      },
+    });
+    expect(red.identity?.aml).toEqual({
+      pep: null,
+      sanctions: true,
+      adverseMedia: null,
+      labels: ["sanctions"],
+    });
+    const screened = normaliseSumsubApplicant({ riskLabels: { aml: [{ label: "pep" }, "crime"] } });
+    expect(screened.identity?.aml).toEqual({
+      pep: true,
+      sanctions: false,
+      adverseMedia: false,
+      labels: ["pep", "crime"],
+    });
+  });
+
+  it("an AML case counts hits unless marked false_positive; a case without counting hits is a clean screen", () => {
+    expect(
+      normaliseSumsubAmlCase({
+        riskLabels: ["pep", "adverseMedia"],
+        hits: [
+          { riskLabels: ["pep"], review: { matchStatus: "false_positive" } },
+          { riskLabels: ["adverseMedia", "crime"], review: { matchStatus: "true_positive" } },
+          { riskLabels: ["terrorism"] },
+        ],
+      }),
+    ).toEqual({
+      pep: false,
+      sanctions: true,
+      adverseMedia: true,
+      labels: ["adverseMedia", "crime", "terrorism"],
+    });
+    expect(normaliseSumsubAmlCase({ hits: [] })).toEqual({
+      pep: false,
+      sanctions: false,
+      adverseMedia: false,
+      labels: [],
+    });
+    expect(amlFromLabels([], false)).toEqual({
+      pep: null,
+      sanctions: null,
+      adverseMedia: null,
+      labels: [],
     });
   });
 });

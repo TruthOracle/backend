@@ -1,5 +1,6 @@
 // Every export here is auto-registered as a controller by AppModule. Written once by package F.
-// KycMockController is deliberately absent: AppModule adds it only when KYC_PROVIDER=mock.
+// KycMockController is deliberately absent: AppModule adds it only when KYC_PROVIDER=mock
+// (RampMockController likewise, only when RAMP_PROVIDER=mock).
 export { AppController } from "./app.controller";
 export { AuthController } from "./auth.controller";
 export { MeController } from "./me.controller";
@@ -27,3 +28,20 @@ export { AdminInstrumentsController } from "./admin-instruments.controller";
 export { RewardsController } from "./rewards.controller";
 export { AdminRewardsController } from "./admin-rewards.controller";
 export { AdminTokensController } from "./admin-tokens.controller";
+// fiat ramp (docs/RAMP.md §8)
+export { RampController } from "./ramp.controller";
+export { AdminRampController } from "./admin-ramp.controller";
+// four-eyes approvals and the token command ledger (SPEC §6.5, §7; S4)
+export { AdminApprovalsController } from "./admin-approvals.controller";
+export { AdminTokenCommandsController } from "./admin-token-commands.controller";
+// compliance: consent and AML alerts (SPEC §11.2, §11.6; S7a)
+export { RampConsentController } from "./ramp-consent.controller";
+export { AdminComplianceController } from "./admin-compliance.controller";
+// screening, freezes and the operations register (SPEC §11.6; S7b)
+export { AdminScreeningController } from "./admin-screening.controller";
+export { AdminRampExportController } from "./admin-ramp-export.controller";
+// bank rail: users' bank accounts and the operator's batches / statements (SPEC §10; S6)
+export { RampBankController } from "./ramp-bank.controller";
+export { AdminRampBankController } from "./admin-ramp-bank.controller";
+// review F0: market resolution as a four-eyes approval (the frontend's wallet relay is gone)
+export { AdminMarketResolutionController } from "./admin-market-resolution.controller";

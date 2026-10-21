@@ -9,6 +9,7 @@
  */
 import { AuditEventEntity } from "../src/entities/audit-event.entity";
 import { RewardGrantEntity } from "../src/entities/reward-grant.entity";
+import { TokenCommandEntity } from "../src/entities/token-command.entity";
 import { RewardsProcessor } from "../src/processors/rewards.processor";
 import { IndexerService } from "../src/services/indexer.service";
 import { RewardsService } from "../src/services/rewards.service";
@@ -554,8 +555,21 @@ describe("rewards: auto-mint and resubmission (REWARDS_AUTO_MINT=true, no confir
     const [row] = await h.grants();
     expect(row.status).toBe("blocked_float");
     expect(row.error).toContain(
-      `auto-mint reward-float-${grant.id} submitted (1500.0000000000 TRO, submitted)`,
+      `auto-mint reward-float-${grant.id} submitted (1500.0000000000 TRO)`,
     );
+    // A write-ahead token command like every other (S8): its token-app record is ours (I9).
+    expect(
+      await ctx.dataSource
+        .getRepository(TokenCommandEntity)
+        .findOneByOrFail({ commandId: `reward-float-${grant.id}` }),
+    ).toMatchObject({
+      kind: "mint",
+      source: "rewards",
+      ref: grant.id,
+      partyId: TEST_TREASURY,
+      amount: parseAmount("1500"),
+      status: "submitted",
+    });
     const mintAudits = await h.audits("token.mint");
     expect(mintAudits).toHaveLength(1);
     expect(mintAudits[0]).toMatchObject({

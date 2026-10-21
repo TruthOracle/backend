@@ -7,6 +7,12 @@ import type { InstrumentEntity } from "../../src/entities/instrument.entity";
 import type { ActiveContractEntry, LedgerTransaction } from "../../src/indexer/events";
 import type { ConsumedMessage, ConsumeHandler } from "../../src/services/nats.service";
 import { walletCreateCommandIdFor } from "../../src/services/ledger-client.service";
+import type {
+  TokenAppHoldingsScan,
+  TokenAppMonitorSnapshot,
+  TokenAppParsedRecord,
+  TokenAppPostOutcome,
+} from "../../src/services/token-app.service";
 import {
   type ApplicantSummary,
   instrumentKey,
@@ -138,10 +144,20 @@ export class FakeLedgerClient {
   /** contractId → active PendingPayout */
   readonly payouts = new Map<string, PendingPayoutRecord>();
   readonly archived = new Set<string>();
+  /** How each archived PendingPayout ended — the choice and its txHash, what the indexer records (`to_ledger_payouts`). */
+  readonly payoutEnds = new Map<
+    string,
+    { record: PendingPayoutRecord; choice: string; txHash: string | null }
+  >();
   /** Every read made through this fake, in order. */
   readonly reads: string[] = [];
   /** When set, every read throws it (nothing is recorded as read); use an `ApiError(502, "upstream_failed")` to mirror the real client. */
   failReads: Error | null = null;
+  /**
+   * The ledger's transactions (createTestApp links the fake stream): what a spec pushed is on the
+   * ledger, indexed only once IndexerService.runOnce() ran — so the ledger may lead the index.
+   */
+  stream: { transactions: readonly LedgerTransaction[] } | null = null;
   readonly defaultInstrument: InstrumentId;
   private seq = 0;
 
@@ -232,9 +248,16 @@ export class FakeLedgerClient {
     return record;
   }
 
-  archivePayout(cid: string): void {
+  /** Archive a PendingPayout; `end` names the choice (default: the user's CancelPayout). */
+  archivePayout(
+    cid: string,
+    end: { choice: string; txHash?: string | null } = { choice: "CancelPayout" },
+  ): void {
+    const record = this.payouts.get(cid);
     this.payouts.delete(cid);
     this.archived.add(cid);
+    if (record)
+      this.payoutEnds.set(cid, { record, choice: end.choice, txHash: end.txHash ?? null });
   }
 
   walletByCid(cid: string): LedgerWallet | null {
@@ -286,6 +309,21 @@ export class FakeLedgerClient {
     return p ? { ...p } : null;
   }
 
+  /** The active PredictionMarket contracts of `marketId` on the ledger (the linked stream's transactions). */
+  async fetchMarketContracts(marketId: string): Promise<string[]> {
+    this.read(`fetchMarketContracts:${marketId}`);
+    const live = new Map<string, Record<string, unknown>>();
+    for (const tx of [...(this.stream?.transactions ?? [])].sort((a, b) => a.offset - b.offset))
+      for (const e of tx.events) {
+        if (e.kind === "created" && e.entity === "PredictionMarket")
+          live.set(e.contractId, e.createArgument);
+        else if (e.kind === "exercised" && e.consuming) live.delete(e.contractId);
+      }
+    return [...live.entries()]
+      .filter(([, payload]) => asString(payload.marketId) === marketId)
+      .map(([cid]) => cid);
+  }
+
   async activeContracts(
     _party: string,
     entity: string,
@@ -325,6 +363,7 @@ export class FakeLedgerClient {
     this.wallets.clear();
     this.payouts.clear();
     this.archived.clear();
+    this.payoutEnds.clear();
     this.reads.length = 0;
     this.failReads = null;
     this.seq = 0;
@@ -343,6 +382,17 @@ const NEVER_HAPPENED = new Set([
   "canceled",
   "not_found",
   "notfound",
+]);
+/** The command index's failure statuses, as EnterpriseWalletService reads them (timeouts included). */
+const COMMAND_FAILED = new Set([
+  "failed",
+  "rejected",
+  "error",
+  "cancelled",
+  "canceled",
+  "aborted",
+  "timeout",
+  "timed_out",
 ]);
 
 export interface RecordedSubmit {
@@ -388,6 +438,13 @@ export class FakeEnterpriseWallet {
   lagLedger = false;
   /** Set to make the next externalSubmit / transfer throw (then cleared). */
   failNext: Error | null = null;
+  /**
+   * Set to have the ledger reject the next externalSubmit the wallet accepted (then cleared): it
+   * answers `submitted`, applies nothing, and its status reads FAILED with this reason.
+   */
+  rejectNext: string | null = null;
+  /** A failed command's reason, as the command index reports it. */
+  readonly commandReasons = new Map<string, string>();
   private readonly pending: RecordedSubmit[] = [];
 
   constructor(
@@ -416,7 +473,13 @@ export class FakeEnterpriseWallet {
     if (this.statusReadsFail) return { known: false, submitted: false, status: null };
     const status = this.unknownCommandIds ? undefined : this.commandStatuses.get(commandId);
     if (status === undefined) return { known: false, submitted: false, status: "not_found" };
-    return { known: true, submitted: !NEVER_HAPPENED.has(status), status };
+    const reason = this.commandReasons.get(commandId);
+    return {
+      known: true,
+      submitted: !COMMAND_FAILED.has(status),
+      status,
+      ...(reason ? { reason } : {}),
+    };
   }
 
   async externalSubmit(args: {
@@ -435,6 +498,13 @@ export class FakeEnterpriseWallet {
       commands: args.commands,
       disclosedContracts: args.disclosedContracts ?? [],
     };
+    if (this.rejectNext !== null) {
+      this.submits.push(submit);
+      this.commandStatuses.set(args.commandId, "failed");
+      this.commandReasons.set(args.commandId, this.rejectNext);
+      this.rejectNext = null;
+      return { commandId: args.commandId, status: "submitted" };
+    }
     if (this.lagLedger) {
       this.submits.push(submit);
       this.pending.push(submit);
@@ -494,6 +564,8 @@ export class FakeEnterpriseWallet {
     this.unknownCommandIds = false;
     this.lagLedger = false;
     this.failNext = null;
+    this.rejectNext = null;
+    this.commandReasons.clear();
   }
 
   private consumeFailNext(): void {
@@ -573,7 +645,7 @@ export class FakeEnterpriseWallet {
       if (choice === "MarkPaid") {
         if (!this.ledger.payouts.has(contractId))
           throw new Error(`fake ledger: CONTRACT_NOT_ACTIVE ${contractId}`);
-        this.ledger.archivePayout(contractId);
+        this.ledger.archivePayout(contractId, { choice, txHash: asString(arg.txHash) || null });
         return;
       }
       if (choice === "SettleToWallet") {
@@ -589,12 +661,17 @@ export class FakeEnterpriseWallet {
           contractId: this.ledger.nextCid("uw"),
           balance: wallet.balance + payout.amount,
         });
-        this.ledger.archivePayout(contractId);
+        this.ledger.archivePayout(contractId, { choice });
         return;
       }
       if (choice === "CreateMarket") {
         // The market itself reaches the index through FakeLedgerStream (docs/MARKETS.md §4); the
         // fake wallet only records that the treasury accepted the exercise.
+        return;
+      }
+      if (choice === "ResolveT0" || choice === "Resolve" || choice === "VoidMarket") {
+        // review F0 (market.resolve): recorded only, like CreateMarket — a spec that needs the
+        // resolved market pushes the successor version through FakeLedgerStream.
         return;
       }
       throw new Error(`fake ledger: unsupported choice ${choice}`);
@@ -868,6 +945,17 @@ export class FakeTokenApp {
   readonly minted: TokenAppMintRequest[] = [];
   readonly burned: TokenAppMintRequest[] = [];
   failNext: Error | null = null;
+  // ── command ledger + sync (docs/RAMP.md §7) ──
+  /** The next `postCommand` answers this; `lands` says whether token-app records it anyway (a lost answer). */
+  nextPost: { outcome: TokenAppPostOutcome; lands: boolean } | null = null;
+  /** Records token-app holds beyond what was posted here (unknown / duplicate / mismatch scenarios). */
+  readonly extraRecords: TokenAppParsedRecord[] = [];
+  /** Posted command ids token-app has not recorded (yet). */
+  readonly unrecorded = new Set<string>();
+  /** `/status`: total supply of every instrument (null = the net of its records) and the monitor's last success. */
+  statusSupply: bigint | null = null;
+  monitorLastSuccessAt: Date | null = null;
+  private readonly postedAt = new Map<string, Date>();
 
   isConfigured(): boolean {
     return this.configured;
@@ -923,6 +1011,102 @@ export class FakeTokenApp {
     return [];
   }
 
+  async postCommand(kind: "mint" | "burn", req: TokenAppMintRequest): Promise<TokenAppPostOutcome> {
+    if (!this.configured)
+      return {
+        outcome: "not_sent",
+        httpStatus: 0,
+        status: null,
+        code: "token_app_unconfigured",
+        message: "token-app is not configured",
+      };
+    let next = this.nextPost ?? {
+      outcome: {
+        outcome: "accepted",
+        httpStatus: 200,
+        status: "submitted",
+        code: null,
+        message: null,
+      },
+      lands: true,
+    };
+    this.nextPost = null;
+    if (this.failNext) {
+      next = {
+        outcome: {
+          outcome: "unknown",
+          httpStatus: 0,
+          status: null,
+          code: "upstream_failed",
+          message: this.failNext.message,
+        },
+        lands: false,
+      };
+      this.failNext = null;
+    }
+    if (next.lands) {
+      (kind === "mint" ? this.minted : this.burned).push({ ...req });
+      this.postedAt.set(`${kind}|${req.commandId}`, new Date());
+    }
+    return next.outcome;
+  }
+
+  async listRecords(
+    kind: "mint" | "burn",
+    filter: { instrumentId: string; partyId?: string },
+  ): Promise<TokenAppParsedRecord[]> {
+    this.ensure();
+    const posted = (kind === "mint" ? this.minted : this.burned)
+      .filter((m) => !this.unrecorded.has(m.commandId))
+      .map((m): TokenAppParsedRecord => ({
+        kind,
+        commandId: m.commandId,
+        updateId: `update-${m.commandId}`,
+        partyId: m.partyId,
+        instrumentId: m.instrumentId,
+        amount: m.amount,
+        createdAt: this.postedAt.get(`${kind}|${m.commandId}`) ?? new Date(0),
+      }));
+    return [...posted, ...this.extraRecords.filter((r) => r.kind === kind)].filter(
+      (r) =>
+        r.instrumentId === filter.instrumentId && (!filter.partyId || r.partyId === filter.partyId),
+    );
+  }
+
+  async monitor(instrumentId: string): Promise<TokenAppMonitorSnapshot> {
+    this.ensure();
+    const [mints, burns] = [
+      await this.listRecords("mint", { instrumentId }),
+      await this.listRecords("burn", { instrumentId }),
+    ];
+    const net = mints.reduce((s, r) => s + r.amount, 0n) - burns.reduce((s, r) => s + r.amount, 0n);
+    const now = new Date();
+    return {
+      updatedAt: now,
+      token: {
+        totalSupply: this.statusSupply ?? net,
+        totalLockedSupply: 0n,
+        uniqueHolders: null,
+        updatedAt: now,
+      },
+      monitor: {
+        lastSuccessAt: this.monitorLastSuccessAt ?? now,
+        ageSeconds: 5,
+        pollIntervalSeconds: 60,
+        monitoringEnabled: true,
+      },
+    };
+  }
+
+  async holdingsScan(): Promise<TokenAppHoldingsScan> {
+    this.ensure();
+    return { scannedAt: new Date(), total: 0, holdings: [] };
+  }
+
+  async health(): Promise<{ ok: boolean; httpStatus: number }> {
+    return { ok: this.reachable, httpStatus: this.reachable ? 200 : 0 };
+  }
+
   async mints(): Promise<TokenAppRecord[]> {
     this.ensure();
     return this.minted.map((m) => this.recordOf(m));
@@ -939,6 +1123,12 @@ export class FakeTokenApp {
     this.minted.length = 0;
     this.burned.length = 0;
     this.failNext = null;
+    this.nextPost = null;
+    this.extraRecords.length = 0;
+    this.unrecorded.clear();
+    this.statusSupply = null;
+    this.monitorLastSuccessAt = null;
+    this.postedAt.clear();
   }
 
   private entryOf(

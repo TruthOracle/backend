@@ -78,7 +78,14 @@ export class SessionGuard implements CanActivate {
   }
 }
 
-function extractToken(req: AuthedRequest): { token: string; kind: "cookie" | "bearer" } {
+/**
+ * The credential a request presents: `Authorization: Bearer <tok>`, else the `to_session` cookie
+ * ("" when neither). Also used by the body parser to pick the 8 MB limit (app.setup.ts, C40).
+ */
+export function extractToken(req: Pick<AuthedRequest, "headers">): {
+  token: string;
+  kind: "cookie" | "bearer";
+} {
   const auth = req.headers.authorization;
   if (typeof auth === "string" && /^bearer\s+/i.test(auth)) {
     return { token: auth.replace(/^bearer\s+/i, "").trim(), kind: "bearer" };

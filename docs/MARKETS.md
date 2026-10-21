@@ -151,6 +151,17 @@ identity fields and the collateral itself — the contract requires them — and
 presentation until an operator writes some; an instrument the platform does not know is
 registered as disabled by the indexer so the market still renders (docs/TOKENS.md §4.1).
 
+Resolving and voiding: `POST /admin/markets/:marketId/resolution` is the four-eyes
+`market.resolve` and the only way any market, of any collateral, is resolved (the frontend's
+wallet relay no longer submits ResolveT0 / Resolve / VoidMarket). The subject is the market id,
+not the contract id, so a trade while the request waits changes nothing; the snapshot holds the
+decision fields only. Request and execution need a fresh index and check the choice's own asserts
+by the backend clock: ResolveT0 in [expiresAt, expiresAt + grace] on a Trading market with
+`operatorResolution` and an allowlisted source (any http(s) source when `sources` is empty);
+Resolve from expiresAt on a Trading or Proposed market, each attestation active, of this market,
+allowlisted and read inside the window, with a T1 signature or the T2 quorum and one outcome;
+VoidMarket after expiresAt + grace. The submission carries the backend's clock as `nowSeconds`.
+
 ## 5. Candles and open interest
 
 Kalshi serves `GET /series/{series}/markets/{ticker}/candlesticks?start_ts&end_ts&period_interval`

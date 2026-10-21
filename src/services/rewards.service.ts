@@ -30,6 +30,7 @@ import {
 import { ApiError } from "../util/errors";
 import { AMOUNT_SCALE, formatAmount, parseAmount, quantizeDown } from "../util/money";
 import { AuditService } from "./audit.service";
+import { ComplianceFreezePort } from "./compliance-freeze.port";
 import { DepositService } from "./deposit.service";
 import { EnterpriseWalletService } from "./enterprise-wallet.service";
 import { IndexerService } from "./indexer.service";
@@ -38,6 +39,7 @@ import { LedgerClientService } from "./ledger-client.service";
 import { NatsService } from "./nats.service";
 import { SentryService } from "./sentry.service";
 import { TokenAppService } from "./token-app.service";
+import { TokenCommandService } from "./token-command.service";
 import { TreasuryTransferService } from "./treasury-transfer.service";
 import { UserService } from "./user.service";
 import { WalletLinkService } from "./wallet-link.service";
@@ -309,6 +311,8 @@ export interface RewardsScanResult {
   requeued: number;
   failed: number;
   blocked: number;
+  /** Grants of frozen accounts left `queued` this pass (SPEC §11.6: no reward reaches a frozen account). */
+  held: number;
   /** The auto-mint command id, when the pass minted. */
   minted: string | null;
   /** Why the pass did nothing (or stopped early). */
@@ -354,9 +358,11 @@ export class RewardsService implements OnApplicationBootstrap {
     private readonly treasuryTransfers: TreasuryTransferService,
     private readonly indexer: IndexerService,
     private readonly tokenApp: TokenAppService,
+    private readonly commands: TokenCommandService,
     private readonly audit: AuditService,
     private readonly nats: NatsService,
     private readonly sentry: SentryService,
+    private readonly freeze: ComplianceFreezePort,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -671,6 +677,7 @@ export class RewardsService implements OnApplicationBootstrap {
       requeued: 0,
       failed: 0,
       blocked: 0,
+      held: 0,
       minted: null,
       skipped: null,
     };
@@ -881,6 +888,11 @@ export class RewardsService implements OnApplicationBootstrap {
     const state = await this.floatState(instrument);
     let mintedThisPass = result.minted !== null;
     for (const row of rows) {
+      // SPEC §11.6 (B3): no Grant into a frozen account's wallet; the grant waits, still `queued`.
+      if (row.userId && (await this.freeze.isFrozen(row.userId))) {
+        result.held += 1;
+        continue;
+      }
       const shortfall = floatShortfall(state, row.amount);
       if (shortfall > 0n) {
         const minted = await this.blockForFloat(row, instrument, state, shortfall, !mintedThisPass);
@@ -939,7 +951,9 @@ export class RewardsService implements OnApplicationBootstrap {
    * Sentry message and `truthoracle.reward.blocked_float`. With `REWARDS_AUTO_MINT` (DevNet) and a
    * configured token-app, `max(shortfall, REWARDS_MINT_MIN)` is minted to the treasury once per
    * grant (`reward-float-<grantId>`) and once per pass — the index shows the new holding on the
-   * next pass, which then submits. Returns the mint command id when it minted.
+   * next pass, which then submits. The mint is a write-ahead token command (source `rewards`, ref =
+   * the grant: S8) like every other, so its token-app record is always ours (I9) and it is never
+   * re-sent on its own (I3). Returns the mint command id when it was sent.
    */
   private async blockForFloat(
     row: RewardGrantEntity,
@@ -951,19 +965,30 @@ export class RewardsService implements OnApplicationBootstrap {
     const figures = `holdings ${formatAmount(state.treasuryHoldings)}, liabilities ${formatAmount(state.liabilities)}, pending ${formatAmount(state.pending)}`;
     let error = `blocked_float: shortfall ${formatAmount(shortfall)} ${instrument.symbol} (${figures})`;
     let minted: string | null = null;
-    const alreadyMinted = row.error?.includes("auto-mint") && row.error.includes("submitted");
+    const commandId = autoMintCommandId(row.id);
+    const prior = await this.commands.status(commandId);
+    // Once per grant: a command past "written, never sent" is not sent again from here.
+    const alreadyMinted = prior !== null && !(prior.status === "pending" && prior.attempts === 0);
     if (mayMint && this.config.rewardsAutoMint && this.tokenApp.isConfigured() && !alreadyMinted) {
-      const amount = autoMintAmount(shortfall, this.config.rewardsMintMin, instrument.decimals);
-      const commandId = autoMintCommandId(row.id);
+      // A command written but never sent (token-app unreachable then) goes out as written.
+      const amount =
+        prior?.amount ?? autoMintAmount(shortfall, this.config.rewardsMintMin, instrument.decimals);
       try {
-        const res = await this.tokenApp.mint({
-          commandId,
-          instrumentId: instrument.id,
-          partyId: this.treasury,
-          amount,
-          decimals: instrument.decimals,
-        });
-        error += `; auto-mint ${commandId} submitted (${formatAmount(amount)} ${instrument.symbol}, ${res.status})`;
+        await this.dataSource.transaction((manager) =>
+          this.commands.recordIntent(manager, {
+            commandId,
+            kind: "mint",
+            instrument: { admin: instrument.admin, id: instrument.id },
+            party: this.treasury,
+            amount,
+            source: "rewards",
+            ref: row.id,
+          }),
+        );
+        const command = await this.commands.submit(commandId);
+        if (command.status === "pending" || command.status === "rejected")
+          throw new Error(`${command.status}: ${command.lastError ?? "not sent"}`);
+        error += `; auto-mint ${commandId} ${command.status} (${formatAmount(amount)} ${instrument.symbol})`;
         minted = commandId;
         await this.audit.record({
           actorType: "system",
@@ -972,7 +997,7 @@ export class RewardsService implements OnApplicationBootstrap {
           subjectId: `${instrument.admin}:${instrument.id}`,
           metadata: {
             commandId,
-            status: res.status,
+            status: command.status,
             instrument: { admin: instrument.admin, id: instrument.id },
             amount: formatAmount(amount),
             party: this.treasury,

@@ -4,7 +4,8 @@ import type { Request } from "express";
 import type { Config } from "../config";
 import type { SessionEntity } from "../entities/session.entity";
 import type { UserEntity } from "../entities/user.entity";
-import type { Actor } from "../types";
+import type { Actor, AdminRole } from "../types";
+import { CidrList, normaliseIp } from "../util/cidr";
 import { ApiError } from "../util/errors";
 import { timingSafeStringEqual } from "../util/strings";
 
@@ -22,6 +23,17 @@ export interface AuthedRequest extends Request {
   clientIp?: string;
   requestHost?: string;
   requestProto?: string;
+  /** Set by AdminGuard (SPEC §6.5): the operator behind an admin session. */
+  adminOperator?: AdminOperatorContext;
+}
+
+/** The operator's party, PERSON and roles, and the key their decisions are verified against. */
+export interface AdminOperatorContext {
+  party: string;
+  personId: string;
+  roles: AdminRole[];
+  /** The pinned key, else the key the admin sign-in verified (base64 raw Ed25519); null = none known. */
+  publicKey: string | null;
 }
 
 /** The slice of an Express request these helpers read (lets tests pass plain objects). */
@@ -62,6 +74,38 @@ export function clientIpOf(
     if (real) return real;
   }
   return req.socket?.remoteAddress ?? "unknown";
+}
+
+/**
+ * Source address of a provider webhook (SPEC §8, X13): the right-most value of
+ * `RAMP_WEBHOOK_IP_HEADER` — the one our edge appended; anything left of it is caller-controlled —
+ * honoured only when the socket peer ∈ `RAMP_TRUSTED_EDGE_CIDRS` or the proxy secret matches;
+ * otherwise the proxy contract's client IP. Always normalised (IPv4-mapped IPv6 → IPv4).
+ */
+export function webhookSourceIpOf(
+  req: MinimalRequest,
+  config: Pick<Config, "backendProxySecret" | "rampWebhooks">,
+): string {
+  const name = config.rampWebhooks.ipHeader;
+  if (name) {
+    const peer = req.socket?.remoteAddress ?? "";
+    const trusted =
+      new CidrList(config.rampWebhooks.trustedEdgeCidrs).has(peer) ||
+      isTrustedProxyRequest(req, config);
+    if (trusted) {
+      const v = req.headers[name];
+      const joined = Array.isArray(v) ? v.join(",") : (v ?? "");
+      const rightMost = joined
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .pop();
+      const ip = normaliseIp(rightMost ?? "");
+      if (ip) return ip;
+    }
+  }
+  const fallback = clientIpOf(req, config);
+  return normaliseIp(fallback) || fallback;
 }
 
 /** The host the browser addressed: `x-forwarded-host` when proxied, else `Host`. */

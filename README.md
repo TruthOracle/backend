@@ -55,7 +55,7 @@ src/
 test/
 ├── helpers/               # createTestApp / useTestApp, fakes (NATS, ledger, wallet, participant stream, registry, token-app, KYC), makeTestWallet, sessions, ledger fixtures
 └── *.e2e-spec.ts          # against real Postgres + Redis
-docs/                      # ARCHITECTURE.md, API.md, INTERNALS.md, RUNBOOK.md, INDEXER.md, MARKETS.md, TOKENS.md, KYC.md
+docs/                      # ARCHITECTURE.md, API.md, INTERNALS.md, RUNBOOK.md, INDEXER.md, MARKETS.md, TOKENS.md, KYC.md, RAMP.md
 ```
 
 Conventions: `Object.values(barrel)` auto-registers every exported class, so barrels export

@@ -20,6 +20,7 @@ import { ApiError } from "../util/errors";
 import { asDecimal } from "../util/ledger-values";
 import { DUST, formatAmount } from "../util/money";
 import { AuditService } from "./audit.service";
+import { ComplianceFreezePort } from "./compliance-freeze.port";
 import { EnterpriseWalletService } from "./enterprise-wallet.service";
 import { IndexerService } from "./indexer.service";
 import { InstrumentsService } from "./instruments.service";
@@ -176,6 +177,23 @@ export interface MintCreditResult {
   status: "confirmed" | "submitted";
 }
 
+/** Where the credit of one mint key stands (C1, `mintCreditStanding`). */
+export interface MintCreditStanding {
+  commandId: string;
+  txRef: string;
+  /** `none`: never written ahead; else the write-ahead row's status after a confirm pass. */
+  state: "none" | "submitted" | "confirmed" | "failed";
+  /** `failed` only: PROVEN never to land (the wallet's FAILED, the index and the ledger agree). */
+  proven: boolean;
+  /** The proof, or what keeps a failure from being proven. */
+  detail: string | null;
+  /**
+   * `failed` and unproven only because the wallet's failure is not final yet: when it is (ISO UTC;
+   * the last submission + the caller's bound). Until then the key must not be re-armed.
+   */
+  finalAt: string | null;
+}
+
 type ConfirmOutcome = "confirmed" | "failed" | "pending";
 
 // ---------------------------------------------------------------------------------------------
@@ -216,6 +234,7 @@ export class DepositService {
     private readonly sentry: SentryService,
     private readonly payouts: PayoutService,
     private readonly walletLinks: WalletLinkService,
+    private readonly freeze: ComplianceFreezePort,
   ) {}
 
   private get treasury(): string {
@@ -246,6 +265,9 @@ export class DepositService {
         "deposits are disabled while an identity verification conflict is open",
       );
     }
+    // SPEC §11.6 (B3): no book transfer into a frozen account's in-app wallet — the deposit stays
+    // with the treasury, uncredited, until the freeze is lifted (the neutral 403).
+    await this.freeze.assertNotFrozen(user.id);
     const instrument = await this.instruments.requireEnabled(
       instrumentRef ?? (await this.instruments.requireDefaultCollateral()),
     );
@@ -659,6 +681,89 @@ export class DepositService {
     } finally {
       await lock.release();
     }
+  }
+
+  /**
+   * C1: where the credit of `mintCommandId` stands — failed for good ONLY on proof, never on an
+   * HTTP status: the confirm pass failed its write-ahead row, the wallet reports the command
+   * FAILED (known, not submitted: an unknown or unreadable status proves nothing) and its last
+   * submission is older than `finalAfterMs` (a timeout the ledger may still apply is no failure
+   * yet), the ledger index is fresh and holds no Deposit with its txRef, and a fresh ledger read
+   * shows the wallet without it. A submitted row goes through the confirm pass first (its user's
+   * deposit lock; busy → it stays as it was). Nothing is re-armed or submitted here.
+   */
+  async mintCreditStanding(
+    mintCommandId: string,
+    opts: { finalAfterMs: number },
+  ): Promise<MintCreditStanding> {
+    const commandId = mintCreditCommandId(mintCommandId);
+    const txRef = mintCreditTxRef(mintCommandId);
+    const out = (
+      state: MintCreditStanding["state"],
+      proven = false,
+      detail: string | null = null,
+      finalAt: string | null = null,
+    ): MintCreditStanding => ({ commandId, txRef, state, proven, detail, finalAt });
+    let row = await this.credits.findOne({ where: { commandId } });
+    if (!row) return out("none");
+    if (row.status === "submitted") {
+      await this.confirmPending(row.userId);
+      row = (await this.credits.findOne({ where: { commandId } })) ?? row;
+    }
+    if (row.status !== "failed") return out(row.status);
+    const missing = await this.failureUnproven(row, opts.finalAfterMs);
+    return missing
+      ? out("failed", false, missing.detail, missing.finalAt)
+      : out("failed", true, row.error ?? "the wallet reports the Deposit failed");
+  }
+
+  /** What keeps a failed credit from being proven never to land; null = proven (C1). */
+  private async failureUnproven(
+    row: DepositCreditEntity,
+    finalAfterMs: number,
+  ): Promise<{ detail: string; finalAt: string | null } | null> {
+    const unproven = (detail: string): { detail: string; finalAt: null } => ({
+      detail,
+      finalAt: null,
+    });
+    const status = await this.wallet.commandStatus(this.treasury, row.commandId);
+    if (!status.known)
+      return unproven(
+        `the wallet does not report ${row.commandId} (${status.status ?? "unreadable"})`,
+      );
+    if (status.submitted)
+      return unproven(`the wallet reports ${row.commandId} as ${status.status ?? "submitted"}`);
+    // The ledger may still apply the last submission until its command lifetime ends: until
+    // then the wallet's FAILED (a timeout above all) proves nothing, and nothing re-arms the key.
+    const finalAt = row.submittedAt.getTime() + finalAfterMs;
+    if (Date.now() <= finalAt)
+      return {
+        detail: `the wallet reports ${row.commandId} as ${status.status ?? "failed"}, final only after ${new Date(finalAt).toISOString()}`,
+        finalAt: new Date(finalAt).toISOString(),
+      };
+    try {
+      await this.indexer.requireFresh();
+    } catch (err) {
+      return unproven(`the ledger index is not fresh: ${(err as Error).message}`);
+    }
+    const indexed = await this.dataSource.query<unknown[]>(
+      `SELECT 1 FROM to_wallet_entries WHERE kind = 'deposit' AND tx_ref = $1 LIMIT 1`,
+      [row.txRef],
+    );
+    if (indexed.length > 0) return unproven(`the ledger index shows a Deposit with ${row.txRef}`);
+    let onLedger: LedgerWallet | null;
+    try {
+      onLedger = await this.ledger.fetchUserWallet(
+        row.ownerParty,
+        { admin: row.instrumentAdmin, id: row.instrumentId },
+        { uncached: true },
+      );
+    } catch (err) {
+      return unproven(`the ledger could not be read: ${(err as Error).message}`);
+    }
+    if (!this.ledgerShowsPreState(row, onLedger))
+      return unproven(`the ledger does not show the wallet without ${row.txRef}`);
+    return null;
   }
 
   /** `lock:deposit:<userId>`, retried for up to `waitMs` (a reconcile in flight finishes in seconds); null when still busy. */
@@ -1183,7 +1288,8 @@ export class DepositService {
       wallets,
       balances,
       pending: { submitted },
-      payouts: payoutRows.map((p) => this.payouts.toApi(p, active.has(p.pendingPayoutCid))),
+      // C8 / C11: the payee's own view (every internal hold reads `processing`, no reason).
+      payouts: payoutRows.map((p) => this.payouts.toUserApi(p, active.has(p.pendingPayoutCid))),
     };
   }
 }

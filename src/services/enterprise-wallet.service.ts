@@ -44,7 +44,10 @@ export interface TransferStatusResult {
  * an unknown id is no evidence that the command never happened. Only an explicit terminal
  * failure status yields `known: true, submitted: false`.
  */
-export type CommandStatusResult = TransferStatusResult;
+export interface CommandStatusResult extends TransferStatusResult {
+  /** A failed command's reason, when the wallet gives one (`reason` / `error`). */
+  reason?: string;
+}
 
 /** Statuses the wallet reports for a command the ledger rejected or that never ran. */
 const COMMAND_FAILED = new Set([
@@ -57,6 +60,22 @@ const COMMAND_FAILED = new Set([
   "timeout",
   "timed_out",
 ]);
+
+/** Statuses the wallet reports for a command the ledger committed. */
+const COMMAND_SUCCEEDED = new Set(["completed", "succeeded", "success", "committed", "confirmed"]);
+
+/**
+ * What a command status says became of the command: `succeeded` (committed), `failed` (the
+ * ledger rejected it or it never ran), `pending` (accepted, no outcome yet) or `unknown` (an
+ * unreadable or unknown status — no evidence either way).
+ */
+export function commandOutcome(
+  s: CommandStatusResult,
+): "succeeded" | "failed" | "pending" | "unknown" {
+  if (!s.known) return "unknown";
+  if (!s.submitted) return "failed";
+  return COMMAND_SUCCEEDED.has(s.status ?? "") ? "succeeded" : "pending";
+}
 
 @Injectable()
 export class EnterpriseWalletService {
@@ -73,7 +92,7 @@ export class EnterpriseWalletService {
 
   private async wallet<T>(
     path: string,
-    options: { method?: "GET" | "POST"; body?: unknown } = {},
+    options: { method?: "GET" | "POST"; body?: unknown; timeoutMs?: number } = {},
   ): Promise<T> {
     const base = this.config.enterpriseWalletUrl;
     if (!base)
@@ -83,7 +102,7 @@ export class EnterpriseWalletService {
         "Enterprise wallet URL is not configured (ENTERPRISE_WALLET_URL)",
       );
     const token = await this.keycloak.bearerFor("wallet");
-    return authedJson<T>(base, path, { ...options, token, timeoutMs: 60_000 });
+    return authedJson<T>(base, path, { timeoutMs: 60_000, ...options, token });
   }
 
   /**
@@ -122,18 +141,25 @@ export class EnterpriseWalletService {
    * transfers and `/api/v1/transfer/{party}/{commandId}` answers 404 for them, which the deposit
    * confirm pass used to read as "never submitted".
    */
-  async commandStatus(partyId: string, commandId: string): Promise<CommandStatusResult> {
+  async commandStatus(
+    partyId: string,
+    commandId: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<CommandStatusResult> {
     try {
       const row = await this.wallet<unknown>(
         `/api/v1/command/${encodeURIComponent(partyId)}/${encodeURIComponent(commandId)}`,
+        opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {},
       );
       if (!row || typeof row !== "object") return { known: false, submitted: false, status: null };
-      const r = row as { status?: unknown; state?: unknown };
+      const r = row as { status?: unknown; state?: unknown; reason?: unknown; error?: unknown };
       const status = asString(r.status ?? r.state)
         .trim()
         .toLowerCase();
       if (!status) return { known: false, submitted: false, status: null };
-      return { known: true, submitted: !COMMAND_FAILED.has(status), status };
+      const failed = COMMAND_FAILED.has(status);
+      const reason = failed ? asString(r.reason ?? r.error).slice(0, 500) : "";
+      return { known: true, submitted: !failed, status, ...(reason ? { reason } : {}) };
     } catch (e) {
       if (e instanceof UpstreamError && e.status === 404)
         return { known: false, submitted: false, status: "not_found" };

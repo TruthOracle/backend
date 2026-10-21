@@ -449,3 +449,31 @@ reconcile in that instrument, so it never reads as an over-credit.
 `Instruments` migration (fresh deploy, no upgrade path): a database migrated from an earlier
 working copy of that migration must run `npm run migration:revert` and `npm run migration:run`
 (the e2e harness runs against a database created from scratch; CI does run / revert / run).
+
+## 17. Fiat ramp — card on-ramp and cash-out (docs/RAMP.md)
+
+**Turning it on.** `RAMP_ENABLED=false` until the acquirer adapter exists, token-app answers for
+the ramp instrument and the treasury holds its MintDelegation (docs/TOKENS.md §9). The boot
+refuses the mock acquirer with `RAMP_ENABLED` in prod or on mainnet. The kill switch stops new
+orders only; in-flight orders keep advancing, because they already hold someone's money.
+
+**The queue.** `GET /admin/ramp/orders?status=needs_review`: `reviewStep` and `lastError` say why
+the order stopped. `retry` resumes the step under the same idempotency keys (at the payment step
+it approves the capture, and only for the exact amount); `refund` returns the card money (on-ramp,
+nothing minted) or re-mints and credits back (cash-out after the burn, payout failed); `fail`
+closes an on-ramp whose payment was never captured. Each needs a `reason`.
+
+**token-app down.** On-ramps wait in `paid` / `minting`, cash-outs in `burning`; nothing is lost
+and the processor resumes. A mint token-app has not recorded after 10 minutes is re-sent under the
+SAME command id (`ramp-mint-<h>`); `RAMP_MAX_ATTEMPTS` failures send the order to review. A
+chargeback that lands while an order is `minting` / `crediting` can leave its mint on the treasury
+(or its credit in-app): the reconciliation's float shows the surplus; burn it with
+`POST /admin/tokens/burn` once the case is reviewed.
+
+**Chargeback.** The account is suspended (sessions revoked, withdrawals blocked), the card blocked,
+`chargeback_receivable` booked, Sentry warned. Recovering the value from the in-app balance needs
+the user's signature today (UserWallet has no operator debit).
+
+**Daily.** `GET /admin/ramp/reconciliation` must be all-green. A red `journal_balanced`,
+`token_app_matches_orders` or `treasury_covers_in_app_balances` is an incident: set
+`RAMP_ENABLED=false` until it is explained.

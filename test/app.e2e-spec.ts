@@ -5,6 +5,7 @@ import request from "supertest";
 
 import { DepositConfirmProcessor } from "../src/processors/deposit-confirm.processor";
 import { KycWebhookProcessor } from "../src/processors/kyc-webhook.processor";
+import { RampProcessor } from "../src/processors/ramp.processor";
 import { RewardsProcessor } from "../src/processors/rewards.processor";
 import { SessionCleanupProcessor } from "../src/processors/session-cleanup.processor";
 import { AppService } from "../src/services/app.service";
@@ -273,6 +274,7 @@ describe("App (e2e)", () => {
       expect(ctx.nats.consumers.map((c) => c.durable).sort()).toEqual([
         "kyc-webhook-apply",
         "payout-settlement-kyc-status",
+        "ramp-webhook-apply",
       ]);
       await expect(ctx.get(DepositConfirmProcessor).tick()).resolves.toEqual({
         confirmed: 0,
@@ -288,6 +290,11 @@ describe("App (e2e)", () => {
         submitted: 0,
         credited: 0,
       });
+      // The fiat ramp's pass runs against the real services too (no orders: nothing to advance).
+      await expect(ctx.get(RampProcessor).tick()).resolves.toBeUndefined();
+      expect(await ctx.nats.dispatch("truthoracle.ramp.webhook.mock", { nope: true })).toEqual([
+        "term",
+      ]);
       // A malformed trigger is terminated; a well-formed one for an unknown row is acked (skipped).
       expect(await ctx.nats.dispatch("truthoracle.kyc.webhook.mock", { nope: true })).toEqual([
         "term",

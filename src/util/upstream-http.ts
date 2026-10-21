@@ -1,9 +1,14 @@
 /**
  * Authenticated JSON call to an upstream (ledger / Enterprise Wallet). Port of
- * `authedJson` in pm-frontend/api/_lib/upstream.mjs: throws with the upstream status
- * and a bounded slice of the body so callers can branch on 404 without ever logging a token.
+ * `authedJson` in pm-frontend/api/_lib/upstream.mjs: throws with the upstream status so callers
+ * can branch on 404 without ever logging a token.
  */
 
+/**
+ * `message` carries method, path and status only — it ends up in logs, `last_error` columns and
+ * audit details, which keep status / code and never upstream bodies (SPEC §8, X17). The bounded
+ * body is `bodyText`, for code that must read it on purpose and must not persist or log it.
+ */
 export class UpstreamError extends Error {
   readonly status: number;
   readonly bodyText: string;
@@ -57,7 +62,7 @@ export async function authedJson<T = unknown>(
 
   if (!res.ok) {
     throw new UpstreamError(
-      `${method} ${path} failed: HTTP ${res.status} ${text.slice(0, 600)}`,
+      `${method} ${path} failed: HTTP ${res.status}`,
       res.status,
       text.slice(0, 2000),
     );

@@ -288,7 +288,7 @@ last_attempt_at null (the sweep's re-arm cooldown counts from here), error null`
 instrument_admin, instrument_id, amount (in that instrument), reason, details jsonb (dust kept
 in-app by quantisation, transfer mode), status (queued | settling | settled_external | settled_in_app |
 blocked_kyc | blocked_unknown_user | blocked_unknown_reason | blocked_wallet_revoked |
-failed | archived), transfer_command_id null, wallet_create_command_id null,
+blocked_ramp_hold | failed | archived), transfer_command_id null, wallet_create_command_id null,
 settle_command_id null, mark_paid_command_id null, attempts int, last_error, first_seen_at,
 settled_at, created_at, updated_at`.
 
@@ -645,8 +645,12 @@ All three entry points (processor, user route, admin route) call one service und
 resolve payout from the ledger (as treasury); upsert to_payouts on first sight:
   user_id / payee_wallet_id from to_wallets by payee_party (active or revoked)
 policy by reason (closed map, no default-external):
-  withdraw            → external:  requires user active AND kyc gate (below) AND payee wallet active
-                        else status blocked_kyc | blocked_unknown_user | blocked_wallet_revoked
+  withdraw            → bound to a card cash-out when the payee's account has an off-ramp order waiting for
+                        exactly it (instrument, amount): MarkPaid { txHash: "ramp:<order>" } only, the ramp
+                        burns and pays the fiat (docs/RAMP.md §3.2); otherwise
+                      → external:  requires user active AND kyc gate (below) AND payee wallet active AND no
+                        card hold (docs/RAMP.md §6)
+                        else status blocked_kyc | blocked_unknown_user | blocked_wallet_revoked | blocked_ramp_hold
   bond, model-prize   → in-app:    if UserWallet(owner = payee) missing → treasury Create UserWallet{0,0,0}
                         (commandId "wallet-create-<sha256(packageName | payee)[:40]>", separate submission), then
                         SettleToWallet { walletCid: freshly read } (commandId "settle-<cidHash>")
@@ -660,7 +664,9 @@ external path: set status settling + transfer_command_id ("payout-<cidHash>") + 
   if the row already records a submitted transfer: NEVER call transfer() again — ask the status index of the
   RECORDED mode (transfer index for wallet, command index for registry; fail CLOSED on read errors: stop,
   keep settling) then MarkPaid ("markpaid-<cidHash>"); attempts capped at PAYOUT_MAX_ATTEMPTS (5) → failed (admin queue)
-archived contract: if a submit was recorded → settled_external / settled_in_app; else archived (user cancel)
+archived contract: if a submit was recorded → settled_external / settled_in_app; else archived (user cancel);
+  a cash-out's MarkPaid counts only when the wallet's command index says it succeeded — the user's
+  CancelPayout may have consumed the contract first (→ archived, the ramp cancels the order)
 kyc gate: users.status = active AND to_kyc_persons binding for the user AND an approved, unexpired
   verification with level_name = KYC_REQUIRED_LEVEL; applies only when KYC_ENFORCE_WITHDRAWALS=true
 ```
@@ -668,8 +674,9 @@ kyc gate: users.status = active AND to_kyc_persons binding for the user AND an a
   party is one of the caller's wallets, and `409 kyc_required` when blocked by the gate. The
   gate is always evaluated on the **payee's** account, never the caller's.
 - `POST /admin/payouts/:cid/settle { force?: boolean, reason }`: `force` overrides
-  `blocked_kyc`/`blocked_wallet_revoked` only with a reason and is audited as
-  `payout.admin_override`.
+  `blocked_kyc`/`blocked_wallet_revoked`/`blocked_ramp_hold` only with a reason and is audited as
+  `payout.admin_override`. `blocked_ramp_hold` rows are re-checked by every scan and settle by
+  themselves once the hold ends.
 - `payout-settlement.processor` scans PendingPayouts every `PAYOUT_SCAN_MS` (30 s) and
   consumes `truthoracle.kyc.status_changed` (→ `approved` re-queues that user's `blocked_kyc`
   rows). Product change (deliberate): `bond` and `model-prize` payouts now settle **into the
@@ -755,6 +762,15 @@ purged after 30 days (`kyc-cleanup` in `session-cleanup.processor`).
   `TokenAppService` with `token.mint` / `token.burn` audit rows and `truthoracle.token.minted|burned`,
   the mint-and-credit (`DepositService.creditMint`, §8.3) and `GET /admin/tokens/status` (token-app's
   snapshot next to `TreasuryTransferService.indexedBalances` per instrument).
+- **Fiat ramp** (docs/RAMP.md): `RampService` (the account's routes and the acquirer webhook
+  inbox), `RampFulfilmentService` (the step engine: acquirer re-reads, token-app mint → deposit
+  credit, PayoutService's MarkPaid → burn → card payout → reversal, operator actions,
+  reconciliation), `RampPolicyService` (instrument, eligibility, limits, card hold, binding a
+  signed withdrawal to its order — reads only, so PayoutService can depend on it),
+  `RampOrderStore` (compare-and-set transitions against `RAMP_TRANSITIONS`, audited with any
+  journal posting in one transaction), `RampJournalService` (double entry in fiat), the
+  `RAMP_PROVIDER` adapter (only `mock` until the bank is chosen) and `RampProcessor` (durable
+  consumer `ramp-webhook-apply` + the scan every `RAMP_SCAN_MS`).
 - **SentryService**: wrapper (`Sentry.init` happens in `main.ts`).
 - **AuditService**, **RateLimitService** (`key`, window, max; `subject` and `ip` dimensions).
 
@@ -803,6 +819,9 @@ purged after 30 days (`kyc-cleanup` in `session-cleanup.processor`).
 | POST | `/admin/kyc/persons/:fingerprint/transfer` | admin | `{ toUserId, reason }` |
 | GET | `/admin/payouts?status=` · POST `/admin/payouts/:cid/settle` | admin | |
 | GET | `/admin/audit?subjectType=&subjectId=&page=` | admin | |
+| GET · POST | `/ramp` · `/ramp/quote` · `/ramp/onramp` · `/ramp/offramp` · `/ramp/orders[/:id]` · `/ramp/orders/:id/attach` · `/ramp/orders/:id/cancel` · `/ramp/payment-methods[/:id]` | session | BYN card on-ramp / cash-out (docs/RAMP.md §8); order creation takes `Idempotency-Key` |
+| POST | `/webhooks/ramp/:provider` | signature | raw body, stored first, applied async after an acquirer re-read |
+| GET · POST | `/admin/ramp/orders[/:id]` · `/admin/ramp/orders/:id/retry` · `/refund` · `/fail` · `/admin/ramp/reconciliation` · `/admin/ramp/provider` | admin | the ramp's queue, actions (`{ reason }`), reconciliation and acquirer probe |
 
 Errors: `{ error: <stable code>, message, details? }` from one global exception filter.
 Codes: `unauthenticated`, `forbidden`, `csrf_rejected`, `rate_limited`, `identity_already_linked`,
@@ -813,9 +832,11 @@ Codes: `unauthenticated`, `forbidden`, `csrf_rejected`, `rate_limited`, `identit
 blocking payout status), `kyc_required`, `kyc_duplicate_identity`, `kyc_provider_unavailable`,
 `webhook_rejected`, `invalid_credential`, `oidc_failed`, `user_suspended`, `trading_halted`,
 `market_not_tradable`, `no_in_app_wallet`, `no_position`, `insufficient_balance`, `insufficient_shares`,
-`quote_unavailable`, `catalog_conflict` (markets / orders, docs/MARKETS.md), `ledger_stale`,
+`quote_unavailable`, `catalog_conflict`, `market_not_resolvable` (markets / orders, docs/MARKETS.md), `ledger_stale`,
 `insufficient_treasury_holdings`, `token_app_unconfigured`, `instrument_unknown`, `instrument_disabled`,
-`instrument_exists` (instruments / tokens, docs/TOKENS.md), `validation_failed`,
+`instrument_exists` (instruments / tokens, docs/TOKENS.md), `ramp_unavailable`, `ramp_not_eligible`,
+`ramp_limit_exceeded`, `ramp_quote_changed`, `ramp_order_open`, `ramp_order_state`, `ramp_hold`
+(fiat ramp, docs/RAMP.md §8), `validation_failed`,
 `bad_request`, `not_found`, `payload_too_large`, `unsupported_media_type`, `upstream_failed`,
 `not_ready`, `internal_error`, `backend_unconfigured` and `backend_unreachable` (proxy only).
 The authoritative list is `ERROR_CODES` in `src/types.ts`; the frontend mirrors it in
@@ -847,6 +868,8 @@ SESSION_CLEANUP_MS=3600000  LEDGER_CACHE_MS=15000  DEPOSIT_LOCK_TTL_MS=300000  D
 COLLATERAL_INSTRUMENT_ADMIN / _ID / _SYMBOL / _NAME / _DECIMALS  COLLATERAL_REGISTRY_URL  COLLATERAL_REGISTRY_AUTH=keycloak  COLLATERAL_WALLET_INSTRUMENT_ID
 REWARDS_INSTRUMENT_* (same shape; TRO)  AUDIT_OBSERVER_PARTIES  TREASURY_TRANSFER_MODE=wallet  TREASURY_TRANSFER_TTL_SEC=600  LEDGER_FRESH_OFFSETS=50  ACCEPTOR_SCAN_MS=10000
 REGISTRY_KEYCLOAK_*  TOKEN_APP_URL  TOKEN_APP_APP_NAME=truthoracle  TOKEN_APP_KEYCLOAK_*  REWARDS_ENABLED=true  REWARDS_SCAN_MS=30000  REWARDS_AUTO_MINT=false  REWARDS_MINT_MIN=1000
+RAMP_ENABLED=false  RAMP_PROVIDER=mock  RAMP_INSTRUMENT=  RAMP_FIAT_CURRENCY=BYN  RAMP_PUBLIC_APP_URL  RAMP_PUBLIC_API_URL  RAMP_DATA_KEY  RAMP_REQUIRE_KYC=true  RAMP_REQUIRE_3DS=true
+RAMP_ONRAMP_* / RAMP_OFFRAMP_* (MIN, MAX, DAILY_MAX, MONTHLY_MAX, FEE_BPS, FEE_FIXED)  RAMP_MAX_CARDS=3  RAMP_HOLD_HOURS=72  RAMP_SCAN_MS=10000  (docs/RAMP.md §10)
 ```
 The deployed Daml package is **truthoracle-v17 1.0.0** (`UserWallet.instrument : InstrumentId`
 and `UserWallet.creditRefs : [Text]` mandatory, `PredictionMarket.collateral`); the two values
@@ -867,7 +890,9 @@ configured (proxied cookies must be host-only); `COLLATERAL_INSTRUMENT_ID` witho
 `COLLATERAL_INSTRUMENT_ADMIN` (or the admin without the id), an instrument admin or
 `AUDIT_OBSERVER_PARTIES` entry that is not a party id, `*_INSTRUMENT_DECIMALS` outside 0..10,
 `*_REGISTRY_AUTH` outside `none | ledger | keycloak`, `TREASURY_TRANSFER_MODE` outside
-`wallet | registry`.
+`wallet | registry`; `RAMP_PROVIDER=mock` with `RAMP_ENABLED` in prod or on mainnet, a real
+`RAMP_PROVIDER` without a 32-byte `RAMP_DATA_KEY`, `RAMP_ENABLED` without `RAMP_PUBLIC_APP_URL`,
+inconsistent ramp limits or fees (docs/RAMP.md §10).
 
 ## 13. Security controls (checklist)
 

@@ -90,6 +90,14 @@ import {
   type TransferInstructionView,
 } from "./token-standard";
 
+/** Templates whose only signatory is `admin` (truthoracle-v17): projected only when `admin` is the treasury. */
+const ADMIN_SIGNED = new Set([
+  "Truthoracle:PredictionMarket",
+  "Truthoracle:UserWallet",
+  "Truthoracle:PendingPayout",
+  "Truthoracle:MarketCounter",
+]);
+
 export interface ProjectionConfig {
   /** `daml.yaml` name of the deployed TruthOracle package (`truthoracle-v17`). */
   packageName: string;
@@ -865,6 +873,15 @@ export class LedgerProjection {
       archivedChoice: null,
       archivedAtLedger: null,
     };
+
+    // Review R3-01: these templates are signed by `admin`, but the treasury also observes contracts any
+    // party can create naming it as an audit observer. Only the ones the treasury signed are projected.
+    if (ADMIN_SIGNED.has(`${e.module}:${e.entity}`) && asText(p.admin) !== this.cfg.treasury) {
+      this.logger.error(
+        `${e.module}:${e.entity} ${e.contractId} names admin ${asText(p.admin)}, not the treasury: not projected`,
+      );
+      return;
+    }
 
     switch (`${e.module}:${e.entity}`) {
       case "Truthoracle:PredictionMarket": {

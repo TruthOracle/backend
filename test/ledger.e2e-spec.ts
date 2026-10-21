@@ -787,6 +787,67 @@ describe("admin ledger", () => {
     await ctx.agent.get("/api/v1/admin/ledger/status").expect(401);
   });
 
+  it("R3-01: a UserWallet or PendingPayout another party signed as admin is kept raw, never projected", async () => {
+    const { f } = await seedTradedMarket();
+    const [mallory] = parties(1, "mallory");
+    // Both need only mallory's signature: the treasury is just an observer, so they reach its stream.
+    ctx.stream.push(
+      f.tx([
+        f.created(
+          "UserWallet",
+          f.cid("uw"),
+          {
+            admin: mallory,
+            owner: alice,
+            instrument: f.instrument(),
+            balance: dec("50000"),
+            deposited: dec("50000"),
+            withdrawn: dec("0"),
+            creditRefs: [],
+            auditObservers: [TEST_TREASURY],
+          },
+          { signatories: [mallory], observers: [alice, TEST_TREASURY] },
+        ),
+        f.created(
+          "PendingPayout",
+          f.cid("pp"),
+          {
+            admin: mallory,
+            user: mallory,
+            marketId: "0",
+            instrument: f.instrument(),
+            amount: dec("50000"),
+            reason: "withdraw",
+            createdAt: "1760000500",
+            auditObservers: [TEST_TREASURY],
+          },
+          { signatories: [mallory], observers: [mallory, TEST_TREASURY] },
+        ),
+      ]),
+    );
+    await ctx.get(IndexerService).runOnce();
+    const { cookie } = await issueSessionDirect(ctx, operator, { kind: "admin" });
+    const headers = { Cookie: cookie, ...ctx.csrf };
+
+    const wallets = bodyOf<ApiPage<{ owner: string; balance: string }>>(
+      await ctx.agent.get("/api/v1/admin/ledger/wallets").set(headers).expect(200),
+    );
+    expect(wallets.items).toEqual([expect.objectContaining({ owner: alice, balance: dec("90") })]);
+    expect(
+      bodyOf<ApiPage<unknown>>(
+        await ctx.agent.get("/api/v1/admin/ledger/payouts").set(headers).expect(200),
+      ).total,
+    ).toBe(0);
+    expect(
+      bodyOf<ApiPage<unknown>>(
+        await ctx.agent
+          .get("/api/v1/admin/ledger/events?entity=PendingPayout")
+          .set(headers)
+          .expect(200),
+      ).total,
+    ).toBe(1);
+  });
+
   it("the indexer state row survives resets of the other tables only through re-creation", async () => {
     const indexer = ctx.get(IndexerService);
     const state = await indexer.state();
