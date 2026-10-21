@@ -751,4 +751,23 @@ describe("fiat ramp (SPEC §4, §5)", () => {
       figures: { unknownRecords: 1, unknownNet: dec("5") },
     });
   });
+
+  it("BYN only, at the database too: a ramp row in another currency is refused (RAMP_FIAT_CURRENCIES)", async () => {
+    expect(ctx.config.ramp.fiatCurrency).toBe("BYN");
+    await expect(
+      ctx.dataSource.query(
+        `INSERT INTO to_ramp_journal (entry_id, kind, account, currency, amount)
+         VALUES (gen_random_uuid(), 'test.currency', 'fee_revenue', 'EUR', 1)`,
+      ),
+    ).rejects.toThrow(/CHK_to_ramp_journal_currency/);
+    // The same (balanced) entry in BYN is accepted.
+    await expect(
+      ctx.dataSource.query(
+        `INSERT INTO to_ramp_journal (entry_id, kind, account, currency, amount)
+         SELECT e.id, 'test.currency', t.account, 'BYN', t.amount
+           FROM (SELECT gen_random_uuid() AS id) e,
+                (VALUES ('fee_revenue', 1), ('bank_fees', -1)) AS t(account, amount)`,
+      ),
+    ).resolves.toBeDefined();
+  });
 });

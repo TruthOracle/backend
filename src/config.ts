@@ -18,10 +18,12 @@ import {
   REGISTRY_AUTHS,
   TREASURY_TRANSFER_MODES,
   parseInstrumentKey,
+  RAMP_FIAT_CURRENCIES,
   RAMP_METHODS,
   RAMP_PAYOUT_RAILS,
   type AdminRole,
   type InstrumentId,
+  type RampFiatCurrency,
   type RampMethod,
   type RampPayoutRail,
   type RampProviderName,
@@ -165,7 +167,8 @@ export interface RampConfig {
   provider: RampProviderName;
   /** `RAMP_INSTRUMENT` parsed; null = the default collateral. */
   instrument: InstrumentId | null;
-  fiatCurrency: string;
+  /** `RAMP_FIAT_CURRENCY` (BYN): one of RAMP_FIAT_CURRENCIES; every ramp amount setting is in it. */
+  fiatCurrency: RampFiatCurrency;
   fiatDecimals: number;
   publicAppUrl: string;
   publicApiUrl: string;
@@ -1220,7 +1223,8 @@ export function getConfiguration(env: NodeJS.ProcessEnv = process.env): Config {
       enabled: parseBool(env.RAMP_ENABLED, false),
       provider: (str(env.RAMP_PROVIDER, "mock").toLowerCase() || "mock") as RampProviderName,
       instrument: str(env.RAMP_INSTRUMENT) ? parseInstrumentKey(str(env.RAMP_INSTRUMENT)) : null,
-      fiatCurrency: str(env.RAMP_FIAT_CURRENCY, "BYN").toUpperCase() || "BYN",
+      // Narrowed here, refused at boot below when it is not one of RAMP_FIAT_CURRENCIES.
+      fiatCurrency: (str(env.RAMP_FIAT_CURRENCY, "BYN").toUpperCase() || "BYN") as RampFiatCurrency,
       fiatDecimals: parseIntOr(env.RAMP_FIAT_DECIMALS, 2),
       publicAppUrl: absoluteUrl(env.RAMP_PUBLIC_APP_URL),
       publicApiUrl: absoluteUrl(env.RAMP_PUBLIC_API_URL),
@@ -1457,8 +1461,10 @@ function rampIssues(
   if (ramp.enabled && !ramp.publicAppUrl) {
     issues.push("RAMP_ENABLED=true requires RAMP_PUBLIC_APP_URL (the checkout return page)");
   }
-  if (!/^[A-Z]{3}$/.test(ramp.fiatCurrency)) {
-    issues.push("RAMP_FIAT_CURRENCY must be an ISO 4217 code");
+  if (!(RAMP_FIAT_CURRENCIES as readonly string[]).includes(ramp.fiatCurrency)) {
+    issues.push(
+      `RAMP_FIAT_CURRENCY must be one of ${RAMP_FIAT_CURRENCIES.join(", ")}: ERIP, the bank rail and the BV thresholds are BYN's`,
+    );
   }
   if (!Number.isInteger(ramp.fiatDecimals) || ramp.fiatDecimals < 0 || ramp.fiatDecimals > 4) {
     issues.push("RAMP_FIAT_DECIMALS must be an integer in 0..4");

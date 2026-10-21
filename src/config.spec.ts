@@ -267,7 +267,16 @@ describe("config", () => {
       ["daily above monthly", { RAMP_OFFRAMP_DAILY_MAX: "30000" }, /RAMP_OFFRAMP_DAILY_MAX/],
       ["a malformed amount", { RAMP_OFFRAMP_MAX: "free" }, /RAMP_OFFRAMP_\* amounts/],
       ["a scan between 0 and 1 s", { RAMP_SCAN_MS: "200" }, /RAMP_SCAN_MS/],
-      ["a lowercase currency", { RAMP_FIAT_CURRENCY: "by" }, /ISO 4217/],
+      [
+        "a currency the ramp does not serve",
+        { RAMP_FIAT_CURRENCY: "EUR" },
+        /RAMP_FIAT_CURRENCY must be one of BYN/,
+      ],
+      [
+        "a malformed currency",
+        { RAMP_FIAT_CURRENCY: "by" },
+        /RAMP_FIAT_CURRENCY must be one of BYN/,
+      ],
     ])("refuses %s", (_name, extra, pattern) => {
       expect(() => cfg(extra)).toThrow(pattern);
     });

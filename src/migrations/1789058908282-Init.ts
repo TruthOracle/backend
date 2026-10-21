@@ -2,6 +2,8 @@ import type { MigrationInterface, QueryRunner } from "typeorm";
 
 const list = (values: readonly string[]): string => values.map((v) => `'${v}'`).join(", ");
 
+/** `RAMP_FIAT_CURRENCIES` (types.ts): every ramp amount is in one of these — BYN only. */
+const FIAT_CURRENCIES = ["BYN"];
 /** RAMP SPEC §3.2 — the CHECKs below repeat `RAMP_ORDER_STATUSES` / `RAMP_STEPS` (types.ts). */
 const ORDER_STATUSES = [
   "created",
@@ -502,6 +504,7 @@ export class Init1789058908282 implements MigrationInterface {
     await q.query(
       `CREATE TABLE "to_ramp_orders" ("id" uuid NOT NULL DEFAULT gen_random_uuid(), "user_id" uuid NOT NULL, "direction" text NOT NULL, "status" text NOT NULL, "review_step" text, "version" integer NOT NULL DEFAULT 0, "provider" text NOT NULL, "instrument_admin" text NOT NULL, "instrument_id" text NOT NULL, "party_id" text NOT NULL, "fiat_currency" text NOT NULL, "fiat_amount" numeric(38,10) NOT NULL, "token_amount" numeric(38,10) NOT NULL, "fee_amount" numeric(38,10) NOT NULL, "payment_method_id" uuid, "idempotency_key" text NOT NULL, "request_hash" text NOT NULL, "provider_payment_id" text, "provider_payout_id" text, "provider_refund_id" text, "checkout_url" text, "expires_at" TIMESTAMP WITH TIME ZONE, "captured_amount" numeric(38,10), "captured_at" TIMESTAMP WITH TIME ZONE, "refunded_amount" numeric(38,10) NOT NULL DEFAULT 0, "mint_command_id" text, "credit_command_id" text, "pending_payout_cid" text, "burn_command_id" text, "remint_command_id" text, "remint_credit_command_id" text, "method" text, "payment_instructions" jsonb, "payout_rail" text, "bank_account_id" uuid, "payout_batch_id" uuid, "payout_reference" text NOT NULL, "operator" jsonb NOT NULL, "consent_id" uuid, "risk" jsonb NOT NULL DEFAULT '{}'::jsonb, "attempts" integer NOT NULL DEFAULT 0, "last_error" text, "details" jsonb NOT NULL DEFAULT '{}'::jsonb, "status_changed_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "last_polled_at" TIMESTAMP WITH TIME ZONE, "completed_at" TIMESTAMP WITH TIME ZONE, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), CONSTRAINT "PK_to_ramp_orders" PRIMARY KEY ("id"), ` +
         `CONSTRAINT "CHK_to_ramp_orders_direction" CHECK ("direction" IN ('onramp', 'offramp')), ` +
+        `CONSTRAINT "CHK_to_ramp_orders_fiat_currency" CHECK ("fiat_currency" IN (${list(FIAT_CURRENCIES)})), ` +
         `CONSTRAINT "CHK_to_ramp_orders_status" CHECK ("status" IN (${list(ORDER_STATUSES)})), ` +
         `CONSTRAINT "CHK_to_ramp_orders_review_step" CHECK ((("status" = 'needs_review') = ("review_step" IS NOT NULL)) AND ("review_step" IS NULL OR "review_step" IN (${list(REVIEW_STEPS)}))), ` +
         `CONSTRAINT "CHK_to_ramp_orders_amounts" CHECK ("fiat_amount" > 0 AND "token_amount" > 0 AND "fee_amount" >= 0), ` +
@@ -589,6 +592,7 @@ export class Init1789058908282 implements MigrationInterface {
       `CREATE TABLE "to_ramp_journal" ("id" BIGSERIAL NOT NULL, "entry_id" uuid NOT NULL, "kind" text NOT NULL, "order_id" uuid, "statement_line_id" uuid, "user_id" uuid, "account" text NOT NULL, "currency" text NOT NULL, "amount" numeric(38,10) NOT NULL, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), CONSTRAINT "PK_to_ramp_journal" PRIMARY KEY ("id"), ` +
         `CONSTRAINT "CHK_to_ramp_journal_account" CHECK ("account" IN (${list(JOURNAL_ACCOUNTS)})), ` +
         `CONSTRAINT "CHK_to_ramp_journal_amount" CHECK ("amount" <> 0), ` +
+        `CONSTRAINT "CHK_to_ramp_journal_currency" CHECK ("currency" IN (${list(FIAT_CURRENCIES)})), ` +
         // The per-client sub-ledger (R12): every client-liability line names its user.
         `CONSTRAINT "CHK_to_ramp_journal_user" CHECK ("account" NOT IN ('issuance_pending', 'customer_liability', 'payout_clearing') OR "user_id" IS NOT NULL), ` +
         // An on-ramp's bank refund and its return are never booked without the statement line.
@@ -702,6 +706,7 @@ export class Init1789058908282 implements MigrationInterface {
     await q.query(
       `CREATE TABLE "to_ramp_payout_batches" ("id" uuid NOT NULL DEFAULT gen_random_uuid(), "status" text NOT NULL, "currency" text NOT NULL, "item_count" integer NOT NULL DEFAULT 0, "total_amount" numeric(38,10) NOT NULL, "created_by_user_id" uuid NOT NULL, "created_by_person" text NOT NULL, "approval_id" uuid, "file_format" text, "file_sha256" text, "exported_at" TIMESTAMP WITH TIME ZONE, "exported_by_user_id" uuid, "export_count" integer NOT NULL DEFAULT 0, "submitted_at" TIMESTAMP WITH TIME ZONE, "submitted_by_user_id" uuid, "bank_reference" text, "settled_at" TIMESTAMP WITH TIME ZONE, "void_approval_id" uuid, "details" jsonb NOT NULL DEFAULT '{}'::jsonb, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), CONSTRAINT "PK_to_ramp_payout_batches" PRIMARY KEY ("id"), ` +
         `CONSTRAINT "CHK_to_ramp_payout_batches_status" CHECK ("status" IN (${list(BATCH_STATUSES)})), ` +
+        `CONSTRAINT "CHK_to_ramp_payout_batches_currency" CHECK ("currency" IN (${list(FIAT_CURRENCIES)})), ` +
         `CONSTRAINT "CHK_to_ramp_payout_batches_figures" CHECK ("item_count" >= 0 AND "total_amount" >= 0 AND "export_count" >= 0), ` +
         `CONSTRAINT "CHK_to_ramp_payout_batches_file" CHECK ("file_sha256" IS NULL OR "file_sha256" ~ '^[0-9a-f]{64}$'), ` +
         // A file exists exactly from the first export on; it never comes back to draft / approved.
@@ -737,6 +742,7 @@ export class Init1789058908282 implements MigrationInterface {
       `CREATE TABLE "to_ramp_bank_statements" ("id" uuid NOT NULL DEFAULT gen_random_uuid(), "account_iban" text NOT NULL, "format" text NOT NULL, "file_sha256" text NOT NULL, "canonical_hash" text NOT NULL, "canonical_kid" text NOT NULL, "period_from" date NOT NULL, "period_to" date NOT NULL, "opening_balance" numeric(38,10) NOT NULL, "closing_balance" numeric(38,10) NOT NULL, "currency" text NOT NULL, "prev_statement_id" uuid, "status" text NOT NULL DEFAULT 'draft', "imported_by_user_id" uuid NOT NULL, "imported_by_person" text NOT NULL, "approval_id" uuid, "second_copy_person" text, "second_copy_at" TIMESTAMP WITH TIME ZONE, "confirmed_at" TIMESTAMP WITH TIME ZONE, "line_count" integer NOT NULL DEFAULT 0, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), CONSTRAINT "PK_to_ramp_bank_statements" PRIMARY KEY ("id"), ` +
         `CONSTRAINT "FK_to_ramp_bank_statements_prev" FOREIGN KEY ("prev_statement_id") REFERENCES "to_ramp_bank_statements"("id") ON DELETE RESTRICT, ` +
         `CONSTRAINT "CHK_to_ramp_bank_statements_format" CHECK ("format" IN ('csv', 'camt053')), ` +
+        `CONSTRAINT "CHK_to_ramp_bank_statements_currency" CHECK ("currency" IN (${list(FIAT_CURRENCIES)})), ` +
         `CONSTRAINT "CHK_to_ramp_bank_statements_status" CHECK ("status" IN ('draft', 'confirmed', 'rejected')), ` +
         `CONSTRAINT "CHK_to_ramp_bank_statements_period" CHECK ("period_from" <= "period_to"), ` +
         `CONSTRAINT "CHK_to_ramp_bank_statements_hashes" CHECK ("file_sha256" ~ '^[0-9a-f]{64}$' AND "canonical_hash" ~ '^[0-9a-f]{64}$'), ` +
@@ -759,6 +765,7 @@ export class Init1789058908282 implements MigrationInterface {
       `CREATE TABLE "to_ramp_bank_lines" ("id" uuid NOT NULL DEFAULT gen_random_uuid(), "statement_id" uuid NOT NULL, "line_ref" text NOT NULL, "booking_date" date NOT NULL, "value_date" date, "amount" numeric(38,10) NOT NULL, "currency" text NOT NULL, "counterparty_iban_hash" text, "counterparty_iban_hash_kid" text, "counterparty_iban_last4" text, "counterparty_bic" text, "bank_tx_code" text, "return_info" boolean NOT NULL DEFAULT false, "return_code" text, "reference" text, "document_no" text, "raw_sealed" text NOT NULL, "match_kind" text, "matched_order_id" uuid, "matched_batch_id" uuid, "status" text NOT NULL DEFAULT 'unmatched', "flags" text[] NOT NULL DEFAULT '{}', "approval_id" uuid, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), CONSTRAINT "PK_to_ramp_bank_lines" PRIMARY KEY ("id"), ` +
         `CONSTRAINT "FK_to_ramp_bank_lines_statement" FOREIGN KEY ("statement_id") REFERENCES "to_ramp_bank_statements"("id") ON DELETE RESTRICT, ` +
         `CONSTRAINT "CHK_to_ramp_bank_lines_amount" CHECK ("amount" <> 0), ` +
+        `CONSTRAINT "CHK_to_ramp_bank_lines_currency" CHECK ("currency" IN (${list(FIAT_CURRENCIES)})), ` +
         `CONSTRAINT "CHK_to_ramp_bank_lines_status" CHECK ("status" IN ('unmatched', 'proposed', 'matched') AND (("status" = 'unmatched') = ("match_kind" IS NULL))), ` +
         `CONSTRAINT "CHK_to_ramp_bank_lines_kind" CHECK ("match_kind" IS NULL OR "match_kind" IN (${list(MATCH_KINDS)})), ` +
         `CONSTRAINT "CHK_to_ramp_bank_lines_flags" CHECK ("flags" <@ ARRAY[${list(LINE_FLAGS)}]::text[]), ` +

@@ -16,6 +16,10 @@ from it and the adapter checklist). cBYN mint and burn depend on Cantor8's DevNe
 - **Off-ramp.** The user signs `UserWallet.Withdraw { amount = T }` on the in-app cBYN wallet.
   The backend consumes the `PendingPayout` (`MarkPaid`), burns `T` cBYN from the treasury and
   pays `T − fee` BYN to a card that funded an earlier on-ramp of the same account.
+- BYN only (`RAMP_FIAT_CURRENCIES` in types.ts; the boot and the database refuse any other fiat
+  currency): ERIP, the bank rail's BY IBANs and КНП, the Belarusian calendar and the BV thresholds
+  are BYN's, so another currency would be a new corridor with its own acquirer, account, limits
+  and rules — designed when it is needed, not a different value of these settings.
 - 1 BYN = 1 cBYN. No FX. Fiat amounts carry 2 decimals (`RAMP_FIAT_DECIMALS`), token amounts
   the usual 10 dp; every amount is a `bigint` in 1e-10 units (ARCHITECTURE §8.4).
 - The ramp instrument is the default collateral (cBYN) unless `RAMP_INSTRUMENT` names another.
@@ -293,7 +297,7 @@ run every sandbox branch of §3.3 end to end before `RAMP_ENABLED=true`.
 RAMP_ENABLED=false                 # kill switch for new orders
 RAMP_PROVIDER=mock                 # mock (dev/test only; refused in prod and on mainnet) | <bank>
 RAMP_INSTRUMENT=                   # <admin>:<id>; blank = the default collateral (cBYN)
-RAMP_FIAT_CURRENCY=BYN
+RAMP_FIAT_CURRENCY=BYN             # BYN only (RAMP_FIAT_CURRENCIES); every ramp amount setting is in it
 RAMP_FIAT_DECIMALS=2
 RAMP_PUBLIC_APP_URL=               # the frontend origin for the checkout return page (required)
 RAMP_PUBLIC_API_URL=               # the backend's own public base (https://<backend>/api/v1): the acquirer posts to
@@ -316,7 +320,8 @@ RAMP_MOCK_WEBHOOK_SECRET=          # mock only; blank = derived from SESSION_SEC
 
 Boot refuses: `RAMP_PROVIDER=mock` with `APP_ENV=prod` or `APP_NETWORK=mainnet`; a real provider
 without `RAMP_DATA_KEY` (32 bytes); `RAMP_ENABLED=true` without `RAMP_PUBLIC_APP_URL`; min > max,
-daily > monthly, a fee outside 0..5000 bps; `RAMP_INSTRUMENT` that is not `<party>:<id>`.
+daily > monthly, a fee outside 0..5000 bps; `RAMP_INSTRUMENT` that is not `<party>:<id>`;
+`RAMP_FIAT_CURRENCY` other than BYN.
 
 ## 11. Operations
 

@@ -420,6 +420,15 @@ export type RampProviderName = "mock";
 export const RAMP_DIRECTIONS = ["onramp", "offramp"] as const;
 export type RampDirection = (typeof RAMP_DIRECTIONS)[number];
 
+/**
+ * The fiat currencies the ramp serves (`RAMP_FIAT_CURRENCY`; the migration's CHECKs repeat it).
+ * BYN only: ERIP, the bank rail's BY IBANs and КНП, the Belarusian calendar and the BV thresholds
+ * are BYN's. Another currency is a new corridor — its own acquirer, account, limits and rules —
+ * not another value of the same settings.
+ */
+export const RAMP_FIAT_CURRENCIES = ["BYN"] as const;
+export type RampFiatCurrency = (typeof RAMP_FIAT_CURRENCIES)[number];
+
 /** How an on-ramp is paid (SPEC §9.2; KROK is out of scope). */
 export const RAMP_METHODS = ["card", "erip"] as const;
 export type RampMethod = (typeof RAMP_METHODS)[number];
