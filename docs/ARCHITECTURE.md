@@ -1052,7 +1052,7 @@ frontend are designed greenfield:
   surplus (drift in either direction is refused), no Daml feature flag for `creditRefs`
   (mandatory on truthoracle-v17), no boot-time precondition in front of
   `KYC_ENFORCE_WITHDRAWALS`, no wallet-side source of deposits (they come from the ledger index
-  alone, docs/TOKENS.md §2 decision 5), and the checked-in migrations create the schema from
+  alone, docs/TOKENS.md §2 decision 5), and the one checked-in `Init` migration creates the schema from
   scratch (no row is carried over from an earlier deploy).
 - Still in place because it is sound regardless of history: write-ahead deposit credits with
   the confirm pass, deterministic command ids, the payout write-ahead arbiter, the KYC gate

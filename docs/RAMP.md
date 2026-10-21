@@ -143,7 +143,7 @@ At most one order per account and direction in `created`, `awaiting_payment` or
 `awaiting_withdrawal` (partial unique index). The table is `RAMP_TRANSITIONS`
 (`ramp-order-store.service.ts`); a move outside it throws before the compare-and-set.
 
-## 5. Data model (migration `1793000000000-Ramp`)
+## 5. Data model (the `Init` migration)
 
 - `to_ramp_orders` — `id`, `user_id` → users, `direction on|off`, `status`, `review_step`,
   `provider`, `instrument_admin/id`, `party_id` (the primary at creation), `fiat_currency`,

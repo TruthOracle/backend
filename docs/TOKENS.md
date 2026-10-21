@@ -406,8 +406,8 @@ REWARDS_MINT_MIN=1000                   # smallest auto-mint
 ```
 Removed: `INDEXER_TRACK_TRANSFERS` (always on), `SPLICE_AMULET_PACKAGE_NAME` stays.
 
-Migration `1792000000000-Instruments.ts`: renames, new tables, data-free (fresh deploy), with a
-`down()` that reverses it (CI runs run/revert/run).
+Schema: part of the one `Init` migration (fresh deploy, no upgrade path); data-free apart from the
+`rewards_cursor` seed, with a `down()` that reverses it (CI runs run/revert/run).
 
 Docs to update: `ARCHITECTURE.md` §8 (wallets per instrument, index-sourced deposits), §11 (routes),
 §12 (config); `INDEXER.md` §3 (tables) and §6 (token-standard transfers); `MARKETS.md` §4 (collateral),
@@ -549,7 +549,7 @@ The original list, annotated:
 Where the implementation of §4.4–§4.7 deviates from, or refines, the text above. The sections
 above stay the design record; this list is what shipped.
 
-- **Rule seeding.** The `Instruments` migration is data-free apart from `to_settings.rewards_cursor =
+- **Rule seeding.** For rewards, the `Init` migration seeds only `to_settings.rewards_cursor =
   '0'`; `RewardsService.seedRules` creates the three automatic rules at every boot (`ON CONFLICT
   (kind) DO NOTHING`), `enabled` iff `APP_ENV=dev` — a dev stack hands out rewards without a
   click, everywhere else an operator enables them (`PUT /admin/rewards/rules/:id`). The dev

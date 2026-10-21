@@ -49,7 +49,7 @@ src/
 ├── indexer/               # ledger event normalisation, tree building, the projection, candles, token-standard + Splice transfer extraction (pure)
 ├── amm/                   # the pm-AMM math port (quotes) — mirrors truthoracle-contracts PmAmmMath.daml
 ├── entities/              # 11 account `to_*` tables (ARCHITECTURE §5) + 16 ledger-index tables (INDEXER.md §3) + catalog / candles (MARKETS.md) + instruments / rewards (TOKENS.md)
-├── migrations/            # checked-in migrations (Init, LedgerIndex, MarketCatalog, …, Instruments); synchronize is hard-coded false
+├── migrations/            # the one checked-in migration (Init: the whole schema); synchronize is hard-coded false
 ├── dto/                   # class-validator request DTOs
 └── util/                  # money (bigint fixed point), canton-crypto, telegram, cookies, errors, …
 test/
@@ -77,23 +77,19 @@ carries `@HttpCode(200)`: `docs/API.md` never answers 201 and Nest would default
 | `npm test` | unit specs (`src/**/*.spec.ts`) |
 | `npm run test:e2e [-- test/session.e2e-spec.ts]` | e2e specs against `TEST_DATABASE_URL` (default `postgresql://localhost:5432/truthoracle_backend_test`, created on demand with `createdb`) and `TEST_REDIS_URL` (default `redis://localhost:6379/1`, flushed before every test) |
 | `npm run typeorm -- <cmd>` | TypeORM CLI against `dist/data-source.js` |
-| `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (against a migrated database it must print "No changes in database schema") |
+| `npm run migration:generate -- src/migrations/<Name>` | diff entities vs the database into a new migration (review it: it also proposes dropping the hand-written CHECKs / partial indexes / named FKs the entities do not declare) |
 | `npm run migration:run` · `migration:revert` | apply / roll back |
 | `npm run seed:dev [-- --clear]` | write (or remove) a demo catalog with 30 days of candles and a trade feed into the local index for UI work — `APP_ENV=dev` only, never on the ledger (docs/RUNBOOK.md §13) |
 
-Five migrations: `Init` (the account schema — greenfield, ARCHITECTURE §18: a database created by
-an earlier layout is dropped and recreated, never upgraded), `LedgerIndex` (the fourteen
-ledger-index tables, additive), `MarketCatalog` (series / events / candles tables plus the
-identity and open-interest columns on `to_markets`, additive; the identity columns are NOT NULL —
-the index never writes a market without them, and a from-scratch deployment starts with an
-empty index), `MarketMetadata` (`to_market_metadata`, the backend-owned image / description
-per market; drops the presentation columns v16 contracts no longer carry, carrying any values
-over first) and `Instruments` (docs/TOKENS.md: `to_instruments`, `to_wallet_credits`,
-`to_ledger_holdings`, `to_ledger_transfer_instructions`, `to_reward_rules`, `to_reward_grants`,
-instrument / collateral columns on every amount-carrying table and the `_cc` suffix dropped from
-every column; a real `down()`; data-free — the reward rules are seeded at boot by
-`RewardsService.seedRules`, not by the migration). Regenerating against a migrated database
-proposes only the cosmetic `'{}'` vs `'{}'::jsonb` default rewrites, which are not drift.
+One migration: `Init` creates every `to_*` table in its final form — accounts, the ledger index,
+the market catalog, instruments / rewards and the fiat ramp — with the CHECK constraints, partial /
+expression indexes and append-only / retention triggers TypeORM cannot declare, and seeds
+`to_settings.app_network` and `rewards_cursor` (the reward rules are seeded at boot by
+`RewardsService.seedRules`, not by the migration). Greenfield, ARCHITECTURE §18: a database created
+by an earlier layout is dropped and recreated, never upgraded. The entities do not declare those
+CHECKs, partial / expression indexes and hand-named foreign keys, so `migration:generate` against a
+migrated database proposes dropping them (plus cosmetic `'{}'` vs `'{}'::jsonb` default rewrites):
+keep only the statements a schema change actually needs.
 
 Jest runs in CommonJS with `test/esm-to-cjs.transformer.cjs` converting the ESM-only packages
 (`@nestjs/*`, `jose`) — it passes on Node 22 and 24+.

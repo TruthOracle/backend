@@ -113,11 +113,13 @@ consumers are created per processor.
   apply migrations explicitly first.
 - CLI (compiled, `dist/data-source.js`): `npm run migration:run`, `npm run migration:revert`,
   `npm run migration:generate -- src/migrations/<Name>` (diffs the entities against
-  `DATABASE_URL`; regenerating against a migrated database must print "No changes in database
-  schema"). `.env` is read by the CLI the same way the app reads it.
+  `DATABASE_URL`; against a migrated database it also proposes dropping the hand-written CHECKs,
+  partial / expression indexes and named foreign keys the entities do not declare — keep only the
+  statements the change needs). `.env` is read by the CLI the same way the app reads it.
 - There is exactly one migration (`src/migrations/<ts>-Init.ts`): it creates the `citext` /
   `pgcrypto` extensions and every `to_*` table of the final layout and seeds
-  `to_settings.app_network` from the `APP_NETWORK` the migration ran under; `kyc_pepper_hash`
+  `to_settings.app_network` from the `APP_NETWORK` the migration ran under (and
+  `rewards_cursor = '0'`); `kyc_pepper_hash`
   is written on first boot (§1, §2). Greenfield (ARCHITECTURE §18): a database created by an
   earlier layout is not upgraded — drop and recreate it (`dropdb truthoracle_backend && createdb
   truthoracle_backend`) and let `DB_MIGRATE_ON_BOOT` apply the migration.
@@ -444,11 +446,6 @@ treasury, retry the credit once that credit confirmed (a request with the same `
 through `DepositService.creditMint` lands on the same row; there is no route for it yet, see
 docs/TOKENS.md §10). A confirmed mint credit counts as "received" for the account's next
 reconcile in that instrument, so it never reads as an over-credit.
-
-**Schema note.** `to_reward_grants.submitted_at` and the removal of the rules seed landed in the
-`Instruments` migration (fresh deploy, no upgrade path): a database migrated from an earlier
-working copy of that migration must run `npm run migration:revert` and `npm run migration:run`
-(the e2e harness runs against a database created from scratch; CI does run / revert / run).
 
 ## 17. Fiat ramp — card on-ramp and cash-out (docs/RAMP.md)
 
