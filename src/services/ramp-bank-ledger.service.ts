@@ -29,6 +29,7 @@ import {
 import { RAMP_IBAN_INDEX_PURPOSE, normalizeIbanForIndex } from "./ramp-bank-rail.port";
 import { RampBankSealing } from "./ramp-bank-sealing.service";
 import { lineFromSealed } from "./ramp-bank-statement.parse";
+import { operatorHeadroom, reserveFigures } from "./ramp-controls.logic";
 import {
   onrampBasis,
   postingFor,
@@ -53,7 +54,6 @@ export interface LedgerRun {
   >;
   /** Orders the run moved to `reversing` (advanced after the commit). */
   reversing: string[];
-  operatorKeys: ReadonlySet<string>;
   pspKeys: ReadonlySet<string>;
 }
 
@@ -117,7 +117,7 @@ export class RampBankLedger {
     private readonly sentry: SentryService,
   ) {}
 
-  /** A run's context: our operator and PSP IBANs keyed under every index kid. */
+  /** A run's context: the PSP's IBANs keyed under every index kid. */
   run(
     mode: LedgerRun["mode"],
     format: LedgerRun["format"],
@@ -139,7 +139,6 @@ export class RampBankLedger {
       format,
       overlay: new Map(),
       reversing: [],
-      operatorKeys: keys(this.config.rampBank.operatorAccountIbans),
       pspKeys: keys(this.config.rampBank.pspSettlementIbans),
     };
   }
@@ -420,7 +419,6 @@ export class RampBankLedger {
       namedItems: referenced ? null : await this.namedItems(m, view, run),
       txMismatch: line.amount < 0n ? await this.txMismatch(m, view) : [],
       duplicate: line.amount < 0n && !referenced ? await this.duplicateOf(m, view, run) : null,
-      operatorKeys: run.operatorKeys,
       pspKeys: run.pspKeys,
       feeMax: this.config.rampBank.feeMax,
       returnFeeMax: this.config.rampBank.returnFeeMax,
@@ -480,10 +478,20 @@ export class RampBankLedger {
         break;
       }
       case "operator_topup":
-      case "operator_sweep":
-        if (!hits(run.operatorKeys)) throw abort("the counterparty is not an operator account");
+      case "operator_sweep": {
+        // One account serves client and operator money: the operator's own money in or out is
+        // whatever two persons say it is — except PSP money, and never a sweep of client money.
+        if (hits(run.pspKeys)) throw abort("the counterparty is a PSP settlement account");
+        if (c.matchKind === "operator_sweep") {
+          const held = await this.operatorMoneyHeld(m);
+          if (abs > held)
+            throw abort(
+              `a sweep of ${formatAmount(abs)} would spend client money: the operator holds ${formatAmount(held)} above the client liabilities`,
+            );
+        }
         decision = { kind: c.matchKind };
         break;
+      }
       case "psp_settlement":
       case "psp_funding":
         if (!hits(run.pspKeys)) throw abort("the counterparty is not a PSP settlement account");
@@ -952,6 +960,15 @@ export class RampBankLedger {
       lines,
       statementLineId: line.id,
     });
+  }
+
+  /**
+   * The operator's own money in the client account (A − L, from the journal), read under a
+   * transaction-scoped lock so two sweeps classified at once never spend the same headroom.
+   */
+  private async operatorMoneyHeld(m: EntityManager): Promise<bigint> {
+    await m.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ["ramp-operator-money"]);
+    return operatorHeadroom(reserveFigures(await this.journal.balances(m)));
   }
 
   /** An order-scoped bank kind booked ON its statement line (SPEC §5; `bank_statement_matches_journal` reads the link). */

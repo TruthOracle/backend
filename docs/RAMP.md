@@ -192,6 +192,16 @@ issued through the ramp), `fee_revenue`, `payout_clearing` (cash-outs in flight)
 `chargeback_receivable`. Bank settlement (`safeguard_bank`, `provider_fees`) is posted from the
 acquirer's settlement report once the adapter exists (§9).
 
+**One bank account.** `RAMP_BANK_ACCOUNT_IBAN` is the operator's only BYN account: client money and
+the operator's own money sit in it together. `operator_money` is the operator's share — the first
+statement's opening balance and its own top-ups — and fees are paid from what it holds. Nothing is
+auto-booked as operator money: a top-up (`operator_topup`) or one of its own payments out
+(`operator_sweep`: rent, a supplier) is classified four-eyes, whoever the counterparty. A sweep is
+refused when it is larger than the client assets above the client liabilities (A − L, the
+`reserve_covers_liabilities` figures), so client money can never be booked as the operator's
+spending (X7); a debit the operator cannot cover stays suspense and the reserve check shows the
+shortfall until it tops up.
+
 | Event | Debit | Credit |
 |---|---|---|
 | on-ramp `paid` (F, fee f, net N) | provider_clearing F | customer_liability N, fee_revenue f |
@@ -263,8 +273,9 @@ What the bank / acquirer must offer (the questions for the selection call):
 5. Signed webhooks (HMAC or RSA over the raw body, with a timestamp) and an IP list.
 6. Daily settlement report (file or API) per transaction: gross, fee, net, settlement date.
 7. A sandbox with test cards for every 3DS / decline / chargeback branch.
-8. A segregated (safeguarding) account for the cBYN reserve, and the bank's view of the
-   platform's licensing for token issuance and exchange in Belarus (legal to confirm).
+8. The client-money account for the cBYN reserve (one BYN account, which also holds the operator's
+   own money — §7), and the bank's view of the platform's licensing for token issuance and
+   exchange in Belarus (legal to confirm).
 
 Belarusian candidates to ask: bePaid, WEBPAY, Assist Belarus (card acquiring with payouts), and
 ERIP through the same gateway as a second payment method: pay-by-reference from internet banking,

@@ -26,6 +26,7 @@ import type {
   ApiRampOrder,
   ApiRampOverview,
   ApiStatementPreview,
+  BankMatchKind,
 } from "../src/types";
 import { formatAmount, parseAmount } from "../src/util/money";
 import { PROD_CONTROLS, TEST_DSO, TEST_TREASURY, useTestApp } from "./helpers/app";
@@ -86,7 +87,6 @@ const ctx = useTestApp({
     RAMP_BANK_NAME: "Alfa-Bank",
     RAMP_BANK_HOLDER_NAME: "TruthOracle LLC",
     RAMP_BANK_HOLDER_UNP: "193456789",
-    RAMP_OPERATOR_ACCOUNT_IBANS: OPERATOR_ACC,
     RAMP_PSP_SETTLEMENT_IBANS: PSP_ACC,
   },
 });
@@ -110,7 +110,11 @@ function signed(w: TestWallet, a: Pick<ApiApproval, "id" | "paramsHash">): strin
 }
 
 /** Ana uploads the client-money statement and asks to confirm; Ben confirms with HIS download, signed. */
-async function confirmStatement(spec: StatementSpec): Promise<ApiStatementPreview> {
+/** Uploads (Ana) and confirms (Ben, his own copy, signed); `book` classifies lines by ref in the confirm. */
+async function confirmStatement(
+  spec: StatementSpec,
+  book: Record<string, BankMatchKind> = {},
+): Promise<ApiStatementPreview> {
   const preview = bodyOf<ApiStatementPreview>(
     await ctx.agent
       .post("/api/v1/admin/ramp/bank-statements")
@@ -122,7 +126,13 @@ async function confirmStatement(spec: StatementSpec): Promise<ApiStatementPrevie
     await ctx.agent
       .post(`/api/v1/admin/ramp/bank-statements/${preview.statement.id}/confirm`)
       .set(await admin(ana))
-      .send({ reason: "statement of the client-money account" })
+      .send({
+        reason: "statement of the client-money account",
+        classifications: Object.entries(book).map(([ref, matchKind]) => ({
+          lineId: preview.lines.find((l) => l.lineRef === ref)!.id,
+          matchKind,
+        })),
+      })
       .expect(202),
   ).approval;
   const done = bodyOf<{ approval: ApiApproval }>(
@@ -314,6 +324,8 @@ async function openTheBooks(): Promise<void> {
         purpose: "Пополнение счёта клиентских средств",
       },
     ]),
+    // The operator's own money in: classified four-eyes (one account, no auto-booking).
+    { "TOPUP-1": "operator_topup" },
   );
   await ctx.dataSource.query(
     `INSERT INTO to_indexer_state (key, "offset", ledger_end) VALUES ('ledger', 10, 10)

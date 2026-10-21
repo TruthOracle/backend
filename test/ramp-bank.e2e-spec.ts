@@ -86,7 +86,6 @@ const ctx = useTestApp({
     RAMP_BANK_NAME: "Alfa-Bank",
     RAMP_BANK_HOLDER_NAME: "TruthOracle LLC",
     RAMP_BANK_HOLDER_UNP: "193456789",
-    RAMP_OPERATOR_ACCOUNT_IBANS: OPERATOR_ACC,
     RAMP_PSP_SETTLEMENT_IBANS: PSP_ACC,
     RAMP_BANK_MANUAL_PROOF: "true",
     RAMP_BANK_FEE_MAX: "5",
@@ -1396,7 +1395,7 @@ describe("bank rail (SPEC §10)", () => {
     await k.expectIdentities();
   });
 
-  it("PSP settlement with its fee true-up, operator top-up and sweep, a bank fee; the rest is classified (suspense) four-eyes (§5, X7)", async () => {
+  it("PSP settlement with its fee true-up and a bank fee auto-booked; the operator's top-up and sweep and the rest (suspense) classified four-eyes (§5, X7)", async () => {
     const buyer = await k.buyer("psp");
     const card = await k.bought(buyer, "100");
     // 240 bps accrued on the card capture: provider_clearing 97.60.
@@ -1460,8 +1459,9 @@ describe("bank rail (SPEC §10)", () => {
     expect(preview.lines.map((l) => [l.lineRef, l.status, l.matchKind])).toEqual(
       expect.arrayContaining([
         ["PSP-1", "proposed", "psp_settlement"],
-        ["OP-IN", "proposed", "operator_topup"],
-        ["OP-OUT", "proposed", "operator_sweep"],
+        // One account: the operator's own money in / out is never auto-booked, whoever the counterparty.
+        ["OP-IN", "unmatched", null],
+        ["OP-OUT", "unmatched", null],
         ["FEE-1", "proposed", "bank_fee"],
         ["UNK-IN", "unmatched", null],
         ["UNK-OUT", "unmatched", null],
@@ -1473,12 +1473,20 @@ describe("bank rail (SPEC §10)", () => {
         .set(await admin(alice))
         .send({
           reason: "statement in",
-          classifications: [{ lineId: byRef("UNK-OUT").id, matchKind: "suspense" }],
+          classifications: [
+            { lineId: byRef("OP-IN").id, matchKind: "operator_topup" },
+            { lineId: byRef("OP-OUT").id, matchKind: "operator_sweep" },
+            { lineId: byRef("UNK-OUT").id, matchKind: "suspense" },
+          ],
         })
         .expect(202),
     ).approval;
     expect(confirm.params).toEqual({
-      classifications: [{ lineId: byRef("UNK-OUT").id, matchKind: "suspense" }],
+      classifications: [
+        { lineId: byRef("OP-IN").id, matchKind: "operator_topup" },
+        { lineId: byRef("OP-OUT").id, matchKind: "operator_sweep" },
+        { lineId: byRef("UNK-OUT").id, matchKind: "suspense" },
+      ],
     });
     const done = bodyOf<{ approval: ApiApproval; result: Record<string, unknown> }>(
       await ctx.agent
@@ -1507,16 +1515,7 @@ describe("bank rail (SPEC §10)", () => {
       "suspense.out:safeguard_bank": dec("-1"),
     });
     expect(await balance("provider_clearing")).toBe(dec("0"));
-    // The unknown credit: an operator account it is not; suspense it is (four-eyes, after the confirm).
-    expect(
-      bodyOf<ErrorBody>(
-        await ctx.agent
-          .post(`/api/v1/admin/ramp/bank-lines/${byRef("UNK-IN").id}/classify`)
-          .set(await admin(alice))
-          .send({ reason: "owner money?", matchKind: "operator_topup" })
-          .expect(409),
-      ),
-    ).toMatchObject({ error: "bank_line_state" });
+    // The unknown credit: suspense (four-eyes, after the confirm).
     expect((await ctx.get(RampBankProcessor).tick()).aged).toBe(0);
     const before = await k.reconciliation();
     expect(k.checkOf(before, "bank_statement_matches_journal").status).toBe("green");
@@ -1536,6 +1535,81 @@ describe("bank rail (SPEC §10)", () => {
     expect(k.checkOf(await k.reconciliation(), "bank_statement_matches_journal").status).toBe(
       "green",
     );
+    await k.expectIdentities();
+  });
+
+  it("one account: the operator's own payments out are swept four-eyes only within its headroom — never client money (X7)", async () => {
+    const buyer = await k.buyer("sweep");
+    await k.bought(buyer, "100");
+    // Client money: 100 owed against provider_clearing 97.60 (the PSP has not settled yet).
+    const day = D[7];
+    const spec = statement(day, day, "1000", [
+      {
+        ref: "OWN-A",
+        amount: "400.00",
+        date: day,
+        iban: OTHER_IBAN,
+        name: "Landlord",
+        purpose: "rent",
+      },
+      {
+        ref: "OWN-B",
+        amount: "598.00",
+        date: day,
+        iban: OTHER_IBAN,
+        name: "Supplier",
+        purpose: "invoice",
+      },
+    ]);
+    const preview = await upload(spec);
+    const byRef = (ref: string): ApiBankLine => preview.lines.find((l) => l.lineRef === ref)!;
+    expect(preview.lines.map((l) => [l.lineRef, l.status])).toEqual(
+      expect.arrayContaining([
+        ["OWN-A", "unmatched"],
+        ["OWN-B", "unmatched"],
+      ]),
+    );
+    // Headroom 1 000 (opening, booked first) + 97.60 − 100 = 997.60 ≥ 400: OWN-A books in the confirm.
+    const classifications = [{ lineId: byRef("OWN-A").id, matchKind: "operator_sweep" }];
+    await ctx.agent
+      .post(`/api/v1/admin/ramp/bank-statements/${preview.statement.id}/confirm`)
+      .set(await admin(alice))
+      .send({ reason: "statement in", classifications })
+      .expect(202);
+    const done = bodyOf<{ approval: ApiApproval; result: Record<string, unknown> }>(
+      await ctx.agent
+        .post(`/api/v1/admin/ramp/bank-statements/${preview.statement.id}/confirm/approve`)
+        .set(await admin(bob))
+        .send({
+          format: "camt053",
+          content: base64(camt053({ ...spec, messageId: "BOB" })),
+          reason: "own copy",
+        })
+        .expect(200),
+    );
+    expect(done.result).toMatchObject({ matched: 1, unmatched: 1 });
+    expect(await lineJournal(preview.statement.id)).toEqual({
+      "operator.sweep:operator_money": dec("400"),
+      "operator.sweep:safeguard_bank": dec("-400"),
+    });
+    // 598 > the 597.60 left above the client liabilities: refused at the request, whoever would approve.
+    const refused = bodyOf<ErrorBody>(
+      await ctx.agent
+        .post(`/api/v1/admin/ramp/bank-lines/${byRef("OWN-B").id}/classify`)
+        .set(await admin(alice))
+        .send({ reason: "supplier invoice", matchKind: "operator_sweep" })
+        .expect(409),
+    );
+    expect(refused.error).toBe("bank_line_state");
+    expect(refused.message).toMatch(/would spend client money/);
+    // The bank did pay it: 0.40 of client money is gone, and the reserve says so (red) instead of a
+    // sweep hiding it. The line waits to be explained (suspense here) until the operator tops up.
+    expect(k.checkOf(await k.reconciliation(), "reserve_covers_liabilities").status).toBe("red");
+    await fourEyes(`/admin/ramp/bank-lines/${byRef("OWN-B").id}/classify`, {
+      reason: "unexplained debit, held",
+      matchKind: "suspense",
+    });
+    expect(await balance("safeguard_bank")).toBe(dec("2"));
     await k.expectIdentities();
   });
 

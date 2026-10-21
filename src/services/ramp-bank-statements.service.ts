@@ -478,10 +478,11 @@ export class RampBankStatementsService implements OnModuleInit {
   }
 
   /**
-   * The confirm's ONE transaction (SPEC §10.4): the chain re-checked, lines applied by booking date
-   * with debits first (the rules decide afresh on locked rows), then the confirm's classifications,
-   * the first statement's `opening.balance`, the statement confirmed. Any lost compare-and-set
-   * throws: nothing is written and the approval fails (re-propose).
+   * The confirm's ONE transaction (SPEC §10.4): the chain re-checked, the first statement's
+   * `opening.balance` (before any line: a sweep classified here may spend it), lines applied by
+   * booking date with debits first (the rules decide afresh on locked rows), then the confirm's
+   * classifications, the statement confirmed. Any lost compare-and-set throws: nothing is written
+   * and the approval fails (re-propose).
    */
   async applyConfirm(
     id: string,
@@ -516,6 +517,16 @@ export class RampBankStatementsService implements OnModuleInit {
           lineRows.map((l) => l.lineRef),
         );
         const prev = await this.latestConfirmed(m);
+        // The first statement of the account opens the books: its opening balance is operator money until shown otherwise.
+        if (!prev && st.openingBalance !== 0n)
+          await this.journal.postEntry(m, {
+            kind: "opening.balance",
+            currency: st.currency,
+            lines: [
+              ["safeguard_bank", st.openingBalance],
+              ["operator_money", -st.openingBalance],
+            ],
+          });
         run = this.ledger.run("apply", st.format, ctx.actor, ctx.approvalId);
         for (const line of lineRows)
           await this.saveOutcome(m, line, await this.ledger.process(m, line, run), ctx.approvalId);
@@ -534,16 +545,6 @@ export class RampBankStatementsService implements OnModuleInit {
             ctx.approvalId,
           );
         }
-        // The first statement of the account opens the books: its opening balance is operator money until shown otherwise.
-        if (!prev && st.openingBalance !== 0n)
-          await this.journal.postEntry(m, {
-            kind: "opening.balance",
-            currency: st.currency,
-            lines: [
-              ["safeguard_bank", st.openingBalance],
-              ["operator_money", -st.openingBalance],
-            ],
-          });
         await m.getRepository(RampBankStatementEntity).update(
           { id, status: "draft" },
           {
