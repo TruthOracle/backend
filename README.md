@@ -15,7 +15,7 @@ the market catalog (series → events → markets), candles, quotes and orders a
 ## Quick start
 
 ```bash
-nvm use                       # .nvmrc = 24 (Node ^22.18 also works)
+nvm use                       # .nvmrc = 24 (engines: Node ^22.18 or >=24.11)
 npm install
 docker compose up -d          # postgres:16, redis:7, nats:2.11 with JetStream
 cp .env.example .env          # every key is annotated; the defaults boot against docker-compose
