@@ -1,6 +1,6 @@
 # truthoracle-backend
 
-Accounts, sessions, wallet linking, KYC, money rails and the **ledger index** (markets, trades,
+Accounts, sessions, wallet linking, KYC, money rails, the BYN fiat ramp and the **ledger index** (markets, trades,
 positions, wallet statements, payouts, transfers — docs/INDEXER.md) for TruthOracle on Canton. NestJS 12 /
 TypeScript 6 / TypeORM 1 / Postgres / Redis / NATS JetStream. A sibling of `pm-frontend`
 (frontend + Vercel functions), `truthoracle-contracts` (Daml) and `enterprise-wallet`; laid out
